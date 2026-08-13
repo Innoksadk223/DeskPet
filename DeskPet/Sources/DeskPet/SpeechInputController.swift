@@ -437,8 +437,14 @@ final class SpeechInputController: NSObject {
 
     /// 豆包 ASR VAD（executor8 A 方案）：静音段不喂 WS 省额度；说话段 + 前后 ~300ms 缓冲防吞字。
     private var asrVAD = ASRVAD()
+    /// R-2026-08-13：音频设备配置变化监听（OBS/录屏切设备 → 重建采集）
+    private var audioConfigObserver: NSObjectProtocol?
 
     private func stopRecordingInternal() {
+        if let obs = audioConfigObserver {
+            NotificationCenter.default.removeObserver(obs)
+            audioConfigObserver = nil
+        }
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         // 豆包路径：尾段过 VAD → 发送末包等 final（结果经 onFinalText 提交）；
@@ -508,8 +514,10 @@ final class SpeechInputController: NSObject {
         do {
             let inputNode = audioEngine.inputNode
             let format = inputNode.outputFormat(forBus: 0)
-            // 目标格式：16kHz int16 mono（豆包协议要求）
-            guard let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true) else {
+            // R-2026-08-13：目标格式保持源声道数（Float32 16k，回调内手动降混 mono）——
+            // 兼容 OBS/录屏切聚合设备（44.1k/2ch）；旧实现 2ch→1ch 转换失败 → 听写静默。
+            guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
+                                             channels: AVAudioChannelCount(max(1, Int(format.channelCount))), interleaved: false) else {
                 throw NSError(domain: "ASR", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法创建 PCM 目标格式"])
             }
             let converter = AVAudioConverter(from: format, to: target)
@@ -517,6 +525,20 @@ final class SpeechInputController: NSObject {
             pcmAccumulator.removeAll()
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
                 if let converter { self?.handleAudioBuffer(buffer, converter: converter) }
+            }
+            // R-2026-08-13：设备配置变化（OBS 切聚合设备/采样率/声道）→ 重建采集与转换链
+            audioConfigObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isRecording, self.duoyunASR != nil else { return }
+                LogManager.shared.info("豆包听写：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
+                // 幂等重建：停旧 tap/引擎 → 重走豆包启动（重新读格式 + 重装 tap + 重连 ASR）
+                self.stopRecordingInternal()
+                self.isRecording = false
+                self.onStateChange?(false)
+                self.startDuoyunRecording()
+                self.isRecording = true
+                self.onStateChange?(true)
             }
             audioEngine.prepare()
             try audioEngine.start()
@@ -550,8 +572,13 @@ final class SpeechInputController: NSObject {
     }
 
     /// tap 回调：转 16k16bit → 累积 200ms 段喂豆包（不足段累积）。
+    /// R-2026-08-13：兼容设备格式变化（OBS/录屏切聚合设备可能 44.1k/2ch）——
+    /// 目标格式保持源声道数（Float32 16k），回调内手动降混 mono：
+    /// 旧实现 2ch→1ch 转换失败 → 豆包听写静默（与唤醒同因）。
     private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter) {
-        guard let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true) else { return }
+        let srcCh = max(1, Int(buffer.format.channelCount))
+        guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
+                                         channels: AVAudioChannelCount(srcCh), interleaved: false) else { return }
         let ratio = target.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 16)
         guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
@@ -563,8 +590,19 @@ final class SpeechInputController: NSObject {
             return buffer
         }
         if convError != nil { return }
-        if let channel = out.int16ChannelData?[0] {
-            let bytes = Data(bytes: channel, count: Int(out.frameLength) * 2)
+        // 手动降混：多声道平均 → int16 mono（豆包协议要求 16k16bit mono）
+        if let chData = out.floatChannelData {
+            let frames = Int(out.frameLength)
+            var bytes = Data(count: frames * 2)
+            bytes.withUnsafeMutableBytes { raw in
+                let p16 = raw.bindMemory(to: Int16.self)
+                for i in 0..<frames {
+                    var sum: Float = 0
+                    for c in 0..<srcCh { sum += chData[c][i] }
+                    let v = sum / Float(srcCh)
+                    p16[i] = Int16(max(-1, min(1, v)) * 32767)
+                }
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isRecording, let asr = self.duoyunASR else { return }
                 self.pcmAccumulator.append(bytes)

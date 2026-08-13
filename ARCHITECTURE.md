@@ -7,6 +7,7 @@
 ## 0. 项目速览
 
 - macOS 菜单栏桌宠（SwiftPM，无 Xcode 方案），`swift build` + `./build-app.sh` 打包
+- **定位：依托 Hermes 0.19（`hermes-agent`）套壳的 AI 语音助手**——Hermes 提供大脑（双 Agent 会话与工具），DeskPet 提供桌面形象 + 语音交互（唤醒/听写/TTS 播报）+ 桌宠体验
 - 大脑 = Hermes serve（`~/.hermes/hermes-agent/venv/bin/hermes serve`），**本体不可改**，DeskPet 只做客户端适配
 - serve 端口：9119（用户原服务）被占时自启 9120/9121；token 持久化在 UserDefaults（`DeskPetServeToken`，.app 版域为 `com.deskpet.app`，debug 版域为 `DeskPet`）
 - 日志：`~/Library/Logs/DeskPet/deskpet.log`（5MB 轮转保留 2 份）；serve 端日志 `~/.hermes/logs/agent.log`

@@ -235,6 +235,9 @@ final class WakeController {
     /// 唤醒词（可配置：deskpet-config.json wakePhrase，默认 嘿猫猫）。
     var wakePhrase: String = "嘿猫猫"
 
+    /// R-2026-08-13：音频设备配置变化监听（OBS/第三方录屏切换默认输入/采样率 → 自动重建采集）
+    private var configChangeObserver: NSObjectProtocol?
+
     private func startCapture() {
         stopCapture()
         let engine = AVAudioEngine()
@@ -242,8 +245,11 @@ final class WakeController {
         let srcFormat = input.outputFormat(forBus: 0)
         LogManager.shared.info("唤醒采集格式：sr=\(srcFormat.sampleRate) ch=\(srcFormat.channelCount)")
 
-        // 重采样到 16kHz mono：用 AVAudioConverter
-        guard let dstFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false),
+        // R-2026-08-13：兼容设备格式变化（OBS/录屏切聚合设备后可能 44.1k/2ch）——
+        // 转换目标保持源声道数（Float32 16k 重采样），回调内手动降混 mono：
+        // 旧实现直接 2ch→1ch 转换会失败 → 唤醒静默（用户实测：OBS 开启后喊不到）。
+        guard let dstFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
+                                            channels: srcFormat.channelCount, interleaved: false),
               let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
             LogManager.shared.error("音频格式转换初始化失败")
             return
@@ -253,7 +259,7 @@ final class WakeController {
 
         input.installTap(onBus: 0, bufferSize: 2048, format: srcFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            // 转成 16kHz int16 mono（W1：输入回调正确用法——消耗跟踪 + endOfStream）
+            // 转成 16kHz Float32（保持源声道数）
             let frameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: frameCount) else { return }
             var error: NSError?
@@ -273,11 +279,20 @@ final class WakeController {
                 LogManager.shared.error("音频转换失败：\(String(describing: error))")
                 return
             }
-            // 非交错 mono：int16ChannelData[0] 指向数据。
-            // 注意：交错格式（interleaved: true）下该指针恒 nil——feed 永不调用，
-            // 唤醒采集静默失效（2026-08-13 实测定位，曾潜伏两个里程碑）
-            if let data16 = outBuf.int16ChannelData {
-                let bytes = Data(bytes: data16[0], count: Int(outBuf.frameLength) * 2)
+            // 手动降混：Float32 多声道平均 → int16 mono（兼容 1/2/N 声道）
+            if let chData = outBuf.floatChannelData {
+                let frames = Int(outBuf.frameLength)
+                let ch = max(1, Int(outBuf.format.channelCount))
+                var bytes = Data(count: frames * 2)
+                bytes.withUnsafeMutableBytes { raw in
+                    let p16 = raw.bindMemory(to: Int16.self)
+                    for i in 0..<frames {
+                        var sum: Float = 0
+                        for c in 0..<ch { sum += chData[c][i] }
+                        let v = sum / Float(ch)
+                        p16[i] = Int16(max(-1, min(1, v)) * 32767)
+                    }
+                }
                 buffer16.append(bytes)
                 // 凑够 1280 样本（80ms）整块写入检测器
                 let blockBytes = 1280 * 2
@@ -287,6 +302,14 @@ final class WakeController {
                     self.feed(block)
                 }
             }
+        }
+        // R-2026-08-13：设备配置变化（OBS 切聚合设备/采样率/声道）→ 自动重建采集
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            LogManager.shared.info("唤醒：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
+            self.startCapture()   // 内部先 stopCapture 再重建（重新读格式/重装 tap）
         }
         engine.prepare()
         do {
@@ -303,6 +326,10 @@ final class WakeController {
     }
 
     private func stopCapture() {
+        if let obs = configChangeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configChangeObserver = nil
+        }
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil

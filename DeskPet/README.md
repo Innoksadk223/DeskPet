@@ -1,6 +1,6 @@
 # DeskPet 开发者文档
 
-macOS 桌面漂浮桌宠（Swift/AppKit 纯代码，无 storyboard/xib）。后台驱动 **Hermes 双 Agent**：主 Agent 对话 + 任务派发协作协议；任务 Agent 后台执行（文件/终端/搜索全工具）。语音三件套：唤醒词（本地 sherpa KWS）+ 持续聆听 + 语音播报（Edge/豆包/系统）+ 听写识别（本地/豆包流式）。
+macOS 桌面漂浮桌宠（Swift/AppKit 纯代码，无 storyboard/xib）。**依托 Hermes 0.19（`~/.hermes/hermes-agent`）套壳的 AI 语音助手**：Hermes 提供大脑（双 Agent 会话与工具集），DeskPet 提供桌面形象、语音交互（唤醒/听写/TTS 播报）与桌宠体验；本体只做客户端适配，Hermes 本体绝不修改。
 
 > **用户文档**（安装/使用/FAQ）见根目录 `README.md` 与 `指令手册.md`；**架构与机制**见项目根 `../ARCHITECTURE.md`。
 
