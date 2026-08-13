@@ -1,0 +1,359 @@
+import Foundation
+
+/// 桌宠配置（M4）：外观 id、唤醒词、音色、功能开关。
+/// 存储：<项目根>/DeskPet/history/config/（开发模式随项目走，可整体拷贝移植；
+/// 分目录 executor8：配置在 config/，数据/临时在 data/——清理历史绝不碰 config/）。
+/// 路径可移植化（F3）：原固定 Application Support → 项目内；一次性迁移旧文件（复制后删除）。
+/// .app 分发场景（#filePath 为编译机路径，定位失败）回退 AS（尽力而为）。
+/// ② 修复 P1 假成功 bug：打包版 bundle 只读——旧实现写进 bundle 的 save 被 try? 吞掉，
+/// 设置界面照报成功、重建 app 丢配置。现在写入路径固定项目内，读取顺序 项目内优先 →
+/// bundle/项目内 fallback（首次运行读到即用，save 时写项目内完成迁移）。
+/// personas 已迁移至 personas.json；deskpet-config.json 旧 personas 字段
+/// 仍可被 loadPersonas() 读取（兼容迁移），保存时不再写回。
+struct DeskPetConfig: Codable {
+    /// 当前外观/素材 id（人设按它匹配）
+    var petID: String = "monthly-salary-cat"
+    /// 唤醒词（对着桌宠喊这个词唤醒它）
+    var wakePhrase: String = "嘿猫猫"
+    /// 播报音色（系统语音：voice name；豆包：voice_type）
+    var voice: String = ""
+    /// 豆包（火山引擎语音服务 v3）API Key（X-Api-Key；控制台 API Key 管理创建，ark- 开头；空 = 播报链跳过豆包）
+    var duoyunApiKey: String = ""
+    /// 豆包自定义 Base URL（R3-6：空 = 默认 plan 端点
+    /// https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional；非空 = 自定义覆盖，
+    /// 需包含完整请求路径）
+    var duoyunBaseURL: String = ""
+    /// 豆包 TTS 资源 ID（X-Api-Resource-Id；默认 seed-tts-2.0）
+    var duoyunResourceId: String = "seed-tts-2.0"
+    /// 豆包 TTS 音色（speaker；默认 Vivi 2.0——uranus 双通音色，researcher2 实测 seed-tts-2.0 可用 8 个）
+    var duoyunVoiceType: String = "zh_female_vv_uranus_bigtts"
+    /// 开机自启
+    var launchAtLogin: Bool = false
+    /// 播报链顺序（edge | system | duoyun | thirdparty | hermes）——
+    /// edge 为默认读轨（用户决策）：链首首选，isAvailable=false 时跳过（D3 降级 system）
+    var speechChain: [String] = ["edge", "system", "duoyun", "thirdparty", "hermes"]
+    /// 宠物大小档位（1.0 小 / 1.5 中 / 2.25 大——每档 1.5 倍，菜单三档不手填）
+    var petScale: Double = 1.0
+    /// 转录存档保留天数（transcripts/*.jsonl 定期清理，默认 7 天）
+    var transcriptRetentionDays: Int = 7
+    /// Edge 语音音色（edge-tts voice 名，如 zh-CN-XiaoxiaoNeural 晓晓）
+    var edgeVoice: String = "zh-CN-XiaoxiaoNeural"
+    /// 云端 ASR 预留：识别实现（local=现状本地识别；cloud=预留）
+    var asrProvider: String = "local"
+    /// 豆包 ASR 识别 Key（空 = 复用语音 Key duoyunApiKey；自定义服务/套餐过期切 key 时填）
+    var asrApiKey: String = ""
+    /// 识别端点（executor8：空 = 默认豆包 plan 端点
+    /// wss://openspeech.bytedance.com/api/v3/plan/sauc/bigmodel_async；
+    /// 套餐过期/换服务时填完整 wss:// URL 覆盖）
+    var asrURL: String = ""
+    /// P1：持续聆听开关（默认关；开启 = 唤醒替代模式，免唤醒直接对话）
+    var listenMode: Bool = false
+    /// P1：聆听退出词（用户决策 2026-08-12：退出词=「晚安」；「退下/再见」回归对话，
+    /// 不再 contains 误伤拦截；UI 文案已对齐实际——只提「晚安」）
+    var listenExitPhrases: [String] = ["晚安"]   // 用户决策（2026-08-12）：退出词=晚安
+    /// P1：聆听分段静默时长（秒，说完停顿多久提交并续听）
+    var listenSilenceTimeout: Double = 2.0
+    /// 唤醒词灵敏度（sherpa KWS 阈值，默认 0.25；范围 0.1-0.5：
+    /// 越低越灵敏越易误触发，越高越迟钝越易漏；非法值回退默认）
+    var wakeThreshold: Double = 0.25
+    /// P3-1：首启引导已完成标记（首次启动气泡引导，显示一次后置 true）
+    var firstLaunchDone: Bool = false
+
+    /// 共享缓存（M-M4-1：三调用点收敛，save 后刷新）。
+    private static var cached: DeskPetConfig?
+
+    /// 默认值初始化（自定义 init(from:) 存在时需显式保留）。
+    init() {}
+
+    /// Codable 兼容（executor8）：新增字段（asrURL/asrApiKey 等）旧配置无键——
+    /// 合成 decode 对缺键必抛错（误判损坏触发备份）→ 自定义 init 全字段 decodeIfPresent。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        petID = try c.decodeIfPresent(String.self, forKey: .petID) ?? "monthly-salary-cat"
+        wakePhrase = try c.decodeIfPresent(String.self, forKey: .wakePhrase) ?? "嘿猫猫"
+        voice = try c.decodeIfPresent(String.self, forKey: .voice) ?? ""
+        duoyunApiKey = try c.decodeIfPresent(String.self, forKey: .duoyunApiKey) ?? ""
+        duoyunBaseURL = try c.decodeIfPresent(String.self, forKey: .duoyunBaseURL) ?? ""
+        duoyunResourceId = try c.decodeIfPresent(String.self, forKey: .duoyunResourceId) ?? "seed-tts-2.0"
+        duoyunVoiceType = try c.decodeIfPresent(String.self, forKey: .duoyunVoiceType) ?? "zh_female_vv_uranus_bigtts"
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        speechChain = try c.decodeIfPresent([String].self, forKey: .speechChain)
+            ?? ["edge", "system", "duoyun", "thirdparty", "hermes"]
+        petScale = try c.decodeIfPresent(Double.self, forKey: .petScale) ?? 1.0
+        transcriptRetentionDays = try c.decodeIfPresent(Int.self, forKey: .transcriptRetentionDays) ?? 7
+        edgeVoice = try c.decodeIfPresent(String.self, forKey: .edgeVoice) ?? "zh-CN-XiaoxiaoNeural"
+        asrProvider = try c.decodeIfPresent(String.self, forKey: .asrProvider) ?? "local"
+        asrApiKey = try c.decodeIfPresent(String.self, forKey: .asrApiKey) ?? ""
+        asrURL = try c.decodeIfPresent(String.self, forKey: .asrURL) ?? ""
+        listenMode = try c.decodeIfPresent(Bool.self, forKey: .listenMode) ?? false
+        listenExitPhrases = try c.decodeIfPresent([String].self, forKey: .listenExitPhrases) ?? ["晚安"]
+        listenSilenceTimeout = try c.decodeIfPresent(Double.self, forKey: .listenSilenceTimeout) ?? 2.0
+        wakeThreshold = try c.decodeIfPresent(Double.self, forKey: .wakeThreshold) ?? 0.25
+        firstLaunchDone = try c.decodeIfPresent(Bool.self, forKey: .firstLaunchDone) ?? false
+    }
+
+    // MARK: - 文件读写（项目内优先 + 迁移 + 损坏备份）
+
+    /// 配置目录：<项目根>/DeskPet/history/config/（配置文件统一存放：
+    /// deskpet-config.json / personas.json / commands.json / voice-services.json / prompts/；
+    /// 数据/临时文件在 history/data/——清理/删除历史绝不碰本目录）。
+    /// 首次调用触发 AS → 项目内一次性迁移；.app 分发定位失败回退 AS。
+    static func configDir() -> URL {
+        migrateConfigFromASIfNeeded()
+        if let dir = ProjectPaths.projectConfigDir() {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        }
+        // .app 分发（#filePath 为编译机路径，非源码运行）→ 回退 AS（尽力而为）
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        let dir = base.appendingPathComponent("DeskPet/config", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 一次性迁移：AS DeskPet/config/ → 项目内 history/config/（复制后删除旧目录）。
+    /// 跳过损坏备份（*.bak-*）；幂等收敛：目标已存在且内容一致 → 视为已迁移；
+    /// 不一致 → 保留 AS（不覆盖不删除，避免中途旧版写回 AS 丢数据）。
+    /// 子目录（prompts/）递归迁移；全部项就位才删除 AS 目录。
+    private static var didMigrateConfig = false
+    private static func migrateConfigFromASIfNeeded() {
+        guard !didMigrateConfig else { return }
+        didMigrateConfig = true
+        guard let target = ProjectPaths.projectConfigDir() else { return }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        let old = base.appendingPathComponent("DeskPet/config", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: old.path),
+              let files = try? FileManager.default.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) else { return }
+        var allHandled = true
+        for f in files {
+            let name = f.lastPathComponent
+            if name.hasPrefix("deskpet-config.json.bak") { continue }   // 损坏备份不迁移
+            if !migrateItem(from: f, to: target.appendingPathComponent(name)) { allHandled = false }
+        }
+        if allHandled {
+            LogManager.shared.info("配置迁移：Application Support → 项目内 history/config/（全部就位，删除 AS 旧目录）")
+            try? FileManager.default.removeItem(at: old)
+        }
+    }
+
+    /// 单文件/目录迁移：目标不存在 → 复制；存在且内容一致 → 视为已迁移；不一致 → false。
+    private static func migrateItem(from src: URL, to dst: URL) -> Bool {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        _ = fm.fileExists(atPath: src.path, isDirectory: &isDir)
+        if !isDir.boolValue {
+            if fm.fileExists(atPath: dst.path) {
+                let same = (try? Data(contentsOf: src)) == (try? Data(contentsOf: dst))
+                if !same {
+                    LogManager.shared.warn("配置迁移跳过（目标已存在且不一致，保留 AS）：\(src.lastPathComponent)")
+                }
+                return same
+            }
+            return (try? fm.copyItem(at: src, to: dst)) != nil
+        }
+        // 目录：递归迁移子项
+        guard let children = try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else { return false }
+        try? fm.createDirectory(at: dst, withIntermediateDirectories: true)
+        var all = true
+        for c in children {
+            if !migrateItem(from: c, to: dst.appendingPathComponent(c.lastPathComponent)) { all = false }
+        }
+        return all
+    }
+
+    /// 读取配置：项目内优先 → bundle/项目内 fallback（subdir 如 "prompts"）。
+    static func readConfigFile(_ name: String, in subdir: String? = nil) -> Data? {
+        var dir = configDir()
+        if let subdir { dir = dir.appendingPathComponent(subdir, isDirectory: true) }
+        let asFile = dir.appendingPathComponent(name)
+        if let data = try? Data(contentsOf: asFile) { return data }
+        let relative = subdir.map { "config/\($0)/\(name)" } ?? "config/\(name)"
+        if let url = ProjectPaths.find(relative: relative) {
+            return try? Data(contentsOf: url)
+        }
+        return nil
+    }
+
+    /// 写入项目内配置目录（②：返回成败，失败不得静默）。
+    @discardableResult
+    static func writeConfigFile(_ name: String, in subdir: String? = nil, data: Data) -> Bool {
+        var dir = configDir()
+        if let subdir { dir = dir.appendingPathComponent(subdir, isDirectory: true) }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try data.write(to: dir.appendingPathComponent(name), options: .atomic)
+            return true
+        } catch {
+            LogManager.shared.error("配置保存失败：\(name)（\(error.localizedDescription)）")
+            return false
+        }
+    }
+
+    /// ③ 损坏容错：坏文件备份为 <name>.bak-<时间戳>，调用方用默认值。
+    static func backupCorrupted(_ name: String, data: Data) {
+        let backup = configDir().appendingPathComponent("\(name).bak-\(Int(Date().timeIntervalSince1970))")
+        try? data.write(to: backup)
+        LogManager.shared.warn("配置损坏已备份：\(backup.path)，使用默认值")
+    }
+
+    static func load() -> DeskPetConfig {
+        if let cached { return cached }
+        var cfg = DeskPetConfig()
+        if let data = readConfigFile("deskpet-config.json") {
+            if let decoded = try? JSONDecoder().decode(DeskPetConfig.self, from: data) {
+                cfg = decoded
+            } else {
+                backupCorrupted("deskpet-config.json", data: data)   // ③
+            }
+        }
+        cached = cfg
+        return cfg
+    }
+
+    /// ② 保存返回成败（调用方失败时提示，不报假成功）。
+    @discardableResult
+    func save() -> Bool {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(self) else { return false }
+        let ok = Self.writeConfigFile("deskpet-config.json", data: data)
+        if ok { Self.cached = self }
+        return ok
+    }
+
+    // MARK: - 分文件配置（todo #15/#16）
+
+    /// 人设迁移源：项目树 config/personas.json 优先（源码编辑入口，权威），
+    /// bundle 副本兜底（打包时由 build-app.sh 从源复制——可能含旧内容，仅兜底）。
+    private static func personaSourceURL() -> URL? {
+        if let root = ProjectPaths.projectRoot() {
+            let src = root.appendingPathComponent("config/personas.json")
+            if FileManager.default.fileExists(atPath: src.path) { return src }
+        }
+        if let res = Bundle.main.resourceURL {
+            let bundled = res.appendingPathComponent("config/personas.json")
+            if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+        }
+        return nil
+    }
+
+    /// 人设文件持久化（history/config/——与「会话数据全项目内」决策一致）：
+    /// 首次启动从当前生效源复制到 history/config/personas.json（已存在不覆盖），
+    /// 之后读取/编辑一律走 history/——build-app.sh 打包复制只更新 bundle 兜底副本，
+    /// 不再还原用户编辑（修复「删了还有」：打包副本覆盖持久化文件）。
+    /// 一次性迁移（进程内只尝试一次，幂等）：迁移源为项目树 config/ 优先。
+    private static var didMigratePersonas = false
+    private static func ensurePersonasMigrated() {
+        guard !didMigratePersonas else { return }
+        didMigratePersonas = true
+        let dir = configDir()
+        let dst = dir.appendingPathComponent("personas.json")
+        guard !FileManager.default.fileExists(atPath: dst.path) else { return }   // 已存在不覆盖
+        guard let src = personaSourceURL() else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.copyItem(at: src, to: dst)
+            LogManager.shared.info("人设迁移：\(src.path) → \(dst.path)（已存在不覆盖）")
+        } catch {
+            LogManager.shared.error("人设迁移失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 人设文件路径：history/config/personas.json（缺失先迁移）——「编辑人设文件」入口用。
+    static func personasFileURL() -> URL {
+        ensurePersonasMigrated()
+        return configDir().appendingPathComponent("personas.json")
+    }
+
+    /// 人设表：history/config/personas.json 优先（首次自动迁移），bundle/项目内 fallback；损坏备份后返回 [:]。
+    /// 不缓存：文件手动编辑后立即生效（仅在建主会话/开设置菜单时调用，低频）。
+    static func loadPersonas() -> [String: String] {
+        ensurePersonasMigrated()   // 首次：源 config/ → history/（已存在不覆盖）
+        if let data = readConfigFile("personas.json") {
+            if let p = try? JSONDecoder().decode([String: String].self, from: data) {
+                return p
+            }
+            backupCorrupted("personas.json", data: data)   // ③
+        }
+        // fallback：旧 deskpet-config.json 的 personas 字段（迁移期兼容）
+        if let data = readConfigFile("deskpet-config.json"),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let p = obj["personas"] as? [String: String] {
+            return p
+        }
+        return [:]
+    }
+
+    /// P1-4（pm2）：资源迁移——项目树 config/<relative> → history/config/<relative>
+    /// （首次复制，已存在不覆盖——与 personas 同模式；读写一致，消除双目录歧义）。
+    /// commands.json / prompts/voice.json 等读取入口在 load 前调用。
+    static func ensureResourceMigrated(_ relative: String) {
+        let dir = configDir()
+        let dst = dir.appendingPathComponent(relative)
+        guard !FileManager.default.fileExists(atPath: dst.path) else { return }
+        guard let root = ProjectPaths.projectRoot() else { return }   // .app 分发：读 fallback 走 bundle
+        let src = root.appendingPathComponent("config/\(relative)")
+        guard FileManager.default.fileExists(atPath: src.path) else { return }
+        try? FileManager.default.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            try FileManager.default.copyItem(at: src, to: dst)
+            LogManager.shared.info("配置迁移：\(src.path) → \(dst.path)（已存在不覆盖）")
+        } catch {
+            LogManager.shared.error("配置迁移失败：\(relative)（\(error.localizedDescription)）")
+        }
+    }
+
+    /// 语音提示词：history/config/prompts/voice.json 优先（首次自动迁移），bundle/项目内 fallback；损坏备份后默认。
+    static func loadVoicePrompts() -> (input: String, output: String) {
+        ensureResourceMigrated("prompts/voice.json")
+        struct Voice: Codable { var inputSide: String; var outputSide: String }
+        let defaults = (
+            input: "若用户输入来自语音转录（口语化、无标点、可能有同音字或识别误差），请宽容理解其真实意图，必要时可先简短确认再执行。",
+            output: "口语播报轨（<spoken>）必须适合语音朗读：用短句、避免 Markdown/符号/代码、数字与英文读作口语（如 80% → 百分之八十）。"
+        )
+        if let data = readConfigFile("voice.json", in: "prompts") {
+            if let v = try? JSONDecoder().decode(Voice.self, from: data) {
+                return (v.inputSide.isEmpty ? defaults.input : v.inputSide,
+                        v.outputSide.isEmpty ? defaults.output : v.outputSide)
+            }
+            backupCorrupted("voice.json", data: data)   // ③
+        }
+        return defaults
+    }
+
+    /// 语音提示词文件路径：history/config/prompts/voice.json（缺失先迁移/复制）——「编辑语音提示词文件」入口用。
+    static func voicePromptsFileURL() -> URL {
+        ensureResourceMigrated("prompts/voice.json")
+        let dir = configDir()
+        let dst = dir.appendingPathComponent("prompts/voice.json")
+        if !FileManager.default.fileExists(atPath: dst.path),
+           let src = ProjectPaths.find(relative: "config/prompts/voice.json") {
+            try? FileManager.default.createDirectory(at: dst.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: src, to: dst)
+        }
+        return dst
+    }
+
+    /// ① 人设中文名（设置菜单显示）：已知外观映射，未知用 id 本身。
+    /// （pet-installer 安装新形象后在此补充显示名分支；personas.json 为 {id: 提示词}
+    /// 扁平结构，显示名统一走本映射表）
+    static func personaDisplayName(for id: String) -> String {
+        switch id {
+        case "monthly-salary-cat": return "月薪猫"
+        case "cache-capy": return "卡皮巴拉"
+        case "xiaolemi": return "小蕾米"
+        case "momonga": return "卖萌小可爱（Momonga）"
+        default: return id
+        }
+    }
+
+    /// 当前外观的人设（无匹配用默认人设）。
+    func persona(for pet: String) -> String {
+        Self.loadPersonas()[pet] ?? "你是桌宠的主 Agent，负责与用户快速对话、接收任务并派发执行。语气亲切简洁。"
+    }
+}

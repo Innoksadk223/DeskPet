@@ -1,0 +1,316 @@
+{
+  "说明": "桌宠本地指令表（触发词机制）。未命中任何规则 → 走主会话闲聊。action: dispatch(派发任务) | interrupt(打断任务) | new_chat(新开对话) | history(查询记录) | steer_task(跟任务说) | mute(静音,M2) | help(帮助)。type: prefix(前缀) | contains(包含) | regex(正则)。",
+  "rules": [
+    {
+      "type": "prefix",
+      "pattern": "执行任务：",
+      "action": "dispatch",
+      "note": "强制派发，内容即任务"
+    },
+    {
+      "type": "prefix",
+      "pattern": "任务：",
+      "action": "dispatch",
+      "note": "强制派发"
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我执行：",
+      "action": "dispatch",
+      "note": "强制派发"
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我查一下",
+      "action": "dispatch",
+      "note": "长前缀优先于「帮我查」（顺序即优先级）",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我查查",
+      "action": "dispatch",
+      "note": "防「帮我查」截剩「查」残缺",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我查",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "查一下",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我搜索",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我搜",
+      "action": "dispatch",
+      "note": "短触发词，排在「帮我搜索」之后",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "搜索一下",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我找一下",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我找",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我下载一下",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我下载",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "帮我打开",
+      "action": "dispatch",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "打开",
+      "action": "dispatch",
+      "matchType": "prefixStrict",
+      "note": "词边界：「打开思路」不命中，「打开 Apple Music」命中",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "搜索",
+      "action": "dispatch",
+      "matchType": "prefixStrict",
+      "note": "词边界：防「搜索X」单字误伤",
+      "excludePrefixes": [
+        "我的心情",
+        "心情",
+        "心结",
+        "对象",
+        "想法",
+        "脸色"
+      ]
+    },
+    {
+      "type": "prefix",
+      "pattern": "跟任务说：",
+      "action": "steer_task",
+      "note": "转向运行中任务"
+    },
+    {
+      "type": "contains",
+      "pattern": "打断任务",
+      "action": "interrupt"
+    },
+    {
+      "type": "contains",
+      "pattern": "停止任务",
+      "action": "interrupt"
+    },
+    {
+      "type": "contains",
+      "pattern": "中断任务",
+      "action": "interrupt",
+      "note": "自然用语补充（用户实测未命中缺口）"
+    },
+    {
+      "type": "contains",
+      "pattern": "取消任务",
+      "action": "interrupt",
+      "note": "与 delete_task（前缀「删除任务：」）不冲突——prefix 语义不会误命中"
+    },
+    {
+      "type": "contains",
+      "pattern": "停一下",
+      "action": "interrupt"
+    },
+    {
+      "type": "contains",
+      "pattern": "停下来",
+      "action": "interrupt",
+      "note": "「停」单字太宽不加"
+    },
+    {
+      "type": "prefix",
+      "pattern": "打断",
+      "action": "interrupt",
+      "note": "短触发词，需唤醒后使用（M3）"
+    },
+    {
+      "type": "contains",
+      "pattern": "新开对话",
+      "action": "new_chat"
+    },
+    {
+      "type": "contains",
+      "pattern": "新会话",
+      "action": "new_chat"
+    },
+    {
+      "type": "contains",
+      "pattern": "聊天记录",
+      "action": "history"
+    },
+    {
+      "type": "contains",
+      "pattern": "查询记录",
+      "action": "history"
+    },
+    {
+      "type": "contains",
+      "pattern": "最近对话",
+      "action": "history"
+    },
+    {
+      "type": "contains",
+      "pattern": "帮助",
+      "action": "help"
+    },
+    {
+      "type": "contains",
+      "pattern": "你能做什么",
+      "action": "help"
+    },
+    {
+      "type": "prefix",
+      "pattern": "删除任务：",
+      "action": "delete_task",
+      "note": "删除指定任务会话（按标题匹配最近）"
+    },
+    {
+      "type": "contains",
+      "pattern": "删除对话历史",
+      "action": "delete_history",
+      "note": "级联删主会话及全部任务会话（删除前确认）"
+    },
+    {
+      "type": "contains",
+      "pattern": "清空对话",
+      "action": "delete_history"
+    },
+    {
+      "type": "contains",
+      "pattern": "静音",
+      "action": "mute",
+      "note": "切换播报静音",
+      "matchType": "prefixStrict"
+    }
+  ]
+}

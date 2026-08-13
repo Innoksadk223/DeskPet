@@ -1,0 +1,25 @@
+{
+  "petID": "monthly-salary-cat",
+  "voice": "",
+  "duoyunApiKey": "",
+  "duoyunResourceId": "seed-tts-2.0",
+  "duoyunVoiceType": "zh_female_vv_uranus_bigtts",
+  "launchAtLogin": false,
+  "speechChain": [
+    "edge",
+    "system",
+    "duoyun",
+    "thirdparty",
+    "hermes"
+  ],
+  "wakePhrase": "嘿猫猫",
+  "edgeVoice": "zh-CN-XiaoxiaoNeural",
+  "asrProvider": "local",
+  "asrApiKey": "",
+  "listenMode": false,
+  "listenExitPhrases": [
+    "晚安"
+  ],
+  "listenSilenceTimeout": 2.0,
+  "wakeThreshold": 0.25
+}
