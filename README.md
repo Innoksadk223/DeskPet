@@ -10,6 +10,7 @@
 - **宠物形象**：可来自 [petscodex.com](https://petscodex.com/) 等网站（下载 spritesheet 放入 `Pets/` 即可），也可以自己制作（`pet.json` + 序列帧图）
 - **语音方案**：本地系统语音（免费离线）或豆包语音（火山引擎 Agent Plan，TTS 音色更自然）——在设置 ▸ 语音渠道 切换
 - **对话能力**：接入 Hermes 双 Agent——聊天、派任务、联网查资料、操作终端/文件/浏览器
+- **速度与思考**：响应速度与所配置模型一致；思考等级（reasoning_effort，high / medium / max）在 Hermes 侧调整（`~/.hermes/config.yaml`），调低思考等级可加快响应
 
 > 📦 最新版本：[Releases](https://github.com/Innoksadk223/DeskPet/releases) 下载 `DeskPet-0.3.0.dmg`
 
