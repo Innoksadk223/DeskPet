@@ -3,6 +3,13 @@
 桌面上一只会陪你聊天、帮你干活的 AI 小精灵。喊它一声「猫猫」就能对话，说「执行任务：…」它就在后台干活，干完用语音向你汇报。
 
 > 🐱 本质：**依托 Hermes 0.19（`hermes-agent`）基础上套壳的 AI 语音助手**——Hermes 提供大脑（双 Agent 会话与工具），DeskPet 提供桌面形象、语音交互（唤醒/听写/TTS 播报）与桌宠体验。
+> **Hermes 能做到什么，小助手也能做到什么**（联网搜索、终端操作、文件处理、浏览器等全工具）。
+
+## 特性
+
+- **宠物形象**：可来自 [petscodex.com](https://petscodex.com/) 等网站（下载 spritesheet 放入 `Pets/` 即可），也可以自己制作（`pet.json` + 序列帧图）
+- **语音方案**：本地系统语音（免费离线）或豆包语音（火山引擎 Agent Plan，TTS 音色更自然）——在设置 ▸ 语音渠道 切换
+- **对话能力**：接入 Hermes 双 Agent——聊天、派任务、联网查资料、操作终端/文件/浏览器
 
 > 📦 最新版本：[Releases](https://github.com/Innoksadk223/DeskPet/releases) 下载 `DeskPet-0.3.0.dmg`
 
