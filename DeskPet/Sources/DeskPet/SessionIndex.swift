@@ -75,6 +75,8 @@ final class SessionIndex {
     private let maxTasks: Int
     /// A：加载失败（损坏）→ save 跳过，不覆盖原文件
     private var loadFailed = false
+    /// SessionIndex 会被事件 Task 与菜单线程同时访问；所有公开读写统一串行化。
+    private let lock = NSLock()
 
     init(maxTasks: Int = 20) {
         self.maxTasks = maxTasks
@@ -168,100 +170,119 @@ final class SessionIndex {
     /// 设置当前主会话。B 归档语义：stored 变化（新开对话/新建）→ 旧当前归档进 mainSessions；
     /// 同 ID（启动 resume 回写）不归档。当前始终在 mainSessions[0]（最近在前）。
     func setMain(sessionID: String, storedSessionID: String) {
-        let oldStored = record.mainStoredSessionID
-        if !oldStored.isEmpty && oldStored != storedSessionID {
-            // 归档旧当前（防重复：若已在 mainSessions 则不重复 append）
-            if !record.mainSessions.contains(where: { $0.storedSessionID == oldStored }) {
-                record.mainSessions.append(.init(storedSessionID: oldStored,
-                                                 sessionID: record.mainSessionID, createdAt: Date()))
+        lock.withLock {
+            let oldStored = record.mainStoredSessionID
+            if !oldStored.isEmpty && oldStored != storedSessionID {
+                // 归档旧当前（防重复：若已在 mainSessions 则不重复 append）
+                if !record.mainSessions.contains(where: { $0.storedSessionID == oldStored }) {
+                    record.mainSessions.append(.init(storedSessionID: oldStored,
+                                                     sessionID: record.mainSessionID, createdAt: Date()))
+                }
             }
+            record.mainSessionID = sessionID
+            record.mainStoredSessionID = storedSessionID
+            // 当前指针同步到 mainSessions（幂等：同 ID 先移除再插最前）
+            record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
+            record.mainSessions.insert(.init(storedSessionID: storedSessionID, sessionID: sessionID, createdAt: Date()), at: 0)
+            // 上限：超 50 删最旧非当前（当前在 [0]，从尾部删）
+            if record.mainSessions.count > maxMainSessions {
+                record.mainSessions.removeLast(record.mainSessions.count - maxMainSessions)
+            }
+            save()
         }
-        record.mainSessionID = sessionID
-        record.mainStoredSessionID = storedSessionID
-        // 当前指针同步到 mainSessions（幂等：同 ID 先移除再插最前）
-        record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
-        record.mainSessions.insert(.init(storedSessionID: storedSessionID, sessionID: sessionID, createdAt: Date()), at: 0)
-        // 上限：超 50 删最旧非当前（当前在 [0]，从尾部删）
-        if record.mainSessions.count > maxMainSessions {
-            record.mainSessions.removeLast(record.mainSessions.count - maxMainSessions)
-        }
-        save()
     }
 
     /// 全部主会话（最近在前，含当前）。
-    func mainSessions() -> [MainRecord] { record.mainSessions }
+    func mainSessions() -> [MainRecord] { lock.withLock { record.mainSessions } }
 
     /// 删除单个主会话记录 + 归属其的任务（服务端级联删除由调用方负责）。
     /// 当前主被删 → 清空当前指针（调用方负责新建）。返回被删的主记录（供调用方判断是否当前）。
     @discardableResult
     func removeMain(storedSessionID: String) -> MainRecord? {
-        let removed = record.mainSessions.first { $0.storedSessionID == storedSessionID }
-        record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
-        record.tasks.removeAll { $0.mainStoredSessionID == storedSessionID }
-        if record.mainStoredSessionID == storedSessionID {
-            record.mainStoredSessionID = ""
-            record.mainSessionID = ""
+        lock.withLock {
+            let removed = record.mainSessions.first { $0.storedSessionID == storedSessionID }
+            record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
+            record.tasks.removeAll { $0.mainStoredSessionID == storedSessionID }
+            if record.mainStoredSessionID == storedSessionID {
+                record.mainStoredSessionID = ""
+                record.mainSessionID = ""
+            }
+            save()
+            return removed
         }
-        save()
-        return removed
     }
 
     // MARK: - 任务
 
     /// 归属某主会话的任务（删除主会话级联用）。
     func tasksOwned(by mainStoredSessionID: String) -> [TaskRecord] {
-        record.tasks.filter { $0.mainStoredSessionID == mainStoredSessionID }
+        lock.withLock { record.tasks.filter { $0.mainStoredSessionID == mainStoredSessionID } }
     }
 
     func addTask(_ task: TaskRecord) -> TaskRecord {
-        var t = task
-        // B：归属自动填当前主（无归属时）
-        if t.mainStoredSessionID == nil || t.mainStoredSessionID?.isEmpty == true {
-            t.mainStoredSessionID = record.mainStoredSessionID.isEmpty ? nil : record.mainStoredSessionID
-        }
-        record.tasks.append(t)
-        // LRU：超过上限删最旧（未完成的任务保留——避免删运行中的任务）
-        let completedCount = record.tasks.count
-        if completedCount > maxTasks {
-            // 优先删最旧的已完成任务；全未完成时保留（不能删运行中任务）并告警
-            let toRemove = record.tasks.filter { $0.completed }
-                .sorted { $0.createdAt < $1.createdAt }
-                .prefix(completedCount - maxTasks)
-            let removeIDs = Set(toRemove.map(\.storedSessionID))
-            record.tasks.removeAll { removeIDs.contains($0.storedSessionID) }
-            if removeIDs.isEmpty {
-                LogManager.shared.warn("会话索引超上限（\(completedCount)>\(maxTasks)）但无可删的已完成任务，全部保留（运行中任务不可删）")
-            } else {
-                LogManager.shared.info("会话 LRU：清理 \(removeIDs.count) 个最旧任务会话（上限 \(maxTasks)）")
+        lock.withLock {
+            var t = task
+            // B：归属自动填当前主（无归属时）
+            if t.mainStoredSessionID == nil || t.mainStoredSessionID?.isEmpty == true {
+                t.mainStoredSessionID = record.mainStoredSessionID.isEmpty ? nil : record.mainStoredSessionID
             }
+            record.tasks.append(t)
+            // LRU：超过上限删最旧（未完成的任务保留——避免删运行中的任务）
+            let completedCount = record.tasks.count
+            if completedCount > maxTasks {
+                // 优先删最旧的已完成任务；全未完成时保留（不能删运行中任务）并告警
+                let toRemove = record.tasks.filter { $0.completed }
+                    .sorted { $0.createdAt < $1.createdAt }
+                    .prefix(completedCount - maxTasks)
+                let removeIDs = Set(toRemove.map(\.id))
+                record.tasks.removeAll { removeIDs.contains($0.id) }
+                if removeIDs.isEmpty {
+                    LogManager.shared.warn("会话索引超上限（\(completedCount)>\(maxTasks)）但无可删的已完成任务，全部保留（运行中任务不可删）")
+                } else {
+                    LogManager.shared.info("会话 LRU：清理 \(removeIDs.count) 条最旧已完成任务记录（上限 \(maxTasks)）")
+                }
+            }
+            save()
+            return t
         }
-        save()
-        return t
     }
 
     /// #39：按任务实例 id 标记完成（常驻会话下多条记录同 sessionID——不能按 sessionID 匹配）。
     func markTaskCompleted(id: String) {
-        if let i = record.tasks.firstIndex(where: { $0.id == id }) {
-            record.tasks[i].completed = true
-            save()
+        lock.withLock {
+            if let i = record.tasks.firstIndex(where: { $0.id == id }) {
+                record.tasks[i].completed = true
+                save()
+            }
         }
     }
 
     /// 删除单条任务记录（#39 常驻共享：只删列表记录，会话内容保留）。
     @discardableResult
     func removeTask(id: String) -> TaskRecord? {
-        guard let i = record.tasks.firstIndex(where: { $0.id == id }) else { return nil }
-        let removed = record.tasks.remove(at: i)
-        save()
-        return removed
+        lock.withLock {
+            guard let i = record.tasks.firstIndex(where: { $0.id == id }) else { return nil }
+            let removed = record.tasks.remove(at: i)
+            save()
+            return removed
+        }
     }
 
-    func taskRecords() -> [TaskRecord] { record.tasks }
+    func taskRecords() -> [TaskRecord] { lock.withLock { record.tasks } }
 
     func clear() {
-        record = Record()
-        save()
+        lock.withLock {
+            record = Record()
+            save()
+        }
     }
 
-    var mainStoredSessionID: String { record.mainStoredSessionID }
+    var mainStoredSessionID: String { lock.withLock { record.mainStoredSessionID } }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T {
+        lock(); defer { unlock() }
+        return body()
+    }
 }

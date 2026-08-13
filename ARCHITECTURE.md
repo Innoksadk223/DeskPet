@@ -84,13 +84,15 @@ EdgeTTSProvider.swift         AppDelegate.swift（胶水层）      DeskPetConfi
 
 ```
 主 Agent 回复含 <task>…</task> 标记 → parseTaskMarkers 剥离 → startTask
-→ 常驻任务会话（种子注入一次，跨任务复用，上下文是特性）
+→ 常驻任务会话（种子注入一次，跨任务复用，上下文是特性；同一时间只执行一个 turn）
+→ 若当前任务仍在执行，新任务进入桌宠本地队列，前一任务结束后按顺序提交
 → 任务 Agent 执行（工具/搜索/终端）
 → 任务消息（自带 spoken/formal）→ scheduleTaskCompletion（complete + 1.5s 静默窗口）
 → 空结果按失败处理（不报"任务完成"）→ 回填主会话 → 口语化报告（低优播报）
 ```
 
 - 标记协议：`<task>`（派发）/ `<task_steer>`（追加指令）/ `<task_status>`（状态查询）/ `<task_cancel>`（取消）
+- 任务队列：最多排队 5 个；新任务不打断当前 turn，显式停止时当前任务与等待队列一起清空
 - 打断：`interruptTask() -> Bool`——无运行任务返回 false（空闲菜单置灰）
 - 打断后：明确「任务已停止，不会再有结果了」，精确取消未提交回填
 

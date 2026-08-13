@@ -80,7 +80,7 @@ DeskPet/
 | `<task_steer>…` | 任务执行中追加调整 |
 | `<task_cancel/>` | 取消任务 |
 
-任务完成 → 任务 Agent 回填主 Agent → 口语化报告（气泡 + 播报）。router 触发词（「执行任务：…」等）直接派发不经过 LLM。双轨输出协议（`<spoken>` 口语概要 + `<formal>` 完整正文）详见 `../ARCHITECTURE.md` §3。
+任务完成 → 任务 Agent 回填主 Agent → 口语化报告（气泡 + 播报）。同一常驻任务会话一次只执行一个 turn；执行中到来的新任务进入本地队列（最多 5 个），按顺序执行，显式停止时清空队列。router 触发词（「执行任务：…」等）直接派发不经过 LLM。双轨输出协议（`<spoken>` 口语概要 + `<formal>` 完整正文）详见 `../ARCHITECTURE.md` §3。
 
 ## 安全说明
 

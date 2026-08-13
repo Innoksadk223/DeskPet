@@ -210,8 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await bridge.adoptRunningTask()
                 // R3-1：serve 长跑自愈接线——任务避让检查（运行中任务不重启）+ 健康检查启动
                 ServeManager.shared.onTaskRunningCheck = { [weak self] in
-                    guard let self, let task = self.bridge?.activeTask else { return false }
-                    return !task.isComplete
+                    self?.bridge?.isTaskBusy() ?? false
                 }
                 // P1-3（pm2）：自愈可见化——重启/失败/避让事件气泡+播报（切主线程）
                 ServeManager.shared.onEvent = { [weak self] message in
@@ -399,8 +398,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanedFormal = msg.formal.trimmingCharacters(in: .whitespacesAndNewlines)
                 if cleanedSpoken.isEmpty && cleanedFormal.isEmpty {
-                    LogManager.shared.warn("主回复为空（formal/spoken 均空，isUserTurn=\(msg.isUserTurn)）——跳过气泡与播报")
-                    if msg.isUserTurn {
+                    LogManager.shared.warn("主回复为空（formal/spoken 均空，isUserTurn=\(msg.isUserTurn), protocolOnly=\(msg.protocolOnly)）——跳过气泡与播报")
+                    if msg.protocolOnly {
+                        self.showBubble("⏳ 正在处理，请稍等…", maxDuration: Self.transitionBubbleTimeout)
+                    } else if msg.isUserTurn {
                         self.showBubble("刚才那句我没接住，再说一遍？")
                     }
                     return
@@ -452,6 +453,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self?.showBubble("📋 \(title)")
                 SpeechOutputManager.shared.speak(spoken, priority: .low, tag: tag)
+            }
+        }
+        bridge.onTaskQueued = { [weak self] title, position in
+            LogManager.shared.info("任务排队：第 \(position) 个：\(title)")
+            DispatchQueue.main.async {
+                self?.showBubble("⏳ 当前任务还在执行，已排队第 \(position) 项：\(title)", persistent: true)
             }
         }
         bridge.onTaskMessage = { [weak self] msg in
@@ -1631,7 +1638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let state = t.completed ? "✅" : "●"
             let owner = mains.first { $0.storedSessionID == t.mainStoredSessionID }
             let ownerTag = owner.map { $0.storedSessionID == bridge.sessionIndex.mainStoredSessionID ? "" : "（历史主）" } ?? ""
-            items.append(.init(id: t.sessionID,
+            items.append(.init(id: t.id,
                                title: "\(state) \(truncated)\(ownerTag) · \(formatter.string(from: t.createdAt))",
                                isMain: false, isCurrent: false, group: "task"))
         }
@@ -1677,7 +1684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        guard let rec = bridge.sessionIndex.taskRecords().first(where: { $0.sessionID == id }) else {
+        guard let rec = bridge.sessionIndex.taskRecords().first(where: { $0.id == id }) else {
             // F5：静默路径消除——入口点击必有反馈
             feedback("⚠️ 该任务记录不存在（可能已被移除）")
             return
@@ -1751,7 +1758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             confirmDeleteMain(rec)
             return
         }
-        guard let rec = bridge.sessionIndex.taskRecords().first(where: { $0.sessionID == id }) else { return }
+        guard let rec = bridge.sessionIndex.taskRecords().first(where: { $0.id == id }) else { return }
         let title = rec.title
         // P1-1：文案与行为一致——删单任务只移除记录（常驻会话内容保留，非永久删除）
         let confirm = alert("移除任务记录", "从列表移除该任务记录「\(title)」？（常驻任务会话内容保留，不影响其它任务记录）", buttons: ["移除", "取消"])

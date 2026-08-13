@@ -291,8 +291,14 @@ final class HermesClient {
                            model: (r["info"] as? [String: Any])?["model"] as? String)
     }
 
-    func submit(_ text: String, sessionID: String) async throws {
-        try await call("prompt.submit", params: ["session_id": sessionID, "text": text])
+    /// 提交一轮 prompt；queued=true 表示忙时必须排队，不能 redirect/interrupt 当前 turn。
+    /// 返回服务端 status（通常为 streaming / queued / redirected）。
+    @discardableResult
+    func submit(_ text: String, sessionID: String, queued: Bool = false) async throws -> String {
+        var params: [String: Any] = ["session_id": sessionID, "text": text]
+        if queued { params["queued"] = true }
+        let response = try await call("prompt.submit", params: params)
+        return response["status"] as? String ?? ""
     }
 
     /// 不打断注入（下一工具结果生效）——"跟任务说：xxx"

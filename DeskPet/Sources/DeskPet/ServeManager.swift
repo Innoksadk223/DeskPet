@@ -24,6 +24,10 @@ final class ServeManager {
     /// P1-3（pm2）：自愈事件通知（AppDelegate 注入——气泡/播报可见化；任意线程回调，注入方自行切主线程）
     var onEvent: ((String) -> Void)?
     private var pendingRestart = false          // 任务运行中触发的重启请求（任务完成后执行）
+    /// 传输层已经失效时，任务不可能自行完成；超过宽限期允许重启，避免「等待任务完成→任务永远无法完成」死锁。
+    private var taskRestartDeferredAt: Date?
+    private let taskRestartGrace: TimeInterval = 30
+    private var forcedRestartWorkItem: DispatchWorkItem?
     private var lastRestartAt = Date.distantPast
     private var restartCount = 0                // 1 小时窗口内重启次数（防风暴）
     private var restartWindowStart = Date()
@@ -81,12 +85,42 @@ final class ServeManager {
             onEvent?("⚠️ 助手服务异常（已停止自愈）——设置菜单「系统▸重新连接助手服务」可恢复")
             return
         }
-        // 任务避让：运行中任务不重启（防中断）——标记待重启，任务完成后由 AppDelegate flush
+        // 任务避让：正常健康/预防性重启继续等待任务完成；但 WS 已失效时任务无法
+        // 自行完成，超过宽限期必须重启，否则会形成永久 pendingRestart 死锁。
         if onTaskRunningCheck?() == true {
-            pendingRestart = true
-            LogManager.shared.info("ServeManager: 任务运行中，重启延迟（\(reason)）——任务完成后执行")
-            // U3：预告气泡删除——内部自愈计划无需用户知情（仅日志）
-            return
+            let transportLost = reason.contains("传输") || reason.contains("ws")
+            if !transportLost {
+                pendingRestart = true
+                LogManager.shared.info("ServeManager: 任务运行中，重启延迟（\(reason)）——任务完成后执行")
+                return
+            }
+            let now = Date()
+            if let deferredAt = taskRestartDeferredAt,
+               now.timeIntervalSince(deferredAt) >= taskRestartGrace {
+                pendingRestart = false
+                taskRestartDeferredAt = nil
+                LogManager.shared.warn("ServeManager: WS 失效已超过 \(Int(taskRestartGrace))s，强制重启以收敛运行中任务")
+            } else {
+                if taskRestartDeferredAt == nil {
+                    taskRestartDeferredAt = now
+                    if forcedRestartWorkItem == nil {
+                        let item = DispatchWorkItem { [weak self] in
+                            guard let self, self.pendingRestart,
+                                  self.onTaskRunningCheck?() == true else { return }
+                            self.pendingRestart = false
+                            self.taskRestartDeferredAt = nil
+                            self.forcedRestartWorkItem = nil
+                            LogManager.shared.warn("ServeManager: WS 失效超过 \(Int(self.taskRestartGrace))s，强制重启以收敛运行中任务")
+                            Task { await self.performRestart(reason: "任务运行超时强制重启") }
+                        }
+                        forcedRestartWorkItem = item
+                        DispatchQueue.main.asyncAfter(deadline: .now() + taskRestartGrace, execute: item)
+                    }
+                }
+                pendingRestart = true
+                LogManager.shared.info("ServeManager: WS 失效且任务运行中，重启延迟（最多 \(Int(taskRestartGrace))s）")
+                return
+            }
         }
         await performRestart(reason: reason)
     }
@@ -95,6 +129,9 @@ final class ServeManager {
     func flushPendingRestart() {
         guard pendingRestart, onTaskRunningCheck?() != true else { return }
         pendingRestart = false
+        taskRestartDeferredAt = nil
+        forcedRestartWorkItem?.cancel()
+        forcedRestartWorkItem = nil
         LogManager.shared.info("ServeManager: 任务已完成，执行延迟重启")
         Task { await performRestart(reason: "任务完成后的延迟重启") }
     }
@@ -106,7 +143,11 @@ final class ServeManager {
             return
         }
         // 成功/失败后必须复位（含异常/取消路径）
-        defer { releaseRestart() }
+        defer {
+            releaseRestart()
+            forcedRestartWorkItem?.cancel()
+            forcedRestartWorkItem = nil
+        }
         LogManager.shared.info("ServeManager: 重启 serve（原因：\(reason)，时间 \(Date())）")
         let oldPort = config.port
         // C1：杀旧进程升级——TERM 宽限 5s → 端口未释放（SIGSTOP 僵死：TERM 信号挂起无法处理）→ SIGKILL 兜底。

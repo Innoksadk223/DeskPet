@@ -3,7 +3,7 @@ import AVFoundation
 import Speech
 
 /// 豆包 ASR VAD（executor8 A 方案）：静音段不喂 WS 省额度；说话段 + 前后 ~300ms 缓冲防吞字。
-/// 仅在豆包路径使用（local 路径 Apple 自带端点检测，零改动）。
+/// 仅在豆包路径使用（local 路径使用 Apple 自带端点检测；两条路径均在设备配置变化时重建采集）。
 /// 语义：每 200ms 段算 RMS（16k int16 归一化幅值）→ 低于门限为静音段；
 /// 静音段进 pendingSilence 队列（只保留最近 2 段 ≈ 400ms）——检测到语音时先 flush 再发当前段
 /// （补字头）；语音结束后的尾巴（tailSegments=2 段）照发（防尾字截断）。
@@ -296,6 +296,20 @@ final class SpeechInputController: NSObject {
             audioEngine.prepare()
             try audioEngine.start()
 
+            audioConfigObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
+            ) { [weak self, epoch] _ in
+                guard let self,
+                      epoch == self.recognitionEpoch,
+                      self.isRecording,
+                      self.duoyunASR == nil else { return }
+                LogManager.shared.info("本地听写：音频设备配置变化 → 重建采集")
+                self.stopRecordingInternal()
+                self.isRecording = false
+                self.onStateChange?(false)
+                self.startRecording()
+            }
+
             recognitionTask = recognizer?.recognitionTask(with: request) { [weak self, epoch] result, error in
                 guard let self else { return }
                 // V2：识别回调在后台队列——一律切主线程（UI 更新 + AVAudioEngine 线程安全）
@@ -485,24 +499,32 @@ final class SpeechInputController: NSObject {
     /// 仅最终结果（无中间字）；失败 → onASRError（AppDelegate 本次会话回退本地 + 提示）。
     private func startDuoyunRecording() {
         recognitionEpoch += 1
+        let epoch = recognitionEpoch
         didSubmitFinal = false
         lastPartialText = ""
         let asr = DuoyunASRProvider()
+        let asrIdentity = ObjectIdentifier(asr)
         duoyunASR = asr
         asrVAD = ASRVAD()   // 每轮识别重置 VAD 状态
-        asr.onFinalText = { [weak self] text in
-            guard let self else { return }
-            DispatchQueue.main.async {
-                guard !self.didSubmitFinal else { return }
+        asr.onFinalText = { [weak self, epoch, asrIdentity] text in
+            DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
+                guard let self,
+                      epoch == self.recognitionEpoch,
+                      let currentASR = self.duoyunASR,
+                      ObjectIdentifier(currentASR) == asrIdentity,
+                      !self.didSubmitFinal else { return }
                 self.didSubmitFinal = true
                 LogManager.shared.info("豆包识别 final：\(text.prefix(40))…")
                 // P0-1：豆包路径无置信度（VAD 已滤静音）——仅长度规则生效
                 self.submitTranscript(text, confidence: nil)
             }
         }
-        asr.onError = { [weak self] message in
-            guard let self else { return }
-            DispatchQueue.main.async {
+        asr.onError = { [weak self, epoch, asrIdentity] message in
+            DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
+                guard let self,
+                      epoch == self.recognitionEpoch,
+                      let currentASR = self.duoyunASR,
+                      ObjectIdentifier(currentASR) == asrIdentity else { return }
                 self.duoyunFailedThisSession = true   // 本次会话回退本地
                 LogManager.shared.warn("豆包识别失败（本次会话回退本地）：\(message)")
                 self.stopRecordingInternal()
@@ -523,14 +545,21 @@ final class SpeechInputController: NSObject {
             let converter = AVAudioConverter(from: format, to: target)
             pcmConverter = converter
             pcmAccumulator.removeAll()
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-                if let converter { self?.handleAudioBuffer(buffer, converter: converter) }
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, epoch, asrIdentity] buffer, _ in
+                if let converter {
+                    self?.handleAudioBuffer(buffer, converter: converter,
+                                            epoch: epoch, asrIdentity: asrIdentity)
+                }
             }
             // R-2026-08-13：设备配置变化（OBS 切聚合设备/采样率/声道）→ 重建采集与转换链
             audioConfigObserver = NotificationCenter.default.addObserver(
                 forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
-            ) { [weak self] _ in
-                guard let self, self.isRecording, self.duoyunASR != nil else { return }
+            ) { [weak self, epoch, asrIdentity] _ in
+                guard let self,
+                      epoch == self.recognitionEpoch,
+                      self.isRecording,
+                      let currentASR = self.duoyunASR,
+                      ObjectIdentifier(currentASR) == asrIdentity else { return }
                 LogManager.shared.info("豆包听写：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
                 // 幂等重建：停旧 tap/引擎 → 重走豆包启动（重新读格式 + 重装 tap + 重连 ASR）
                 self.stopRecordingInternal()
@@ -542,11 +571,15 @@ final class SpeechInputController: NSObject {
             }
             audioEngine.prepare()
             try audioEngine.start()
-            Task {
+            Task { [weak self, epoch, asrIdentity] in
                 do {
                     try await asr.start()
                 } catch {
-                    DispatchQueue.main.async {
+                    DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
+                        guard let self,
+                              epoch == self.recognitionEpoch,
+                              let currentASR = self.duoyunASR,
+                              ObjectIdentifier(currentASR) == asrIdentity else { return }
                         self.duoyunFailedThisSession = true
                         LogManager.shared.warn("豆包 ASR 会话建立失败（本次会话回退本地）：\(error)")
                         self.stopRecordingInternal()
@@ -575,7 +608,8 @@ final class SpeechInputController: NSObject {
     /// R-2026-08-13：兼容设备格式变化（OBS/录屏切聚合设备可能 44.1k/2ch）——
     /// 目标格式保持源声道数（Float32 16k），回调内手动降混 mono：
     /// 旧实现 2ch→1ch 转换失败 → 豆包听写静默（与唤醒同因）。
-    private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter) {
+    private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter,
+                                   epoch: Int, asrIdentity: ObjectIdentifier) {
         let srcCh = max(1, Int(buffer.format.channelCount))
         guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
                                          channels: AVAudioChannelCount(srcCh), interleaved: false) else { return }
@@ -603,8 +637,12 @@ final class SpeechInputController: NSObject {
                     p16[i] = Int16(max(-1, min(1, v)) * 32767)
                 }
             }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isRecording, let asr = self.duoyunASR else { return }
+            DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
+                guard let self,
+                      epoch == self.recognitionEpoch,
+                      self.isRecording,
+                      let asr = self.duoyunASR,
+                      ObjectIdentifier(asr) == asrIdentity else { return }
                 self.pcmAccumulator.append(bytes)
                 if self.pcmAccumulator.count >= 6400 {
                     let seg = self.pcmAccumulator.prefix(6400)

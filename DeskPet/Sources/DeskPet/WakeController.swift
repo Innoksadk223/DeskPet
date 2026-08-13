@@ -22,6 +22,9 @@ final class WakeController {
     private var audioEngine: AVAudioEngine?
     private var detectorProc: Process?
     private var detectorStdin: FileHandle?
+    /// 检测器 stdout 分片缓冲：只处理完整行，残段留待下一次读取。
+    private var pendingStdout = ""
+    private let stdoutBufferLock = NSLock()
 
     var isEnabled: Bool { currentState != .disabled }
     var currentState: State = .disabled {
@@ -146,35 +149,44 @@ final class WakeController {
         }
         LogManager.shared.info("唤醒监听已启动（本地检测：\(wakePhrase)）")
         // 监听检测事件（后台线程回调；逐行解析 detected/heartbeat）
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            // B5-2：EOF（空数据）后必须取消注册——否则 EOF 持续可读 → fd_monitoring 空转
-            if data.isEmpty {
+        stdoutBufferLock.lock()
+        pendingStdout.removeAll(keepingCapacity: true)
+        stdoutBufferLock.unlock()
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self, weak proc] handle in
+            guard let self, let proc, self.detectorProc === proc else {
                 handle.readabilityHandler = nil
                 return
             }
-            guard !data.isEmpty, let self else { return }
-            let text = String(data: data, encoding: .utf8) ?? ""
-            var hitDetected = false
-            var hitLine = ""
-            for line in text.split(whereSeparator: \.isNewline) {
-                if line.contains("detected") {
-                    hitDetected = true
-                    hitLine = String(line)
+            let data = handle.availableData
+            // B5-2：EOF（空数据）后先处理最后半行，再取消注册——否则 EOF 持续可读 → fd_monitoring 空转
+            if data.isEmpty {
+                self.stdoutBufferLock.lock()
+                let remainder = self.pendingStdout
+                self.pendingStdout.removeAll(keepingCapacity: true)
+                self.stdoutBufferLock.unlock()
+                if !remainder.isEmpty {
+                    self.processWakeLines([remainder])
                 }
+                handle.readabilityHandler = nil
+                return
             }
             // E-W6：任何 stdout 输出（detected/heartbeat）都刷新健康时间戳
             self.detectorOutputLock.lock()
             self.lastDetectorOutput = Date()
             self.detectorOutputLock.unlock()
-            if hitDetected {
-                DispatchQueue.main.async {
-                    LogManager.shared.info("唤醒命中：\(hitLine)")
-                    self.onWakeDetected?()
-                }
+
+            let text = String(data: data, encoding: .utf8) ?? ""
+            var lines: [String] = []
+            self.stdoutBufferLock.lock()
+            self.pendingStdout.append(text)
+            while let idx = self.pendingStdout.firstIndex(of: "\n") {
+                lines.append(String(self.pendingStdout[..<idx]))
+                self.pendingStdout = String(self.pendingStdout[self.pendingStdout.index(after: idx)...])
             }
+            self.stdoutBufferLock.unlock()
+            self.processWakeLines(lines)
         }
-        startCapture()
+        guard startCapture() else { return }
         currentState = .listening
         startHeartbeatMonitor()
     }
@@ -210,7 +222,7 @@ final class WakeController {
         // E3：命中恢复防抖——听写刚结束的语音尾巴不再连环触发
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, self.currentState == .detected else { return }
-            self.startCapture()
+            guard self.startCapture() else { return }
             self.currentState = .listening
         }
     }
@@ -226,7 +238,7 @@ final class WakeController {
     /// 手动语音输入结束 → 恢复唤醒采集（若处于监听态）。
     func resumeCapture() {
         guard currentState == .listening, audioEngine == nil else { return }
-        startCapture()
+        guard startCapture() else { return }
         LogManager.shared.info("手动语音输入结束：唤醒采集恢复")
     }
 
@@ -238,7 +250,7 @@ final class WakeController {
     /// R-2026-08-13：音频设备配置变化监听（OBS/第三方录屏切换默认输入/采样率 → 自动重建采集）
     private var configChangeObserver: NSObjectProtocol?
 
-    private func startCapture() {
+    private func startCapture() -> Bool {
         stopCapture()
         let engine = AVAudioEngine()
         let input = engine.inputNode
@@ -252,7 +264,9 @@ final class WakeController {
                                             channels: srcFormat.channelCount, interleaved: false),
               let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
             LogManager.shared.error("音频格式转换初始化失败")
-            return
+            currentState = .disabled
+            onFailure?("音频格式转换初始化失败")
+            return false
         }
         let ratio = 16000.0 / srcFormat.sampleRate
         var buffer16 = Data()
@@ -309,19 +323,41 @@ final class WakeController {
         ) { [weak self] _ in
             guard let self else { return }
             LogManager.shared.info("唤醒：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
-            self.startCapture()   // 内部先 stopCapture 再重建（重新读格式/重装 tap）
+            if !self.startCapture() {
+                LogManager.shared.warn("唤醒：设备变化重建采集失败（已回退 disabled）")
+            }
         }
         engine.prepare()
         do {
             try engine.start()
             audioEngine = engine
             LogManager.shared.info("唤醒音频采集开始（16kHz → 本地检测器）")
+            return true
         } catch {
             LogManager.shared.error("唤醒音频采集失败：\(error)")
             // R-M3-2：采集失败 → 回退 disabled（避免"看似开启实则无音频"）
             input.removeTap(onBus: 0)
             currentState = .disabled
             onFailure?("音频采集失败：\(error.localizedDescription)")   // P1-06
+            return false
+        }
+    }
+
+    /// 解析已切出的完整行；EOF 的最后半行也走此路径，避免命中事件丢失。
+    private func processWakeLines(_ lines: [String]) {
+        var hitDetected = false
+        var hitLine = ""
+        for line in lines {
+            if line.contains("detected") {
+                hitDetected = true
+                hitLine = line
+            }
+        }
+        guard hitDetected else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            LogManager.shared.info("唤醒命中：\(hitLine)")
+            self.onWakeDetected?()
         }
     }
 
