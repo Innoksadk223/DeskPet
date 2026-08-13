@@ -4,7 +4,7 @@ macOS 桌面漂浮桌宠（Swift/AppKit 纯代码，无 storyboard/xib）。后�
 主 Agent 快速对话 + 任务派发协作协议；任务 Agent 后台执行（文件/终端/搜索全工具）。
 语音三件套：唤醒词（本地 sherpa KWS）+ 持续聆听 + 语音播报（Edge/豆包/系统）+ 听写识别（本地/豆包流式）。
 
-> **📘 交接指引（AI 接手必读）**：完整架构与机制见项目根 `ARCHITECTURE.md`（双轨协议/播报串行化/修复决策/排查指南）。
+> **📘 交接指引（AI 接手必读）**：完整架构与机制见项目根 `../ARCHITECTURE.md`（双轨协议/播报串行化/修复决策/排查指南）。
 >
 > **🚫 铁律（不可违背）**：
 > - **Hermes 本体与 serve（`~/.hermes/hermes-agent/`）绝不修改**——桌宠只做客户端适配
@@ -26,8 +26,8 @@ macOS 桌面漂浮桌宠（Swift/AppKit 纯代码，无 storyboard/xib）。后�
 ## 快速开始
 
 ```bash
-# 方式一：DMG 安装（分发/更新）
-open DeskPet-<版本>.dmg        # 双击 → 拖 DeskPet.app 到 Applications；未验证提示时右键→打开
+# 方式一：DMG 安装（分发/更新）——dmg 在项目根（../DeskPet-<版本>.dmg）
+open ../DeskPet-<版本>.dmg      # 双击 → 拖 DeskPet.app 到 Applications；未验证提示时右键→打开
 
 # 方式二：源码构建运行
 cd ~/Downloads/项目-助手/DeskPet
@@ -37,7 +37,7 @@ cd ~/Downloads/项目-助手/DeskPet
 swift run DeskPet                    # 开发模式
 ```
 
-重新打包 DMG：`../build-dmg.sh [版本号]`（项目根，默认 0.3.0，产物 DeskPet-<版本>.dmg）。
+重新打包 DMG：`../build-dmg.sh [版本号]`（项目根脚本，默认 0.3.0，产物 `../DeskPet-<版本>.dmg`）。
 
 ## 工程结构
 
@@ -72,7 +72,7 @@ DeskPet/
 └── README.md / 指令手册.md
 ```
 
-项目根：`build-dmg.sh`（DMG 打包）+ `ARCHITECTURE.md`（架构与机制交接）+ `HANDOFF.md`（历史交接，已弃用）
+项目根：`../build-dmg.sh`（DMG 打包）+ `../ARCHITECTURE.md`（架构与机制交接）
 
 ## 配置说明（history/config/）
 
