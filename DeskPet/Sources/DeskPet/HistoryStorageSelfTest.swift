@@ -12,6 +12,9 @@ import ObjectiveC
 ///    - M4 ownership 标记（不含隐私）
 ///    - v12 W2 workspace：幂等创建 ~/.deskpet/hermes/workspace、目录校验、标准化后位于
 ///      realHome 内；路径被占用/失败时抛可见 directory 错误（不静默降级），修复后可重试
+///    - v13 S1/S2 专属 SOUL：缺失从模板原子创建；旧主链接（→~/.hermes/SOUL.md）只删链接
+///      后替换且主 SOUL 内容/mtime 不变；既有普通文件保留不覆盖；其他链接 conflict 不接管；
+///      幂等；workspace/ 无第二份 SOUL
 /// 2. 后端 contract/profile_name 正反例：SessionInfo.parse + validateBackendContract（M3 硬门槛）。
 /// 3. legacy（profile=nil）与新版 profile 记录往返：SessionIndex 记录层 Codable 兼容
 ///    （resume/delete 按记录 profile 路由的数据源）。
@@ -77,6 +80,19 @@ enum HistoryStorageSelfTest {
         }
         func isConflict(_ e: DeskPetHermesProfile.ProfileError?) -> Bool { if case .conflict? = e { return true }; return false }
         func isDirectory(_ e: DeskPetHermesProfile.ProfileError?) -> Bool { if case .directory? = e { return true }; return false }
+        /// v13：模板内容（与产品同一来源：ProjectPaths 定位 bundle/项目 config/SOUL.md）
+        func soulTemplateData() -> Data? {
+            guard let t = ProjectPaths.find(relative: "config/SOUL.md") else { return nil }
+            return try? Data(contentsOf: t)
+        }
+        func isSymlink(_ path: URL) -> Bool { (try? fm.destinationOfSymbolicLink(atPath: path.path)) != nil }
+        // v13 内容契约：模板必须是用户确认草稿——含核心身份（个人数字管家）且不含口气/人格注入
+        let tplText = soulTemplateData().flatMap { String(data: $0, encoding: .utf8) }
+        check("SOUL 模板为已确认草稿（身份=个人数字管家）",
+              tplText?.contains("个人数字管家") == true, tplText.map { "模板长度 \($0.count)" } ?? "模板缺失")
+        check("SOUL 模板声明职责分层（口气→personas、语音→voice prompts）",
+              tplText?.contains("persona") == true && tplText?.contains("voice prompts") == true,
+              tplText.map { "模板长度 \($0.count)" } ?? "模板缺失")
 
         // 1a. 预置目录拒绝（既有 deskpet-app 为普通目录——非本应用链接，不覆盖）
         try? fm.createDirectory(at: linkPath, withIntermediateDirectories: true)
@@ -154,8 +170,101 @@ enum HistoryStorageSelfTest {
             }
             check("幂等后 workspace 仍为目录",
                   fm.fileExists(atPath: workspacePath.path, isDirectory: &isDir) && isDir.boolValue)
+            // v13（S1/S3）：缺失创建——专属 SOUL 为真实文件且内容==模板；workspace 无第二份 SOUL
+            let soul = realHome.appendingPathComponent("SOUL.md", isDirectory: false)
+            let soulIsRegular = !isSymlink(soul)
+            let soulMatchesTemplate = (try? Data(contentsOf: soul)) == soulTemplateData()
+            check("专属 SOUL 缺失创建：真实文件（非符号链接）", soulIsRegular)
+            check("专属 SOUL 内容与模板一致", soulMatchesTemplate)
+            check("workspace/ 无第二份 SOUL（不重复注入 identity）",
+                  !fm.fileExists(atPath: workspacePath.appendingPathComponent("SOUL.md").path))
         } catch {
             check("权限修复后 ensure 重试成功（H2）", false, "\(error)")
+        }
+
+        // ---- 1g-v13. 专属 SOUL 生命周期（install-dedicated-soul，临时 HOME；resetEnsureForTesting 复位一次性标记）----
+        let soul = realHome.appendingPathComponent("SOUL.md", isDirectory: false)
+        let mainSoul = homeRoot.appendingPathComponent(".hermes/SOUL.md", isDirectory: false)
+        let elsewhereSoul = homeRoot.appendingPathComponent("elsewhere-soul.md", isDirectory: false)
+        func soulIsRegularFileWithTemplate() -> Bool {
+            guard !isSymlink(soul), let tpl = soulTemplateData() else { return false }
+            return (try? Data(contentsOf: soul)) == tpl
+        }
+
+        // 1h. 既有普通文件保留：用户自定义内容 → ensure 不覆盖（升级/重启不重写）
+        let customSoul = "# 我的专属 SOUL\n自定义内容 v1\n"
+        try? customSoul.data(using: .utf8)!.write(to: soul)
+        DeskPetHermesProfile.resetEnsureForTesting()
+        do {
+            try DeskPetHermesProfile.ensure()
+            let kept = (try? String(contentsOf: soul, encoding: .utf8)) == customSoul
+            check("既有普通 SOUL 保留不覆盖（升级不重写）", kept && !isSymlink(soul), kept ? "" : "被覆盖")
+        } catch {
+            check("既有普通 SOUL 保留不覆盖（升级不重写）", false, "\(error)")
+        }
+        // 幂等：再次 ensure 不触碰既有文件
+        DeskPetHermesProfile.resetEnsureForTesting()
+        do {
+            try DeskPetHermesProfile.ensure()
+            check("SOUL 保留后 ensure 幂等（内容仍为自定义）",
+                  (try? String(contentsOf: soul, encoding: .utf8)) == customSoul)
+        } catch {
+            check("SOUL 保留后 ensure 幂等（内容仍为自定义）", false, "\(error)")
+        }
+
+        // 1i. 其他链接冲突：SOUL 链接指向非主位置 → conflict，不接管、链接保留
+        try? fm.removeItem(at: soul)
+        try? Data("elsewhere".utf8).write(to: elsewhereSoul)
+        try? fm.createSymbolicLink(at: soul, withDestinationURL: elsewhereSoul)
+        DeskPetHermesProfile.resetEnsureForTesting()
+        let e6 = ensureError()
+        check("其他链接 → conflict（不擅自接管）", isConflict(e6), e6.map { "\($0)" } ?? "未抛错")
+        check("冲突后链接未被删除（保持原状）",
+              isSymlink(soul) && (try? fm.destinationOfSymbolicLink(atPath: soul.path)) == elsewhereSoul.path)
+
+        // 1j. 旧主链接替换：SOUL → ~/.hermes/SOUL.md——只删链接本体并创建专属文件，主 SOUL 内容/mtime 不变
+        try? fm.removeItem(at: soul)
+        try? fm.createDirectory(at: mainSoul.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let mainContent = "# 主 SOUL\n用户主 profile 内容\n"
+        try? mainContent.data(using: .utf8)!.write(to: mainSoul)
+        let mainMtime = (try? fm.attributesOfItem(atPath: mainSoul.path))?[.modificationDate] as? Date
+        try? fm.createSymbolicLink(at: soul, withDestinationURL: mainSoul)
+        DeskPetHermesProfile.resetEnsureForTesting()
+        do {
+            try DeskPetHermesProfile.ensure()
+            let mtimeAfter = (try? fm.attributesOfItem(atPath: mainSoul.path))?[.modificationDate] as? Date
+            check("旧主链接替换：专属 SOUL 为真实文件且内容==模板", soulIsRegularFileWithTemplate())
+            check("旧链接已移除（不再指向主 SOUL）", !isSymlink(soul))
+            check("主 SOUL 内容/mtime 不变（不读不复制不改）",
+                  (try? String(contentsOf: mainSoul, encoding: .utf8)) == mainContent
+                    && mainMtime != nil && mtimeAfter == mainMtime)
+        } catch {
+            check("旧主链接替换（端到端）", false, "\(error)")
+        }
+
+        // 1k. soulAction 纯函数决策（4 分支，不依赖 ensure）
+        let pureDir = homeRoot.appendingPathComponent("soul-pure", isDirectory: true)
+        try? fm.createDirectory(at: pureDir, withIntermediateDirectories: true)
+        let pSoul = pureDir.appendingPathComponent("SOUL.md")
+        let pMain = pureDir.appendingPathComponent("main.md")
+        check("soulAction：缺失 → createFromTemplate",
+              DeskPetHermesProfile.soulAction(fm, soul: pSoul, mainSoul: pMain) == .createFromTemplate)
+        try? Data("x".utf8).write(to: pSoul)
+        check("soulAction：普通文件 → keepExisting",
+              DeskPetHermesProfile.soulAction(fm, soul: pSoul, mainSoul: pMain) == .keepExisting)
+        try? fm.removeItem(at: pSoul)
+        try? Data("m".utf8).write(to: pMain)
+        try? fm.createSymbolicLink(at: pSoul, withDestinationURL: pMain)
+        check("soulAction：指向主 SOUL 的链接 → replaceOldLink",
+              DeskPetHermesProfile.soulAction(fm, soul: pSoul, mainSoul: pMain) == .replaceOldLink)
+        let pOther = pureDir.appendingPathComponent("other.md")
+        try? Data("o".utf8).write(to: pOther)
+        try? fm.removeItem(at: pSoul)
+        try? fm.createSymbolicLink(at: pSoul, withDestinationURL: pOther)
+        if case .conflict = DeskPetHermesProfile.soulAction(fm, soul: pSoul, mainSoul: pMain) {
+            check("soulAction：其他链接 → conflict（不接管）", true)
+        } else {
+            check("soulAction：其他链接 → conflict（不接管）", false)
         }
 
         // ---- 2. 后端 contract/profile_name 正反例（M3 硬门槛）----

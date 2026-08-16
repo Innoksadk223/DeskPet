@@ -20,6 +20,7 @@ cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # App 图标（猫爪�
 mkdir -p "$APP/Contents/Resources/config" "$APP/Contents/Resources/Scripts"
 cp config/commands.json "$APP/Contents/Resources/config/"
 cp config/voice-services.json "$APP/Contents/Resources/config/"   # 语音服务清单
+cp config/SOUL.md "$APP/Contents/Resources/config/"   # v13 专属 SOUL 默认模板（首次 ensure 安装到 profile 根）
 # 双保险（executor8）：打包前强制剥离敏感字段——分发 .app 永不携带 key。
 # 源 config/deskpet-config.json 若被误填 key（运行时读的是 history/config/），打包产物必须为空。
 # 显式清单：duoyunApiKey / asrApiKey；模式兜底：字段名以 key/token/secret 结尾的字符串值置 ""（递归）。

@@ -18,6 +18,13 @@ import Foundation
 ///   主/任务 `session.create` 均显式传 `cwd=workspace.path`（HermesClient 可选参数，仅 DeskPet 调用传值）。
 /// - W2：ensure() 幂等创建并校验 workspace：存在、是目录、标准化后位于 realHome 内；
 ///   创建/校验失败抛可见 directory error——绝不静默回退当前目录或主 terminal.cwd。
+/// v13（专属 SOUL install-dedicated-soul）：
+/// - S1：profile 根安装独立真实 `SOUL.md`（身份=个人数字管家；只定义身份/目标/职责/固定边界，
+///   口气由 personas、语音格式由 voice prompts 提供——分层不重复注入）。
+/// - S2：模板 `DeskPet/config/SOUL.md`（bundle Resources/config 或项目 config）→ 首次 ensure 原子创建；
+///   旧指向 `~/.hermes/SOUL.md` 的链接只删链接本体后替换（主 SOUL 不读不复制不改）；
+///   既有普通文件永久保留（升级/重启不覆盖，Agent 不自行更新）；其他链接报 conflict 不接管。
+/// - S3：workspace/ 不创建第二份 SOUL（主/任务会话经同一 HERMES_HOME 加载同一专属 SOUL）。
 enum DeskPetHermesProfile {
     /// named profile 名（Hermes normalize 规则：小写字母/数字/连字符/下划线）
     static let name = "deskpet-app"
@@ -46,8 +53,45 @@ enum DeskPetHermesProfile {
         let home = realHome.standardizedFileURL.path
         return ws.hasPrefix(home + "/")
     }
-    /// 复用项：profile home 缺失时链接到 ~/.hermes 对应既有项（不复制凭证）
-    private static let reuseItems = ["config.yaml", ".env", "auth.json", "SOUL.md", "skills"]
+    /// v13（S1）：专属 SOUL 路径：~/.deskpet/hermes/SOUL.md（真实文件，非符号链接）。
+    static var soulURL: URL {
+        realHome.appendingPathComponent("SOUL.md", isDirectory: false)
+    }
+    /// v13（S2）：主 profile SOUL：~/.hermes/SOUL.md——仅作旧链接识别参照，绝不读取内容/复制/修改。
+    static var mainSoulURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".hermes/SOUL.md", isDirectory: false)
+    }
+
+    /// v13：SOUL 处理动作（纯函数，可离线自测）。
+    enum SoulAction: Equatable {
+        /// 缺失 → 从模板原子创建
+        case createFromTemplate
+        /// 明确指向主 SOUL 的旧链接 → 只删链接本身并创建专属文件（主 SOUL 内容/mtime 不变）
+        case replaceOldLink
+        /// 普通文件 → 永久保留不覆盖（用户/Agent 内容为准，应用升级不重写）
+        case keepExisting
+        /// 链接指向其他位置 → 报 conflict，不擅自接管
+        case conflict(String)
+    }
+
+    /// v13：SOUL 处理决策（纯函数）——按文件系统现状判定，不做任何修改。
+    static func soulAction(_ fm: FileManager, soul: URL, mainSoul: URL) -> SoulAction {
+        if let dst = try? fm.destinationOfSymbolicLink(atPath: soul.path) {
+            let normalized = URL(fileURLWithPath: dst).standardizedFileURL.path
+            let mainNormalized = mainSoul.standardizedFileURL.path
+            if normalized == mainNormalized || dst == mainSoul.path {
+                return .replaceOldLink
+            }
+            return .conflict("~/.deskpet/hermes/SOUL.md 是符号链接且指向 \(dst)（非主 SOUL），拒绝接管")
+        }
+        if fm.fileExists(atPath: soul.path) { return .keepExisting }
+        return .createFromTemplate
+    }
+
+    /// 复用项：profile home 缺失时链接到 ~/.hermes 对应既有项（不复制凭证）。
+    /// v13：SOUL.md 已移出——专属 SOUL 必须是真实文件（见 installSoulIfNeeded），不再复用主 SOUL。
+    private static let reuseItems = ["config.yaml", ".env", "auth.json", "skills"]
     /// ownership 标记文件名（不含隐私：owner/用途/版本）
     private static let markerName = ".deskpet-app.json"
 
@@ -68,9 +112,9 @@ enum DeskPetHermesProfile {
         }
     }
 
-    /// 进程内一次性确保（幂等且可重试）：真实目录 → 接入链接 → 复用链接 → ownership 标记。
+    /// 进程内一次性确保（幂等且可重试）：真实目录 → 接入链接 → 复用链接 → 专属 SOUL → ownership 标记。
     /// H2：全部成功才置 ensured=true；任一步失败抛错（调用方反馈），下次调用可重试。
-    /// 冲突（既有 deskpet-app 非本链接）→ 抛 conflict 不覆盖；目录失败 → 抛 directory 不静默。
+    /// 冲突（既有 deskpet-app 非本链接 / SOUL 指向其他位置）→ 抛 conflict 不覆盖；目录失败 → 抛 directory 不静默。
     private static var ensured = false
     private static let ensureLock = NSLock()
     static func ensure() throws {
@@ -78,6 +122,12 @@ enum DeskPetHermesProfile {
         if ensured { return }
         let ok = try ensureInternal()
         if ok { ensured = true }
+    }
+
+    /// 仅供离线自测（HistoryStorageSelfTest 临时 HOME 场景间复用）：重置进程内一次性标记，
+    /// 使 ensure() 可用新文件系统现状重新执行。产品代码不调用（与 HermesBridge.overrideMainSessionForTesting 同先例）。
+    static func resetEnsureForTesting() {
+        ensureLock.lock(); ensured = false; ensureLock.unlock()
     }
 
     /// 返回 false 表示需要修复但非致命（复用项链接全部失败时仍可运行——serve 可自建缺失项）。
@@ -139,8 +189,9 @@ enum DeskPetHermesProfile {
             }
         }
 
-        // 复用链接：profile home 缺失的 config/.env/auth/SOUL/skills → 指向 ~/.hermes 既有项
-        // （凭证只链接不复制；单项失败仅 warn 不阻断——serve 可自建缺失项）
+        // 复用链接：profile home 缺失的 config/.env/auth/skills → 指向 ~/.hermes 既有项
+        // （凭证只链接不复制；单项失败仅 warn 不阻断——serve 可自建缺失项；
+        // v13：SOUL.md 不在复用列表——专属 SOUL 走 installSoulIfNeeded 真实文件安装）
         let hermesHome = fm.homeDirectoryForCurrentUser.appendingPathComponent(".hermes", isDirectory: true)
         var linked = 0
         for item in reuseItems {
@@ -157,13 +208,55 @@ enum DeskPetHermesProfile {
             }
         }
         if linked > 0 {
-            LogManager.shared.info("deskpet-app profile 复用链接：\(linked) 项（config/.env/auth/SOUL/skills → ~/.hermes，仅链接不复制）")
+            LogManager.shared.info("deskpet-app profile 复用链接：\(linked) 项（config/.env/auth/skills → ~/.hermes，仅链接不复制）")
         }
+
+        // v13（S2）：专属 SOUL 生命周期（幂等）——缺失创建 / 旧主链接替换 / 普通文件保留 / 其他链接冲突。
+        try installSoulIfNeeded(fm)
 
         // M4：ownership/version 标记（不含隐私）。写入条件：接入链接已确认指向 realHome——
         // 即本目录确为 DeskPet 管理（既有正确链接补标记安全；其他预置目录不接管）。
         writeOwnershipMarker(fm)
         return true
+    }
+
+    /// v13：按需安装专属 SOUL（幂等，不读取主 SOUL 内容）。
+    /// - 缺失 → 从模板（bundle/项目 config/SOUL.md，ProjectPaths 定位）原子创建；
+    /// - 明确指向 ~/.hermes/SOUL.md 的旧链接 → 只删除链接本身后原子创建（主文件内容/mtime 不变）；
+    /// - 既有普通文件 → 保留不覆盖（Agent/应用升级均不重写）；
+    /// - 链接指向其他位置 → 抛 conflict 不接管；
+    /// - 模板缺失/读取失败 → error 日志并跳过（不破坏现状：旧链接仍提供内容，绝不删而不建）。
+    private static func installSoulIfNeeded(_ fm: FileManager) throws {
+        let soul = soulURL
+        let action = soulAction(fm, soul: soul, mainSoul: mainSoulURL)
+        switch action {
+        case .createFromTemplate, .replaceOldLink:
+            guard let template = ProjectPaths.find(relative: "config/SOUL.md") else {
+                LogManager.shared.error("专属 SOUL 模板缺失（config/SOUL.md 未找到）——跳过安装，保持现状")
+                return
+            }
+            guard let data = try? Data(contentsOf: template) else {
+                LogManager.shared.error("专属 SOUL 模板读取失败：\(template.path)——跳过安装，保持现状")
+                return
+            }
+            if action == .replaceOldLink {
+                do {
+                    try fm.removeItem(at: soul)   // 只删链接本体，不触碰链接目标
+                } catch {
+                    throw ProfileError.directory("移除旧 SOUL 链接失败：\(soul.path)（\(error.localizedDescription)）")
+                }
+            }
+            do {
+                try data.write(to: soul, options: .atomic)   // 原子创建真实文件
+            } catch {
+                throw ProfileError.directory("专属 SOUL 创建失败：\(soul.path)（\(error.localizedDescription)）")
+            }
+            LogManager.shared.info("专属 SOUL 安装：\(soul.path)（模板 \(template.path)）")
+        case .keepExisting:
+            LogManager.shared.log(.debug, "专属 SOUL 已存在（普通文件）——保留不覆盖")
+        case .conflict(let msg):
+            throw ProfileError.conflict(msg)
+        }
     }
 
     /// 写入 ownership/version 标记（幂等覆盖自家标记；内容不含隐私）。

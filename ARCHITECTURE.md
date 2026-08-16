@@ -1,6 +1,6 @@
 # DeskPet 架构与机制（AI 交接文档）
 
-> 更新时间：2026-08-16（v9：音频设备切换稳定窗口重建/任务派发可见收口/任务失联看门狗；v10：三分控制中断/幽灵任务槽修复；v11：双 Agent 异步细节加固——详见 §12 双 Agent 异步模型与 §8 批次记录；v12：专属执行工作区 workspace 绑定——主/任务会话显式 cwd=~/.deskpet/hermes/workspace，见 §8 v12 批次）
+> 更新时间：2026-08-16（v9：音频设备切换稳定窗口重建/任务派发可见收口/任务失联看门狗；v10：三分控制中断/幽灵任务槽修复；v11：双 Agent 异步细节加固——详见 §12 双 Agent 异步模型与 §8 批次记录；v12：专属执行工作区 workspace 绑定——主/任务会话显式 cwd=~/.deskpet/hermes/workspace；v13：专属 SOUL install-dedicated-soul——profile 根安装独立真实 SOUL.md，见 §8 v13 批次）
 > 本文件是 AI 接手本项目的首要阅读文档：先读本文件 → 再读 HANDOFF.md（铁律/历史/排查）。
 > 配套人工可读版：`.pi/artifacts/deskpet.html`
 
@@ -15,6 +15,7 @@
 - 会话索引：`~/Library/Application Support/DeskPet/`（.app 版）；项目 `history/data/`（debug 版）
 - **v5 历史存储隔离**：新主/任务会话建在 Hermes named profile `deskpet-app`（真实目录 `~/.deskpet/hermes`，由 `~/.hermes/profiles/deskpet-app` 符号链接接入；`.env/auth` 等只链接不复制）；旧索引缺 profile 视为 legacy——保留可查看删除，升级后旧当前自动归档、新会话立即用 deskpet-app
 - **v12 专属执行工作区（deskpet-workspace）**：主/任务会话 `session.create` 均显式传 `cwd=~/.deskpet/hermes/workspace`（DeskPetHermesProfile.workspace 单一事实来源；HermesClient.createSession 可选 cwd 参数，仅 DeskPet 调用传值）——任务 Agent 默认文件/终端操作在专属工作区进行，不再落到启动时所在的用户项目目录；Hermes 本体/主 profile/全局文件零修改
+- **v13 专属 SOUL（install-dedicated-soul）**：profile 根安装独立真实 `~/.deskpet/hermes/SOUL.md`（身份=个人数字管家；只定义身份/目标/职责/固定边界）——口气由 personas、语音格式由 voice prompts 提供，三层互不重复注入；不再链接主 SOUL，主 SOUL 零读写；升级不覆盖既有专属文件，Agent 不自行更新
 
 ## 1. 三层架构与文件映射
 
@@ -212,6 +213,17 @@ seed 版本号存 SessionIndex（`mainSeedVersion`，当前 4）——版本不�
 | 主 Agent 仍是纯对话协调者 | 无 | 主/任务会话均绑定 workspace cwd（主 Agent 无工具，其 cwd 仅一致性）；seed v4 注入工作目录说明，任务 Agent 种子明确「文件/终端操作默认在此专属工作区进行」 |
 | 工作区边界不可验证 | 无离线断言 | HistoryStorageSelfTest：workspace 创建/校验/占用失败可见/修复重试/幂等；HermesBridgeSelfTest：`createSessionParams`（cwd 键构造）与 `shouldResumeMainSession`（门槛）纯逻辑回归；**Hermes 源码/`~/.hermes/config.yaml`/SOUL/凭证/skills 等全局文件零修改** |
 
+### v13 批次（专属 SOUL install-dedicated-soul，摘要）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| DeskPet 会话加载主 profile 的 SOUL（~/.hermes/SOUL.md），身份/行为随主环境变化且清历史时可能受影响 | profile 复用链接把 SOUL.md 指向主文件 | **内容分层**：专属 SOUL 只定义身份（个人数字管家）/目标/职责/固定边界；口气由 personas（personas.json）、语音格式由 voice prompts（prompts/voice.json）提供——三者不重复注入 |
+| 升级/安装时如何放置专属 SOUL | 无模板与安装机制 | 模板 `DeskPet/config/SOUL.md`（build-app.sh 复制到 App Resources/config）；运行时首次 `ensure()` 经 ProjectPaths 定位模板，原子创建 profile 根真实文件（.atomic） |
+| 旧版本遗留 SOUL → ~/.hermes/SOUL.md 链接 | 复用链接历史遗留 | `soulAction` 纯函数决策：缺失→createFromTemplate；明确指向主 SOUL 的链接→只删链接本体后创建专属文件（主 SOUL 不读不复制不改，内容/mtime 不变）；普通文件→keepExisting 永久保留；其他链接→conflict 不接管 |
+| 应用升级/重启会覆盖用户专属 SOUL 吗 | 无保留策略 | 不覆盖：既有普通文件永久保留，Agent 不自行更新此文件；模板缺失时跳过安装（绝不删而不建） |
+| workspace 出现第二份 SOUL 重复注入 identity | 无边界约定 | workspace/ 只作 cwd 上下文，不创建 SOUL；主/任务会话经同一 HERMES_HOME（deskpet-app）加载同一专属 SOUL |
+| 迁移/保留/冲突不可验证 | 无离线断言 | HistoryStorageSelfTest（临时 HOME）：缺失创建（内容==模板）、旧主链接替换（主 SOUL 内容/mtime 不变）、普通文件保留、其他链接冲突、幂等、soulAction 四分支纯函数；**Hermes 本体/主 profile 零修改** |
+
 ### 历史批次（2026-08-13，摘要）
 
 | 问题 | 根因 | 修复 |
@@ -252,7 +264,7 @@ swift run DeskPet --self-test-markers           # 标记协议 + state-sync + ta
 swift run DeskPet --self-test-wake              # 唤醒决策 17/17（零音频触碰）
 swift run DeskPet --self-test-vad               # 静音分段 8/8 + segmenter 23/23
 swift run DeskPet --self-test-asr-seg           # ASR 分段回归 10/10
-swift run DeskPet --self-test-history-storage   # 历史存储隔离回归（含 workspace 目录创建/校验/失败可见/幂等）
+swift run DeskPet --self-test-history-storage   # 历史存储隔离回归（workspace + 专属 SOUL 生命周期：缺失创建/旧链接替换/保留/冲突/幂等）
 ```
 
 **验收指标**（deskpet-hv）：丢弃告警 10min ≤2 条 + 30min 归零；桌宠 CPU 待机 ≤1%（当前 0.2-0.4%）；内存 2h 不增长；serve 自愈 kill → ≤30s 恢复 + 对话提交成功；唤醒误触发 0.25/0.4 档必须 0。
