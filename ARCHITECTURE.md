@@ -1,6 +1,6 @@
 # DeskPet 架构与机制（AI 交接文档）
 
-> 更新时间：2026-08-16（v9：音频设备切换稳定窗口重建/任务派发可见收口/任务失联看门狗；v10：三分控制中断/幽灵任务槽修复；v11：双 Agent 异步细节加固——详见 §12 双 Agent 异步模型与 §8 批次记录；v12：专属执行工作区 workspace 绑定——主/任务会话显式 cwd=~/.deskpet/hermes/workspace；v13：专属 SOUL install-dedicated-soul——profile 根安装独立真实 SOUL.md，见 §8 v13 批次）
+> 更新时间：2026-08-16（v9：音频设备切换稳定窗口重建/任务派发可见收口/任务失联看门狗；v10：三分控制中断/幽灵任务槽修复；v11：双 Agent 异步细节加固——详见 §12 双 Agent 异步模型与 §8 批次记录；v12：专属执行工作区 workspace 绑定——主/任务会话显式 cwd=~/.deskpet/hermes/workspace；v13：专属 SOUL install-dedicated-soul——profile 根安装独立真实 SOUL.md；v14：补齐 0.6 数据归属、隔离边界与升级理念——见 §1.1–§1.3）
 > 本文件是 AI 接手本项目的首要阅读文档：先读本文件 → 再读 HANDOFF.md（铁律/历史/排查）。
 > 配套人工可读版：`.pi/artifacts/deskpet.html`
 
@@ -13,7 +13,7 @@
 - serve 端口：9119（用户原服务）被占时自启 9120/9121；token 持久化在 UserDefaults（`DeskPetServeToken`，.app 版域为 `com.deskpet.app`，debug 版域为 `DeskPet`）
 - 日志：`~/Library/Logs/DeskPet/deskpet.log`（5MB 轮转保留 2 份）；serve 端日志 `~/.hermes/logs/agent.log`
 - 会话索引：`~/Library/Application Support/DeskPet/`（.app 版）；项目 `history/data/`（debug 版）
-- **v5 历史存储隔离**：新主/任务会话建在 Hermes named profile `deskpet-app`（真实目录 `~/.deskpet/hermes`，由 `~/.hermes/profiles/deskpet-app` 符号链接接入；`.env/auth` 等只链接不复制）；旧索引缺 profile 视为 legacy——保留可查看删除，升级后旧当前自动归档、新会话立即用 deskpet-app
+- **v5 历史存储隔离**：新主/任务会话建在 Hermes named profile `deskpet-app`（真实目录 `~/.deskpet/hermes`，由 `~/.hermes/profiles/deskpet-app` 符号链接接入；`config/.env/auth/skills` 只链接不复制；v13 起 `SOUL.md` 改为 DeskPet 独立真实文件）；旧索引缺 profile 视为 legacy——保留可查看删除，升级后旧当前自动归档、新会话立即用 deskpet-app
 - **v12 专属执行工作区（deskpet-workspace）**：主/任务会话 `session.create` 均显式传 `cwd=~/.deskpet/hermes/workspace`（DeskPetHermesProfile.workspace 单一事实来源；HermesClient.createSession 可选 cwd 参数，仅 DeskPet 调用传值）——任务 Agent 默认文件/终端操作在专属工作区进行，不再落到启动时所在的用户项目目录；Hermes 本体/主 profile/全局文件零修改
 - **v13 专属 SOUL（install-dedicated-soul）**：profile 根安装独立真实 `~/.deskpet/hermes/SOUL.md`（身份=个人数字管家；只定义身份/目标/职责/固定边界）——口气由 personas、语音格式由 voice prompts 提供，三层互不重复注入；不再链接主 SOUL，主 SOUL 零读写；升级不覆盖既有专属文件，Agent 不自行更新
 
@@ -32,6 +32,62 @@ DeskPetHermesProfile.swift    HermesClient.swift             DeskPetState.swift
 
 - **AppDelegate** 是胶水：接线 ①↔②↔③，`showBubble`/`feedback` 是唯一气泡/反馈入口，NSWindow 操作主线程收口
 - **HermesBridge** 是核心：状态机（idle/waiting/run/review/failed）、事件处理、双轨解析、任务标记协议、结果归档
+
+### 1.1 0.6 数据归属与隔离边界
+
+```text
+Hermes 本体（只依赖，不修改）
+~/.hermes/hermes-agent/
+
+DeskPet named profile（会话运行状态）
+~/.deskpet/hermes/
+├── state.db                # 主 Agent + 任务 Agent 的完整消息/会话
+├── SOUL.md                 # DeskPet 独立身份：个人数字管家
+├── workspace/              # 主/任务会话显式 cwd；任务默认文件落点
+├── logs/cache/bin/...      # Hermes 在该 profile 下生成的运行数据
+└── config/.env/auth/skills # 指向主 profile 的复用链接，不复制内容
+
+项目内 DeskPet 数据（App 自己维护）
+DeskPet/history/
+├── config/                 # personas、voice prompts、commands、DeskPet 设置
+└── data/session-index.json # 会话 ID、任务归属与完成状态索引；不是聊天正文
+```
+
+边界含义：
+
+- **完整聊天正文**属于 Hermes profile，存于 `~/.deskpet/hermes/state.db`；项目内 `session-index.json` 只是可移植索引，不重复保存消息正文。
+- **任务产物**默认属于 `workspace/`，与会话数据库分离；清聊天历史不应顺带删除工作文件，清工作区也不应破坏会话索引。
+- **SOUL**属于 DeskPet profile 的稳定身份；**persona**负责具体宠物的口气/性格；**voice prompts**负责语音输入容错与播报格式。三者职责不重叠。
+- `workspace/` 是**默认工作目录隔离**，不是操作系统权限沙箱。任务 Agent 在用户明确授权并给出绝对路径时仍可能访问其他位置；不可逆、敏感、付费或外发操作仍必须经过确认。
+
+### 1.2 设计理念
+
+1. **DeskPet 适配，不侵入 Hermes**：只使用 Hermes 已有的 named profile、`session.create.cwd`、会话 API 和提示词加载机制；不修改 `~/.hermes/hermes-agent/**`，不替用户改全局 `terminal.cwd`。
+2. **显式路径优于进程环境**：会话创建必须显式传 workspace cwd，不依赖 App 从 Finder、终端或其他项目目录启动时碰巧继承的当前目录。
+3. **状态、工作文件、身份分层**：`state.db` 管对话，`workspace/` 管产物，`SOUL.md` 管稳定职责，persona/voice 管体验。任何一层的清理或升级不应隐式覆盖另一层。
+4. **用户所有权优先**：首次安装只创建缺失文件；既有专属 SOUL 永不自动覆盖，Agent 不自行改写；仅识别并迁移 DeskPet 旧版创建的主 SOUL 链接，未知链接直接报冲突。
+5. **安全迁移、可回退历史**：workspace 切换用 seed 版本门槛新建当前会话，旧会话只归档不迁移正文、不删除；迁移失败必须可见，禁止静默回退用户项目目录。
+6. **单一事实来源**：profile 根和 workspace 统一由 `DeskPetHermesProfile` 定义；会话 cwd、SOUL 安装、测试与文档都引用同一位置，避免多套路径漂移。
+7. **主快、任务稳**：主 Agent 保持对话与控制权，任务 Agent 在单槽 FIFO 中执行；两者共享身份与 cwd，但不共享职责，任务运行不阻塞主对话。
+8. **可观察而不伪成功**：目录创建、链接冲突、远端中断、任务启动与事件缺失都有明确状态/日志/用户反馈；不能验证时报告限制，不把推断当完成。
+
+### 1.3 安装、升级与会话生效顺序
+
+```text
+DeskPet 启动
+→ ensure ~/.deskpet/hermes 与 named-profile 接入链接
+→ 创建并校验 workspace/（失败即停止会话创建，不回退）
+→ 安装 SOUL：缺失则从 App 模板创建；旧主链接则只替换链接；普通文件保留
+→ 复用 config/.env/auth/skills 链接
+→ 检查 mainSeedVersion
+   ├─ 旧版本会话：归档保留，不 resume
+   └─ 当前版本会话：正常 resume
+→ 新建主会话与常驻任务会话时显式传同一 cwd
+```
+
+- 新 SOUL 和新 cwd 在**新建/重新构建 Agent 会话**后生效；不能假设修改磁盘文件会重写已经在内存中的模型上下文。
+- 0.6 使用 `mainSeedVersion = 4` 作为 workspace 切换门槛：旧历史仍能查看/删除，新当前会话绑定专属工作区。
+- 发布验证必须同时检查：最终 App 二进制、workspace 类型/边界、SOUL 是否为普通文件、主 SOUL/全局配置 mtime 未变、旧历史仍在。
 
 ## 2. 对话主流程（v3）
 
@@ -250,6 +306,8 @@ seed 版本号存 SessionIndex（`mainSeedVersion`，当前 4）——版本不�
 - 持续聆听默认关闭；阈值（2 字/0.5 置信）待实机校准（`minSegmentLength`/`minSegmentConfidence` 常量）
 - v3 待验证：[耗时] 日志积累后决定是否进一步优化首字延迟（ASR 静默 2s 分段/Hermes 思考等级）
 - P2 体验项：本地设置触发云 TTS、开始新对话无确认、形象与性格联动不透明、声线列表重复、冷启动无就绪反馈、AX 状态不可靠、空输入可发送——未处理
+- `~/.deskpet/hermes/workspace` 只是默认 cwd，不是 macOS 沙箱；如未来要求强制禁止访问目录外路径，应使用独立进程/容器/系统权限，而不是继续堆提示词判断
+- 专属 SOUL 在新 Agent 构建时读取；运行中直接编辑文件不会可靠热更新当前会话，需新开对话或重启会话
 
 ## 11. 构建与验证命令
 
