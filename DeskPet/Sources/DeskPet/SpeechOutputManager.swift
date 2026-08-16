@@ -91,8 +91,8 @@ final class SpeechOutputManager {
         let text: String
         let tag: String?   // 任务实例 tag（nil = 非任务播报）
     }
-    /// 低优队列（任务完成/进度播报）；high speak 清空（新内容优先，clearsQueue=false 除外），
-    /// stop 不清（P3-1）；新任务派发时旧任务条目被清除（P4-1）
+    /// 低优队列（任务完成结果/开始确认）；high speak 清空（新内容优先，clearsQueue=false 除外），
+    /// stop（用户开口/打断）清空（2026-08-16 最新优先）；静音/链重建只停当前不清队列；新任务派发时旧任务条目被清除（P4-1）
     private var lowQueue: [LowItem] = []
     /// R-2026-08-13：高优多句剩余队列——speak(.high) 逐句串行（当前句播完才合成下一句），
     /// 防多句并发合成完成顺序乱（实测交叉/乱序）；打断（stop）时清空。
@@ -124,9 +124,10 @@ final class SpeechOutputManager {
         buildChain()
     }
 
-    /// 播报链重建（渠道切换后调用；保持静音状态）。
+    /// 播报链重建（渠道切换后调用；保持静音状态）。只停当前播报**不清队列**——
+    /// 切声线/渠道不代表放弃排队中的任务结果，新链上继续播。
     func rebuild() {
-        stop()
+        stopPlayback()
         buildChain()
     }
 
@@ -176,7 +177,8 @@ final class SpeechOutputManager {
 
     func toggleMute() {
         isMuted.toggle()
-        if isMuted { stop() }
+        // 静音≠用户关注新内容：只停当前播报，排队条目保留（取消静音后继续播）
+        if isMuted { stopPlayback() }
         onMuteChange?(isMuted)
         LogManager.shared.info("播报静音：\(isMuted)")
         // P3-1：取消静音 → 恢复低优队列推进（静音期间队列保留，speak 被 isMuted 守卫拦截）
@@ -198,8 +200,14 @@ final class SpeechOutputManager {
             return
         }
         // high：打断当前播报；清低优队列仅当 clearsQueue（新内容优先）
-        stopPlayback()
-        if clearsQueue { lowQueue.removeAll() }
+        // 轻确认（clearsQueue=false，如「收到」）：正在播报/多句未播完时不打断不掐断——
+        // 直接跳过（调用方已有气泡确认），杜绝句间隙 isSpeaking 短暂为假的竞态窗口
+        if clearsQueue {
+            stopPlayback()
+            lowQueue.removeAll()
+        } else if isSpeaking || !pendingHigh.isEmpty {
+            return
+        }
         // R-2026-08-13：逐句串行——只提交第一句，其余句入 pendingHigh 播完推进
         // （多句并发合成 → 完成顺序乱 → 播放交叉，实测）。
         guard let first = sentences.first else { return }
@@ -217,8 +225,11 @@ final class SpeechOutputManager {
 
     /// R-2026-08-13：高优多句串行推进——当前句播完（provider 完成回调）→ 合成并播下一句；
     /// 该句全链失败则跳过继续。打断（stop）清空 pendingHigh，未播句全部作废。
+    /// 2026-08-16：isSpeaking 守卫——完成回调统一主线程派发后可能「迟到」（新旧播报交接窗口），
+    /// 迟到回调不得弹出下一句（新句已在播，交由其自己的完成回调推进）
     private func advanceHigh() {
         guard !pendingHigh.isEmpty else { return }
+        guard !isSpeaking else { return }
         let next = pendingHigh.removeFirst()
         for provider in providerChain where provider.speak(next) {
             activeProvider = provider
@@ -231,7 +242,7 @@ final class SpeechOutputManager {
     /// - newTag 非 nil（新任务派发）：停当前播报（含正在播的旧任务播报/主回复——最新指令优先）
     ///   + 清空低优队列（含无 tag 条目——不再继续播旧内容）+ 记录当前任务 tag（后到的旧任务播报按 tag 丢弃）
     /// - newTag nil（中断/删除任务）：停任务播报 + 清空队列（当前任务失效）
-    /// 与说话打断区分：stop()/打断保留队列（T-1 用户优先），只有任务派发/中断才清队列。
+    /// 与说话打断区分：两者现在都清队列（2026-08-16 最新优先）；静音/链重建只停当前不清队列。
     func cancelTaskSpeech(newTag: String?) {
         stop()   // 停当前播报
         currentTaskTag = newTag
