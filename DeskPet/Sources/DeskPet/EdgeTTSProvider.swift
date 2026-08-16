@@ -446,11 +446,19 @@ final class EdgeTTSProvider: NSObject, SpeechProvider {
 }
 
 extension EdgeTTSProvider: NSSoundDelegate {
+    /// 2026-08-16 竞态收口：与 DuoyunSpeechProvider 同型——NSSound delegate 回调无主线程
+    /// 保证，统一派发主线程后再动 isPlaying/队列；flag=false（被 stop() 打断）不推进；
+    /// 身份校验 activeSound === sound 拦截迟到回调（新播放已接管/已被清空）。
     func sound(_ sound: NSSound, didFinishPlaying flag: Bool) {
-        // 诊断：播放完成（flag=false = 被中断/未播完——定位「几个字就没了」关键点）
-        LogManager.shared.log(.debug, "Edge 播放完成：\(sound.name ?? "?") flag=\(flag)")
-        if activeSound === sound { activeSound = nil }
-        isPlaying = false
-        playNext()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // 诊断：flag=false = 被中断/未播完——定位「几个字就没了」关键点
+            LogManager.shared.log(.debug, "Edge 播放完成：\(sound.name ?? "?") flag=\(flag)")
+            guard flag else { return }
+            guard self.activeSound === sound else { return }
+            self.activeSound = nil
+            self.isPlaying = false
+            self.playNext()
+        }
     }
 }
