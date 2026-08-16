@@ -50,6 +50,9 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedSetPetScale(_ view: PetView, scale: Double)
     func petViewRequestedDuoyunKeyConfigured(_ view: PetView) -> Bool
     func petViewRequestedDuoyunVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)]
+    func petViewRequestedMiMoKeyConfigured(_ view: PetView) -> Bool
+    func petViewRequestedMiMoVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)]
+    func petViewRequestedSetMiMoVoice(_ view: PetView, voice: String)
     func petViewRequestedSetDuoyunVoice(_ view: PetView, voiceType: String)
     func petViewRequestedCustomDuoyunVoice(_ view: PetView)
     // P2-04：开关状态（菜单勾选/标题动态化）
@@ -281,6 +284,7 @@ final class PetView: NSView {
             duoyunSettings: #selector(duoyunSettings),
             duoyunVoice: #selector(selectDuoyunVoice(_:)),
             duoyunCustomVoice: #selector(customDuoyunVoice),
+            mimoVoice: #selector(selectMiMoVoice(_:)),
             mimoSettings: #selector(mimoSettings),
             edgeVoice: #selector(selectEdgeVoice(_:)),
             voiceServices: #selector(voiceServices),
@@ -305,6 +309,8 @@ final class PetView: NSView {
             voices: delegate?.petViewRequestedVoices(self) ?? [],
             duoyunVoices: delegate?.petViewRequestedDuoyunVoices(self) ?? [],
             duoyunKeyOK: delegate?.petViewRequestedDuoyunKeyConfigured(self) ?? false,
+            mimoVoices: delegate?.petViewRequestedMiMoVoices(self) ?? [],
+            mimoKeyOK: delegate?.petViewRequestedMiMoKeyConfigured(self) ?? false,
             edgeVoices: delegate?.petViewRequestedEdgeVoices(self) ?? [],
             edgeAvailable: delegate?.petViewRequestedEdgeAvailable(self) ?? false,
             asrProvider: delegate?.petViewRequestedASRProvider(self) ?? "local",
@@ -415,6 +421,11 @@ final class PetView: NSView {
     @objc private func selectDuoyunVoice(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         delegate?.petViewRequestedSetDuoyunVoice(self, voiceType: id)
+    }
+
+    @objc private func selectMiMoVoice(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        delegate?.petViewRequestedSetMiMoVoice(self, voice: id)
     }
 
     @objc private func customDuoyunVoice() { delegate?.petViewRequestedCustomDuoyunVoice(self) }

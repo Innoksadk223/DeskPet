@@ -1373,6 +1373,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return Self.duoyunVoiceCatalog.map { ($0.id, $0.name, $0.id == current) }
     }
 
+    // MARK: MiMo 声线（2026-08-16：与豆包声线同款子菜单——preset 模式生效）
+
+    func mimoKeyConfigured() -> Bool {
+        !DeskPetConfig.load().mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func mimoVoiceMenuList() -> [(id: String, name: String, isCurrent: Bool)] {
+        let cfg = DeskPetConfig.load()
+        let current = cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice
+        return MiMoSpeechProvider.presetVoiceCatalog.map { ($0.id, $0.name, $0.id == current) }
+    }
+
+    @objc func menuSelectMiMoVoice(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectMiMoVoice(id)
+    }
+
+    /// 切换 MiMo 预置音色：保存 mimoVoice + 重建链 + 气泡确认（preset 模式生效；
+    /// design/clone 模式音色来自配置文件——提示里说明，不误以为坏了）
+    private func selectMiMoVoice(_ id: String) {
+        var cfg = DeskPetConfig.load()
+        guard cfg.mimoVoice != id else { return }
+        cfg.mimoVoice = id
+        guard cfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()
+        let name = MiMoSpeechProvider.presetVoiceCatalog.first { $0.id == id }?.name ?? id
+        let mode = cfg.mimoTTSMode
+        let suffix = (mode == "design" || mode == "clone")
+            ? "（注意：当前是\(mode == "design" ? "设计" : "克隆")音色模式，预置音色不生效——切换回 preset 见 MiMo音色指南.md）"
+            : "（当前语音：\(Self.channelName(SpeechOutputManager.shared.channelList().first(where: \.isCurrent)?.id ?? "system"))——想听 MiMo：设置 ▸ 语音 ▸ 播报方式选 MiMo 语音）"
+        feedback("✅ 已切换 MiMo 声线：\(name)\(suffix)")
+    }
+
     /// 切换豆包音色：保存 duoyunVoiceType + 重建链 + 气泡确认。
     @objc func menuSelectDuoyunVoice(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
@@ -2342,6 +2378,11 @@ extension AppDelegate: PetViewDelegate {
     }
     func petViewRequestedSetDuoyunVoice(_ view: PetView, voiceType: String) { selectDuoyunVoice(voiceType) }
     func petViewRequestedCustomDuoyunVoice(_ view: PetView) { menuCustomDuoyunVoice() }
+    func petViewRequestedMiMoKeyConfigured(_ view: PetView) -> Bool { mimoKeyConfigured() }
+    func petViewRequestedMiMoVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)] {
+        mimoVoiceMenuList()
+    }
+    func petViewRequestedSetMiMoVoice(_ view: PetView, voice: String) { selectMiMoVoice(voice) }
     func petViewRequestedInput(_ view: PetView) { requestInput() }
     func petViewRequestedVoice(_ view: PetView) { toggleVoiceInput() }
     func petViewRequestedMute(_ view: PetView) { toggleMute() }

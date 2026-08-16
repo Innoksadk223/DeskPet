@@ -11,6 +11,7 @@ enum SettingsMenuFactory {
         var duoyunSettings: Selector
         var duoyunVoice: Selector          // NSMenuItem 动作（representedObject = 声线 id）
         var duoyunCustomVoice: Selector
+        var mimoVoice: Selector             // MiMo 声线（预置音色；design/clone 模式下不生效——tooltip 说明）
         var mimoSettings: Selector          // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
         var edgeVoice: Selector            // NSMenuItem 动作（representedObject = Edge 声线 id）
         var voiceServices: Selector        // 语音服务管理（清单展示）
@@ -37,6 +38,8 @@ enum SettingsMenuFactory {
         var voices: [(identifier: String, name: String, isCurrent: Bool)]
         var duoyunVoices: [(id: String, name: String, isCurrent: Bool)]
         var duoyunKeyOK: Bool
+        var mimoVoices: [(id: String, name: String, isCurrent: Bool)]
+        var mimoKeyOK: Bool
         var edgeVoices: [(id: String, name: String, isCurrent: Bool)]
         var edgeAvailable: Bool
         var asrProvider: String          // 当前识别来源（local/duoyun/mimo）
@@ -208,6 +211,27 @@ enum SettingsMenuFactory {
             dvMenu.addItem(customItem)
             duoyunVoicesItem.submenu = dvMenu
             menu.addItem(duoyunVoicesItem)
+        }
+
+        // MiMo 声线（2026-08-16：与豆包声线同款入口——只在清单含 mimo 时显示；
+        // 无 key 置灰；preset 模式生效，design/clone 模式音色来自配置文件——tooltip 说明）
+        if manifestIDs.contains("mimo") {
+            let keyOK = data.mimoKeyOK
+            let mimoVoicesItem = NSMenuItem(title: "MiMo 声线", action: nil, keyEquivalent: "")
+            mimoVoicesItem.isEnabled = keyOK
+            mimoVoicesItem.toolTip = keyOK
+                ? "MiMo 语音的预置音色（preset 模式生效；设计/克隆音色见 MiMo音色指南.md）"
+                : "先配置 MiMo API Key（MiMo 语音设置…）"
+            let mvMenu = NSMenu()
+            for mv in data.mimoVoices {
+                let item = NSMenuItem(title: mv.name, action: actions.mimoVoice, keyEquivalent: "")
+                item.target = target
+                item.representedObject = mv.id
+                item.state = mv.isCurrent ? .on : .off
+                mvMenu.addItem(item)
+            }
+            mimoVoicesItem.submenu = mvMenu
+            menu.addItem(mimoVoicesItem)
         }
 
         // 识别（听写识别来源：本地 / 豆包流式 / MiMo 整段——单选勾选）
