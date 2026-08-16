@@ -211,7 +211,22 @@ final class PetView: NSView {
 
     private func popContextMenu(with event: NSEvent) {
         let menu = buildContextMenu()
-        let p = convert(event.locationInWindow, from: nil)
+        var p = convert(event.locationInWindow, from: nil)
+        // 2026-08-16：贴边自适应——桌宠在屏幕右/下边缘（如重启后停靠右下角）时，
+        // 右键菜单默认向右下展开会被屏幕边缘裁剪（表现为"没有完全展开"）。
+        // 按菜单尺寸把弹出锚点拉回屏幕可见区域内（向屏幕内侧偏移）；子菜单方向由系统自动翻转。
+        if let win = window, let screen = win.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            let size = menu.size   // 询问 size 触发布局，得到根菜单实际尺寸
+            var sp = win.convertToScreen(NSRect(origin: convert(p, to: nil), size: .zero)).origin
+            if sp.x + size.width > visible.maxX {
+                sp.x = max(visible.minX, sp.x - size.width)
+            }
+            if sp.y - size.height < visible.minY {
+                sp.y = min(visible.maxY, sp.y + size.height)
+            }
+            p = convert(win.convertFromScreen(NSRect(origin: sp, size: .zero)).origin, from: nil)
+        }
         menu.popUp(positioning: nil, at: p, in: self)
     }
 
