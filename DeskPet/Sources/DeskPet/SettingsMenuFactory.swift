@@ -11,9 +11,10 @@ enum SettingsMenuFactory {
         var duoyunSettings: Selector
         var duoyunVoice: Selector          // NSMenuItem 动作（representedObject = 声线 id）
         var duoyunCustomVoice: Selector
+        var mimoSettings: Selector          // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
         var edgeVoice: Selector            // NSMenuItem 动作（representedObject = Edge 声线 id）
         var voiceServices: Selector        // 语音服务管理（清单展示）
-        var asrProvider: Selector        // 听写识别来源（local/duoyun 单选——representedObject = id）
+        var asrProvider: Selector        // 听写识别来源（local/duoyun/mimo 单选——representedObject = id）
         var persona: Selector              // NSMenuItem 动作（representedObject = 人设 id）
         var editPersonas: Selector
         var editVoicePrompts: Selector      // executor8：高级——直接编辑语音提示词文件
@@ -38,7 +39,7 @@ enum SettingsMenuFactory {
         var duoyunKeyOK: Bool
         var edgeVoices: [(id: String, name: String, isCurrent: Bool)]
         var edgeAvailable: Bool
-        var asrProvider: String          // 当前识别来源（local/duoyun）
+        var asrProvider: String          // 当前识别来源（local/duoyun/mimo）
         var wakeThresholds: [(value: Double, name: String, isCurrent: Bool)]
         var petScales: [(value: Double, name: String, isCurrent: Bool)]
         var autoLaunchOn: Bool           // 开机自启当前状态
@@ -209,12 +210,13 @@ enum SettingsMenuFactory {
             menu.addItem(duoyunVoicesItem)
         }
 
-        // 识别（听写识别来源：本地 / 豆包——单选勾选）
+        // 识别（听写识别来源：本地 / 豆包流式 / MiMo 整段——单选勾选）
         let asrItem = NSMenuItem(title: "识别", action: nil, keyEquivalent: "")
         let asrMenu = NSMenu()
         let asrOptions: [(id: String, name: String, note: String)] = [
             ("local", "本地识别", "Apple 系统听写，离线可用，无消耗"),
             ("duoyun", "豆包识别", "云端流式，识别更准；持续聆听会消耗时长额度"),
+            ("mimo", "MiMo 识别", "云端整段识别（小米 MiMo），需 MiMo API Key"),
         ]
         for opt in asrOptions {
             let item = NSMenuItem(title: opt.name, action: actions.asrProvider, keyEquivalent: "")
@@ -232,6 +234,14 @@ enum SettingsMenuFactory {
             let duoyunItem = NSMenuItem(title: "豆包语音设置…", action: actions.duoyunSettings, keyEquivalent: "")
             duoyunItem.target = target
             menu.addItem(duoyunItem)
+        }
+
+        // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声；已删服务不显示）
+        if manifestIDs.contains("mimo") {
+            let mimoItem = NSMenuItem(title: "MiMo 语音设置…", action: actions.mimoSettings, keyEquivalent: "")
+            mimoItem.target = target
+            mimoItem.toolTip = "MiMo API Key + 预置音色（设计/克隆音色见 MiMo音色指南.md）"
+            menu.addItem(mimoItem)
         }
 
         // 语音服务管理（清单展示）

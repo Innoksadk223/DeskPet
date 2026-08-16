@@ -27,11 +27,31 @@ struct DeskPetConfig: Codable {
     var duoyunResourceId: String = "seed-tts-2.0"
     /// 豆包 TTS 音色（speaker；默认 Vivi 2.0——uranus 双通音色，researcher2 实测 seed-tts-2.0 可用 8 个）
     var duoyunVoiceType: String = "zh_female_vv_uranus_bigtts"
+    /// MiMo（小米）语音 API Key（2026-08-16：Authorization Bearer；platform.xiaomimimo.com 创建；
+    /// TTS 与 ASR 共用同一 Key；空 = 播报链/识别链跳过 MiMo）
+    var mimoApiKey: String = ""
+    /// MiMo 自定义 Base URL（2026-08-16：空 = 默认 https://api.xiaomimimo.com；
+    /// TTS/ASR 同端点 /v1/chat/completions——OpenAI 兼容；自定义时填完整 origin，不含路径）
+    var mimoBaseURL: String = ""
+    /// MiMo TTS 音色模式（2026-08-16：preset=预置音色 / design=设计音色 / clone=克隆音色）
+    var mimoTTSMode: String = "preset"
+    /// MiMo 预置音色名（preset 模式用：mimo_default/冰糖/茉莉/苏打/白桦（中文）、
+    /// Mia/Chloe/Milo/Dean（英文）；默认茉莉）
+    var mimoVoice: String = "茉莉"
+    /// MiMo 设计音色描述（design 模式必填——空 = design 模式不可用；如「沉稳的男声，语速适中，像纪录片旁白」）
+    var mimoVoiceDesignPrompt: String = ""
+    /// MiMo 克隆音色样本路径（clone 模式：mp3 文件绝对路径，10-20s 干净人声；空/文件不存在 = clone 不可用）
+    var mimoVoiceClonePath: String = ""
+    /// MiMo 朗读风格指令（可选：preset/clone 模式的 user 消息——如「语气轻快一些」；空 = 不带）
+    var mimoStyleInstruction: String = ""
+    /// MiMo ASR 识别语言（2026-08-16：auto/zh/en，默认 auto）
+    var mimoASRLanguage: String = "auto"
     /// 开机自启
     var launchAtLogin: Bool = false
-    /// 播报链顺序（edge | system | duoyun | thirdparty | hermes）——
-    /// edge 为默认读轨（用户决策）：链首首选，isAvailable=false 时跳过（D3 降级 system）
-    var speechChain: [String] = ["edge", "system", "duoyun", "thirdparty", "hermes"]
+    /// 播报链顺序（edge | system | duoyun | mimo | thirdparty | hermes）——
+    /// edge 为默认读轨（用户决策）：链首首选，isAvailable=false 时跳过（D3 降级 system）；
+    /// mimo 2026-08-16 追加在 duoyun 之后（只改默认数组——既有配置文件保持原链，渠道切换时按需插入）
+    var speechChain: [String] = ["edge", "system", "duoyun", "mimo", "thirdparty", "hermes"]
     /// 宠物大小档位（1.0 小 / 1.5 中 / 2.25 大——每档 1.5 倍，菜单三档不手填）
     var petScale: Double = 1.0
     /// 转录存档保留天数（transcripts/*.jsonl 定期清理，默认 7 天）
@@ -77,9 +97,17 @@ struct DeskPetConfig: Codable {
         duoyunBaseURL = try c.decodeIfPresent(String.self, forKey: .duoyunBaseURL) ?? ""
         duoyunResourceId = try c.decodeIfPresent(String.self, forKey: .duoyunResourceId) ?? "seed-tts-2.0"
         duoyunVoiceType = try c.decodeIfPresent(String.self, forKey: .duoyunVoiceType) ?? "zh_female_vv_uranus_bigtts"
+        mimoApiKey = try c.decodeIfPresent(String.self, forKey: .mimoApiKey) ?? ""
+        mimoBaseURL = try c.decodeIfPresent(String.self, forKey: .mimoBaseURL) ?? ""
+        mimoTTSMode = try c.decodeIfPresent(String.self, forKey: .mimoTTSMode) ?? "preset"
+        mimoVoice = try c.decodeIfPresent(String.self, forKey: .mimoVoice) ?? "茉莉"
+        mimoVoiceDesignPrompt = try c.decodeIfPresent(String.self, forKey: .mimoVoiceDesignPrompt) ?? ""
+        mimoVoiceClonePath = try c.decodeIfPresent(String.self, forKey: .mimoVoiceClonePath) ?? ""
+        mimoStyleInstruction = try c.decodeIfPresent(String.self, forKey: .mimoStyleInstruction) ?? ""
+        mimoASRLanguage = try c.decodeIfPresent(String.self, forKey: .mimoASRLanguage) ?? "auto"
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         speechChain = try c.decodeIfPresent([String].self, forKey: .speechChain)
-            ?? ["edge", "system", "duoyun", "thirdparty", "hermes"]
+            ?? ["edge", "system", "duoyun", "mimo", "thirdparty", "hermes"]
         petScale = try c.decodeIfPresent(Double.self, forKey: .petScale) ?? 1.0
         transcriptRetentionDays = try c.decodeIfPresent(Int.self, forKey: .transcriptRetentionDays) ?? 7
         edgeVoice = try c.decodeIfPresent(String.self, forKey: .edgeVoice) ?? "zh-CN-XiaoxiaoNeural"

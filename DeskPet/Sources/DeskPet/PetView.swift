@@ -40,6 +40,8 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedVoices(_ view: PetView) -> [(identifier: String, name: String, isCurrent: Bool)]
     func petViewRequestedSetVoice(_ view: PetView, identifier: String)
     func petViewRequestedDuoyunSettings(_ view: PetView)
+    /// MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
+    func petViewRequestedMiMoSettings(_ view: PetView)
     func petViewRequestedEdgeVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)]
     func petViewRequestedEdgeAvailable(_ view: PetView) -> Bool
     func petViewRequestedSetEdgeVoice(_ view: PetView, voiceID: String)
@@ -279,6 +281,7 @@ final class PetView: NSView {
             duoyunSettings: #selector(duoyunSettings),
             duoyunVoice: #selector(selectDuoyunVoice(_:)),
             duoyunCustomVoice: #selector(customDuoyunVoice),
+            mimoSettings: #selector(mimoSettings),
             edgeVoice: #selector(selectEdgeVoice(_:)),
             voiceServices: #selector(voiceServices),
             asrProvider: #selector(selectASRProvider),
@@ -406,6 +409,8 @@ final class PetView: NSView {
     }
 
     @objc private func duoyunSettings() { delegate?.petViewRequestedDuoyunSettings(self) }
+
+    @objc private func mimoSettings() { delegate?.petViewRequestedMiMoSettings(self) }
 
     @objc private func selectDuoyunVoice(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }

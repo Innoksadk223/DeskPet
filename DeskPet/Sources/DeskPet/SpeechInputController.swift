@@ -331,19 +331,36 @@ final class SpeechInputController: NSObject {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     private(set) var isRecording = false
 
-    /// 豆包流式识别（asrProvider=duoyun 且 key 已配时使用；采集 PCM 转 16k16bit 喂 WS，仅最终结果）
-    private var duoyunASR: DuoyunASRProvider?
+    /// 云端识别实例（2026-08-16 MiMo 批次参数化：豆包 WS 流式 / MiMo 整段 HTTP——
+    /// CloudPCMASR 统一表面；采集 PCM 转 16k16bit 喂入，仅最终结果）
+    private var cloudASR: CloudPCMASR?
+    /// 当前 cloudASR 是否 MiMo（停止收尾/静默提交分支语义不同：豆包 final 已在录音期间
+    /// 流式到达可即时回收；MiMo final 在停止/flush 后 1-3s 才到——需保留实例等迟到文本）
+    private var cloudASRIsMiMo = false
     private var pcmConverter: AVAudioConverter?
     private var pcmAccumulator = Data()
-    /// 本次会话豆包已失败（自动回退本地——重启识别链时读取）
+    /// 本次会话云端识别（豆包/MiMo）已失败（自动回退本地——重启识别链时读取；
+    /// 2026-08-16 语义泛化：任一云端 provider 失败均置位，名字保留兼容既有注释）
     private(set) var duoyunFailedThisSession = false
-    /// 是否走豆包路径（config + key + 本会话未失败）
-    var useDuoyunASR: Bool {
+
+    /// 云端识别途径（2026-08-16 参数化：豆包流式 / MiMo 整段；nil = 本地 Apple 路径）。
+    /// 豆包判定与原 useDuoyunASR 完全一致（asrProvider=duoyun 且 asrApiKey 非空——
+    /// Key 复用 duoyunApiKey 的逻辑在 DuoyunASRProvider 内部，此处门槛不动既有行为）；
+    /// MiMo：asrProvider=mimo 且 mimoApiKey 非空。失败标记两者共用（回退本地语义一致）。
+    private enum CloudASRKind { case duoyun, mimo }
+    private var cloudASRKind: CloudASRKind? {
         let cfg = DeskPetConfig.load()
-        return cfg.asrProvider == "duoyun"
-            && !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !duoyunFailedThisSession
+        if cfg.asrProvider == "duoyun",
+           !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !duoyunFailedThisSession { return .duoyun }
+        if cfg.asrProvider == "mimo",
+           !cfg.mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !duoyunFailedThisSession { return .mimo }
+        return nil
     }
+
+    /// 云端识别显示名（日志前缀区分「豆包识别」/「MiMo 识别」）
+    private var cloudASRDisplayName: String { cloudASRIsMiMo ? "MiMo 识别" : "豆包识别" }
 
     /// P1-1：持续聆听模式——分段 final 后自动重启识别（不停止引擎/不发状态变化）；
     /// 未开口超时从 10s 放宽到 60s（聆听场景用户可能思考较久）；onTranscript/onStateChange 语义不变。
@@ -476,14 +493,14 @@ final class SpeechInputController: NSObject {
         return speech
     }
 
-    /// 开始录音识别（按住说话）。asrProvider=duoyun 且 key 已配 → 豆包流式；否则 Apple 本地。
+    /// 开始录音识别（按住说话）。asrProvider=云端（豆包流式/MiMo 整段）且 key 已配 → 云端路径；否则 Apple 本地。
     /// v8（attempt 4 reviewer 修复）：preserveSegment=true 为服务端 final 续听专用——
     /// 跳过段状态 reset 与 L2 补交（续听不抹除已累积前半句、不在 restart 时刻补交提前提交）；
     /// 真正的新会话（用户停止后新录音、唤醒听写结束）仍走完整 reset。
     func startRecording(preserveSegment: Bool = false) {
         guard !isRecording else { return }
-        if useDuoyunASR {
-            startDuoyunRecording(preserveSegment: preserveSegment)
+        if let kind = cloudASRKind {
+            startCloudRecording(kind: kind, preserveSegment: preserveSegment)
             return
         }
         guard recognizer?.isAvailable == true else {
@@ -548,7 +565,7 @@ final class SpeechInputController: NSObject {
                 guard let self,
                       epoch == self.recognitionEpoch,
                       self.isRecording,
-                      self.duoyunASR == nil else { return }
+                      self.cloudASR == nil else { return }
                 LogManager.shared.info("本地听写：音频设备配置变化 → 稳定窗口后重建采集")
                 self.scheduleCaptureRebuild(epoch: epoch)
             }
@@ -722,6 +739,14 @@ final class SpeechInputController: NSObject {
     /// 提交后：持续聆听重启识别（新分段）、非持续结束听写（既有语义保留）。
     private func handleSilenceCommit() {
         guard isRecording else { return }
+        // MiMo 整段识别分支（2026-08-16）：无中间结果——静默到点先把累积音频整段上传
+        // （flushSegment），文本 1-3s 后经 onFinalText 到达再提交/续听（见 handleMiMoFinalText）。
+        // 不得落入下方 .none 分支重启识别：重启会换 provider 实例，在途结果被身份校验丢弃；
+        // isBusy 覆盖「有待发音频」（flush）与「上传在途」（等待）两态。
+        if cloudASRIsMiMo, let asr = cloudASR as? MiMoASRProvider, asr.isBusy {
+            if asr.hasPendingAudio { asr.flushSegment() }
+            return
+        }
         let out = segmentState.handle(.silenceCommit)
         switch out {
         case .submit(let text):
@@ -844,9 +869,11 @@ final class SpeechInputController: NSObject {
         }
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
-        // 豆包路径：尾段过 VAD → 发送末包等 final（结果经 onFinalText 提交）；
-        // 全程静音（VAD 零发送）→ 无音频可识别，直接 cancel 会话（不等 final，不触发超时回退）
-        if let asr = duoyunASR {
+        // 云端路径（豆包/MiMo 参数化）：尾段过 VAD → 发送末包等 final（结果经 onFinalText 提交）；
+        // 全程静音（VAD 零发送）→ 无音频可识别，直接 cancel 会话（不等 final，不触发超时回退）。
+        // 收尾差异：豆包录音期间 final 已流式到达——立即回收（迟到 final 由 epoch/身份守卫丢弃，
+        // 原行为）；MiMo final 在停止后 1-3s 才到——保留实例等迟到文本（20s 看门狗兜底回收）。
+        if let asr = cloudASR {
             if !pcmAccumulator.isEmpty {
                 for s in asrVAD.process(segment: pcmAccumulator) {
                     asr.feedAudio(s)
@@ -855,12 +882,17 @@ final class SpeechInputController: NSObject {
             }
             asrVAD.flushRemaining()
             if asrVAD.totalSentBytes == 0 {
-                LogManager.shared.info("豆包 ASR：全程静音（VAD 零发送），直接关闭会话")
+                LogManager.shared.info("\(cloudASRDisplayName)：全程静音（VAD 零发送），直接关闭会话")
                 asr.cancel()
+                cloudASR = nil
             } else {
                 asr.finish()
+                if !cloudASRIsMiMo {
+                    cloudASR = nil
+                } else {
+                    armCloudASRLateWatchdog()
+                }
             }
-            duoyunASR = nil
             asrVAD = ASRVAD()
         }
         pcmConverter = nil
@@ -878,9 +910,12 @@ final class SpeechInputController: NSObject {
         }
     }
 
-    /// 豆包流式路径：采集 PCM（转 16kHz int16）→ 200ms 段喂 WS → 静默/停止 → 末包 → final 文本。
+    /// 云端识别路径（2026-08-16 参数化：豆包 WS 流式 / MiMo 整段 HTTP）：
+    /// 采集 PCM（转 16kHz int16）→ 200ms 段过 VAD 喂 provider → 静默/停止 → final 文本。
     /// 仅最终结果（无中间字）；失败 → onASRError（AppDelegate 本次会话回退本地 + 提示）。
-    private func startDuoyunRecording(preserveSegment: Bool = false) {
+    /// 采集/VAD/epoch/身份守卫两 kind 完全共用；仅 final 到达语义分支（豆包=流式段累积；
+    /// MiMo=停止/flush 后整段一次性，见 handleMiMoFinalText）。
+    private func startCloudRecording(kind: CloudASRKind, preserveSegment: Bool = false) {
         recognitionEpoch += 1
         let epoch = recognitionEpoch
         if !preserveSegment {
@@ -888,43 +923,26 @@ final class SpeechInputController: NSObject {
             nextUtteranceIsNew = false
         }
         lastPartialText = ""
-        let asr = DuoyunASRProvider()
+        cloudASRIsMiMo = (kind == .mimo)
+        let asr: CloudPCMASR
+        if kind == .mimo {
+            asr = MiMoASRProvider()
+        } else {
+            asr = DuoyunASRProvider()
+        }
         let asrIdentity = ObjectIdentifier(asr)
-        duoyunASR = asr
+        cloudASR = asr
         asrVAD = ASRVAD()   // 每轮识别重置 VAD 状态
         asr.onFinalText = { [weak self, epoch, asrIdentity] text in
             DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
                 guard let self,
                       epoch == self.recognitionEpoch,
-                      let currentASR = self.duoyunASR,
+                      let currentASR = self.cloudASR,
                       ObjectIdentifier(currentASR) == asrIdentity else { return }
-                LogManager.shared.info("豆包识别 final（段累积）：\(text.prefix(40))…")
-                // v8：final 不立即提交、不一次性丢弃——更新段累积（utteranceUpdate 幂等收尾 /
-                // restart 后新 utterance 拼接合并），提交统一由本地 1s/2s 静音计时驱动。
-                let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
-                self.nextUtteranceIsNew = false
-                _ = self.segmentState.handle(event)
-                // v8（reviewer 修复）：服务端 final 到达即分句边界已过（端点检测静音 ≥ ~1s）——
-                // 立即标记，保证停顿 1~2s 续说时 final2 走 utteranceStart 拼接合并。
-                _ = self.segmentState.handle(.silenceBoundary)
-                self.lastPartialText = text   // F1：兜底文本保持最新
-                if !self.isRecording && !self.continuousMode {
-                    // 用户已松开/听写已结束（stopRecordingInternal 末包触发）→ 收尾提交（去重）
-                    // utteranceUpdate：幂等替换当前 utterance 尾部（保留分句窗口内的拼接合并）
-                    if !self.segmentState.submitted {   // 竞态收敛：2s 计时已提交 → 迟到 final 不重复
-                        let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
-                        self.nextUtteranceIsNew = false
-                        _ = self.segmentState.handle(event)
-                        let out = self.segmentState.handle(.finish)
-                        if case .submit(let t) = out {
-                            self.submitTranscript(t, confidence: nil)
-                        }
-                    }
-                } else if self.isRecording {
-                    // 服务端 final = WS 会话终点：续听开新 WS（分句窗口内用户可能继续说 → 合并；
-                    // preserveSegment：restart 不抹除已累积前半句、不 L2 补交）
-                    self.armSilenceTimers()   // 本地 1s/2s 计时统一提交（保留——restart 不取消）
-                    self.restartRecognition(cancelTimers: false, preserveSegment: true)
+                if self.cloudASRIsMiMo {
+                    self.handleMiMoFinalText(text, identity: asrIdentity)
+                } else {
+                    self.handleDuoyunFinalText(text)
                 }
             }
         }
@@ -932,10 +950,17 @@ final class SpeechInputController: NSObject {
             DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
                 guard let self,
                       epoch == self.recognitionEpoch,
-                      let currentASR = self.duoyunASR,
+                      let currentASR = self.cloudASR,
                       ObjectIdentifier(currentASR) == asrIdentity else { return }
-                self.duoyunFailedThisSession = true   // 本次会话回退本地
-                LogManager.shared.warn("豆包识别失败（本次会话回退本地）：\(message)")
+                // MiMo 迟到错误（停止后等 final 期间失败）：会话已结束——只回收 provider，
+                // 不回退本地不打扰用户（本次无文本，下次录音自然重试）
+                if self.cloudASRIsMiMo, !self.isRecording {
+                    LogManager.shared.warn("MiMo 识别：停止后收到错误（\(message)），回收会话")
+                    self.cloudASR = nil
+                    return
+                }
+                self.duoyunFailedThisSession = true   // 任一云端识别失败：本次会话回退本地（语义泛化）
+                LogManager.shared.warn("\(self.cloudASRDisplayName)失败（本次会话回退本地）：\(message)")
                 self.stopRecordingInternal()
                 self.isRecording = false
                 self.onStateChange?(false)
@@ -968,44 +993,47 @@ final class SpeechInputController: NSObject {
                 guard let self,
                       epoch == self.recognitionEpoch,
                       self.isRecording,
-                      let currentASR = self.duoyunASR,
+                      let currentASR = self.cloudASR,
                       ObjectIdentifier(currentASR) == asrIdentity else { return }
-                LogManager.shared.info("豆包听写：音频设备配置变化（OBS/录屏/蓝牙切换？）→ 稳定窗口后重建采集")
+                LogManager.shared.info("\(self.cloudASRDisplayName)：音频设备配置变化（OBS/录屏/蓝牙切换？）→ 稳定窗口后重建采集")
                 self.scheduleCaptureRebuild(epoch: epoch)
             }
             audioEngine.prepare()
             try audioEngine.start()
-            Task { [weak self, epoch, asrIdentity] in
-                do {
-                    try await asr.start()
-                } catch {
-                    DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
-                        guard let self,
-                              epoch == self.recognitionEpoch,
-                              let currentASR = self.duoyunASR,
-                              ObjectIdentifier(currentASR) == asrIdentity else { return }
-                        self.duoyunFailedThisSession = true
-                        LogManager.shared.warn("豆包 ASR 会话建立失败（本次会话回退本地）：\(error)")
-                        self.stopRecordingInternal()
-                        self.isRecording = false
-                        self.onStateChange?(false)
-                        self.onASRError?("\(error.localizedDescription)")
-                        // v9（audio-device-fix）：持续聆听下会话建立失败 → 稳定窗口后自动重试
-                        // （重试经 useDuoyunASR 判定已回退本地，聆听不假死）
-                        if self.continuousMode {
-                            LogManager.shared.warn("持续聆听：豆包会话建立失败，稳定窗口后自动重试（本地）")
-                            self.scheduleCaptureRebuild(epoch: self.recognitionEpoch)
+            // 豆包需建 WS 会话（FULL_REQUEST）；MiMo 整段 HTTP 无会话建立——直接采集
+            if kind == .duoyun, let duoyun = asr as? DuoyunASRProvider {
+                Task { [weak self, epoch, asrIdentity] in
+                    do {
+                        try await duoyun.start()
+                    } catch {
+                        DispatchQueue.main.async { [weak self, epoch, asrIdentity] in
+                            guard let self,
+                                  epoch == self.recognitionEpoch,
+                                  let currentASR = self.cloudASR,
+                                  ObjectIdentifier(currentASR) == asrIdentity else { return }
+                            self.duoyunFailedThisSession = true
+                            LogManager.shared.warn("豆包 ASR 会话建立失败（本次会话回退本地）：\(error)")
+                            self.stopRecordingInternal()
+                            self.isRecording = false
+                            self.onStateChange?(false)
+                            self.onASRError?("\(error.localizedDescription)")
+                            // v9（audio-device-fix）：持续聆听下会话建立失败 → 稳定窗口后自动重试
+                            // （重试经 cloudASRKind 判定已回退本地，聆听不假死）
+                            if self.continuousMode {
+                                LogManager.shared.warn("持续聆听：豆包会话建立失败，稳定窗口后自动重试（本地）")
+                                self.scheduleCaptureRebuild(epoch: self.recognitionEpoch)
+                            }
                         }
                     }
                 }
             }
             isRecording = true
             onStateChange?(true)
-            LogManager.shared.info("豆包识别开始（流式）")
-            // 静默结束：豆包路径同样按静默计时（未开口 10s / 开口后 2s）
+            LogManager.shared.info("\(cloudASRDisplayName)开始（\(kind == .mimo ? "整段上传" : "流式")）")
+            // 静默结束：云端路径同样按静默计时（未开口 10s / 开口后 2s）
             scheduleSilenceTimeout(delay: continuousMode ? 60.0 : 10.0)
         } catch {
-            LogManager.shared.error("豆包识别启动失败：\(error)")
+            LogManager.shared.error("\(cloudASRDisplayName)启动失败：\(error)")
             duoyunFailedThisSession = true
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
@@ -1018,13 +1046,98 @@ final class SpeechInputController: NSObject {
             onASRError?("\(error.localizedDescription)")
             // v9（audio-device-fix）：持续聆听下启动失败 → 稳定窗口后自动重试续听（不假死）
             if continuousMode {
-                LogManager.shared.warn("持续聆听：豆包识别启动失败，稳定窗口后自动重试（本地）")
+                LogManager.shared.warn("持续聆听：\(cloudASRDisplayName)启动失败，稳定窗口后自动重试（本地）")
                 scheduleCaptureRebuild(epoch: recognitionEpoch)
             }
         }
     }
 
-    /// tap 回调：转 16k16bit → 累积 200ms 段喂豆包（不足段累积）。
+    /// 豆包 final 处理（v8 原逻辑，参数化提取——行为零改动）：
+    /// final 不立即提交、不一次性丢弃——更新段累积（utteranceUpdate 幂等收尾 /
+    /// restart 后新 utterance 拼接合并），提交统一由本地 1s/2s 静音计时驱动。
+    private func handleDuoyunFinalText(_ text: String) {
+        LogManager.shared.info("豆包识别 final（段累积）：\(text.prefix(40))…")
+        let event: SpeechSegmenter.Event = nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
+        nextUtteranceIsNew = false
+        _ = segmentState.handle(event)
+        // v8（reviewer 修复）：服务端 final 到达即分句边界已过（端点检测静音 ≥ ~1s）——
+        // 立即标记，保证停顿 1~2s 续说时 final2 走 utteranceStart 拼接合并。
+        _ = segmentState.handle(.silenceBoundary)
+        lastPartialText = text   // F1：兜底文本保持最新
+        if !isRecording && !continuousMode {
+            // 用户已松开/听写已结束（stopRecordingInternal 末包触发）→ 收尾提交（去重）
+            // utteranceUpdate：幂等替换当前 utterance 尾部（保留分句窗口内的拼接合并）
+            if !segmentState.submitted {   // 竞态收敛：2s 计时已提交 → 迟到 final 不重复
+                let event: SpeechSegmenter.Event = nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
+                nextUtteranceIsNew = false
+                _ = segmentState.handle(event)
+                let out = segmentState.handle(.finish)
+                if case .submit(let t) = out {
+                    submitTranscript(t, confidence: nil)
+                }
+            }
+        } else if isRecording {
+            // 服务端 final = WS 会话终点：续听开新 WS（分句窗口内用户可能继续说 → 合并；
+            // preserveSegment：restart 不抹除已累积前半句、不 L2 补交）
+            armSilenceTimers()   // 本地 1s/2s 计时统一提交（保留——restart 不取消）
+            restartRecognition(cancelTimers: false, preserveSegment: true)
+        }
+    }
+
+    /// MiMo final 处理（2026-08-16，整段语义——与豆包流式差异的核心适配点）：
+    /// final 必然来自 flushSegment/finish（静默提交 handleSilenceCommit 或会话停止触发），
+    /// 即**静默阈值已过**、文本即完整段——到达后直接提交，不再等本地计时。
+    /// 仍在录音：提交后**继续用同一 provider/epoch**（MiMo 无服务端会话状态，无需
+    /// restartRecognition 换新实例——换实例会把在途/后续段被身份校验丢弃；分段计时由
+    /// 后续 VAD 语音活动重新武装）。非持续模式提交后自动结束听写（与 handleSilenceCommit
+    /// 非持续分支同语义——flush 时录音尚未停，替它完成收口）。
+    private func handleMiMoFinalText(_ text: String, identity: ObjectIdentifier) {
+        LogManager.shared.info("MiMo 识别 final（整段）：\(text.prefix(40))…")
+        // 段状态机更新（与豆包 final 同构：restart 语义下新 utterance / 同 utterance 收尾）
+        let event: SpeechSegmenter.Event = nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
+        nextUtteranceIsNew = false
+        _ = segmentState.handle(event)
+        lastPartialText = text   // F1：兜底文本保持最新
+        // 静默阈值已过（flush 由 handleSilenceCommit/finish 触发）→ 直接提交（去重）
+        if !segmentState.submitted {
+            let out = segmentState.handle(.finish)
+            if case .submit(let t) = out {
+                submitTranscript(t, confidence: nil)   // MiMo 无置信度（VAD 已滤静音）——同豆包 nil
+            }
+        }
+        if isRecording {
+            if !continuousMode {
+                // 非持续（手动/唤醒听写）：提交后自动结束（stopRecording 内 finish 幂等——
+                // provider 已 finished，不会重复上传；后续迟到 final 由 submitted 去重）
+                stopRecording()
+            }
+            // 持续聆听：继续同一 provider 采下一段（无 restart——见方法注释）
+            return
+        }
+        // 会话已结束（用户先松开，final 迟到到达）：提交完成——回收 provider（持续模式
+        // 保留引用到下次 startCloudRecording 自然替换，语义等价、少一次空窗）
+        if !continuousMode, let current = cloudASR, ObjectIdentifier(current) == identity {
+            cloudASR = nil
+        }
+    }
+
+    /// MiMo 迟到收口看门狗（2026-08-16）：stopRecordingInternal 保留 provider 等 final
+    /// （正常 1-3s 到达）；20s 仍未回调（网络挂起/丢包）→ 回收 provider 防泄漏。
+    /// 身份守卫：期间已换新实例/已回收则本看门狗空转（不误杀新会话）。
+    private static let cloudASRLateWatchdogSeconds: TimeInterval = 20
+    private func armCloudASRLateWatchdog() {
+        guard let asr = cloudASR else { return }
+        let identity = ObjectIdentifier(asr)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.cloudASRLateWatchdogSeconds) { [weak self] in
+            guard let self else { return }
+            guard let current = self.cloudASR, ObjectIdentifier(current) == identity else { return }
+            LogManager.shared.warn("MiMo 识别：final \(Int(Self.cloudASRLateWatchdogSeconds))s 未到，回收会话")
+            asr.cancel()
+            self.cloudASR = nil
+        }
+    }
+
+    /// tap 回调：转 16k16bit → 累积 200ms 段喂云端 provider（不足段累积）。
     /// R-2026-08-13：兼容设备格式变化（OBS/录屏切聚合设备可能 44.1k/2ch）——
     /// 目标格式保持源声道数（Float32 16k），回调内手动降混 mono：
     /// 旧实现 2ch→1ch 转换失败 → 豆包听写静默（与唤醒同因）。
@@ -1044,7 +1157,7 @@ final class SpeechInputController: NSObject {
             return buffer
         }
         if convError != nil { return }
-        // 手动降混：多声道平均 → int16 mono（豆包协议要求 16k16bit mono）
+        // 手动降混：多声道平均 → int16 mono（云端协议统一要求 16k16bit mono）
         if let chData = out.floatChannelData {
             let frames = Int(out.frameLength)
             var bytes = Data(count: frames * 2)
@@ -1061,13 +1174,14 @@ final class SpeechInputController: NSObject {
                 guard let self,
                       epoch == self.recognitionEpoch,
                       self.isRecording,
-                      let asr = self.duoyunASR,
+                      let asr = self.cloudASR,
                       ObjectIdentifier(asr) == asrIdentity else { return }
                 self.pcmAccumulator.append(bytes)
                 if self.pcmAccumulator.count >= 6400 {
                     let seg = self.pcmAccumulator.prefix(6400)
                     self.pcmAccumulator.removeFirst(6400)
-                    // VAD（executor8）：静音段不喂 WS；说话段 + 前后缓冲发送
+                    // VAD（executor8）：静音段不喂云端（MiMo 整段上传省流量/豆包省额度）；
+                    // 说话段 + 前后缓冲发送
                     let sent = self.asrVAD.process(segment: Data(seg))
                     for s in sent {
                         asr.feedAudio(s)

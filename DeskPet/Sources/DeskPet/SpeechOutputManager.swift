@@ -82,6 +82,8 @@ final class SpeechOutputManager {
 
     private let systemProvider = SystemSpeechProvider()
     private let duoyunProvider = DuoyunSpeechProvider()
+    /// MiMo（小米）TTS（2026-08-16）：播报链第三档——preset/design/clone 三模式（见 MiMoSpeechProvider）
+    private let mimoProvider = MiMoSpeechProvider()
     private let edgeProvider = EdgeTTSProvider()
     private var providerChain: [SpeechProvider] = []
     private var activeProvider: SpeechProvider?
@@ -147,6 +149,11 @@ final class SpeechOutputManager {
                 // ISSUE-1：链重建前刷新豆包配置缓存（音色/key 切换后正式播报立即生效）
                 duoyunProvider.refreshConfig()
                 if duoyunProvider.isAvailable() { chain.append(duoyunProvider) }
+            case "mimo":
+                // 2026-08-16（ISSUE-1 同款）：链重建前刷新 MiMo 配置缓存（Key/模式/音色/克隆样本
+                // 切换后正式播报立即生效——含克隆样本路径变化重读）
+                mimoProvider.refreshConfig()
+                if mimoProvider.isAvailable() { chain.append(mimoProvider) }
             case "thirdparty", "hermes":
                 break   // 第三方/内置兜底：预留（M4.1 扩展点）
             default:
@@ -355,11 +362,15 @@ final class SpeechOutputManager {
         let cfg = DeskPetConfig.load()
         let edgeOK = edgeProvider.isAvailable()
         let duoyunOK = duoyunProvider.isAvailable()
+        // MiMo 可用性含缓存刷新（菜单打开时重读——Key/模式/克隆样本变化即时反映）
+        mimoProvider.refreshConfig()
+        let mimoOK = mimoProvider.isAvailable()
         let current = cfg.speechChain.first(where: { id in
             switch id {
             case "system": return true
             case "edge": return edgeOK
             case "duoyun": return duoyunOK
+            case "mimo": return mimoOK
             default: return false
             }
         }) ?? "system"
@@ -376,6 +387,23 @@ final class SpeechOutputManager {
         if manifestIDs.contains("duoyun") {
             list.append(ChannelInfo(id: "duoyun", name: "豆包语音", available: duoyunOK,
                         note: duoyunOK ? "" : "未填 Key（设置 ▸ 语音 ▸ 豆包语音设置 可配置）", isCurrent: current == "duoyun"))
+        }
+        if manifestIDs.contains("mimo") {
+            // MiMo note（2026-08-16）：不可用给原因（Key/设计描述/克隆样本）；
+            // 可用时按模式标注（design/clone 与 preset 体验不同——用户需知道当前是哪种）
+            let mimoMode = cfg.mimoTTSMode
+            let note: String
+            if mimoOK {
+                switch mimoMode {
+                case "design": note = "自定义设计音色"
+                case "clone": note = "克隆音色"
+                default: note = ""
+                }
+            } else {
+                note = mimoProvider.unavailableReason()
+            }
+            list.append(ChannelInfo(id: "mimo", name: "MiMo 语音", available: mimoOK,
+                                    note: note, isCurrent: current == "mimo"))
         }
         return list
     }

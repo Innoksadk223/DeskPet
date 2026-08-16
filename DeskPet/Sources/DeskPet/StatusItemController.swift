@@ -108,6 +108,7 @@ final class StatusItemController: NSObject {
             duoyunSettings: #selector(AppDelegate.menuDuoyunSettings),
             duoyunVoice: #selector(AppDelegate.menuSelectDuoyunVoice(_:)),
             duoyunCustomVoice: #selector(AppDelegate.menuCustomDuoyunVoice),
+            mimoSettings: #selector(AppDelegate.menuMiMoSettings),
             edgeVoice: #selector(AppDelegate.menuSelectEdgeVoice(_:)),
             voiceServices: #selector(AppDelegate.menuVoiceServices),
             asrProvider: #selector(AppDelegate.menuSelectASRProvider),

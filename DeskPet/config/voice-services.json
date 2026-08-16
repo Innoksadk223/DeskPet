@@ -3,6 +3,7 @@
     {"id": "system", "name": "系统语音", "type": "local", "configKeys": [], "enabled": true, "note": "macOS 本地，零依赖"},
     {"id": "edge-tts", "name": "Edge 语音", "type": "cloud", "configKeys": ["edgeVoice"], "dependency": "edge-tts (pip)", "enabled": false, "note": "非官方接口，个人使用"},
     {"id": "duoyun", "name": "豆包语音", "type": "cloud", "configKeys": ["duoyunApiKey", "duoyunVoiceType"], "dependency": "API Key", "enabled": false, "note": "需火山引擎 API Key"},
+    {"id": "mimo", "name": "MiMo 语音", "type": "cloud", "configKeys": ["mimoApiKey", "mimoVoice", "mimoTTSMode", "mimoVoiceDesignPrompt", "mimoVoiceClonePath"], "dependency": "API Key", "enabled": false, "note": "小米 MiMo（预置/设计/克隆音色 + 整段识别），见 MiMo音色指南.md"},
     {"id": "cloud-asr", "name": "云端识别(预留)", "type": "cloud", "configKeys": ["asrProvider", "asrApiKey"], "enabled": false, "note": "预留"}
   ]
 }

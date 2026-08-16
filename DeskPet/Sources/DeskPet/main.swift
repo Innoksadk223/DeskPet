@@ -15,6 +15,10 @@ if args.contains("--self-test-duoyun-asr") {
 if args.contains("--self-test-vad") {
     exit(ASRVAD.runSelfTest())
 }
+if args.contains("--self-test-mimo") {
+    // MiMo 语音（2026-08-16）：纯函数离线自测（WAV 头布局 + TTS/ASR 请求体构造）——不触网络
+    exit(MiMoSelfTest.run())
+}
 if args.contains("--self-test-markers") {
     exit(HermesBridgeSelfTest.runMarkersSelfTest())
 }

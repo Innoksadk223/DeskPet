@@ -25,9 +25,9 @@ WakeController.swift          HermesClient.swift             PetView.swift（动
 SpeechInputController.swift   HermesBridge.swift（核心）      BubblePanel.swift（气泡）
 DuoyunASRProvider.swift       ServeManager.swift             StatusItemController.swift（菜单栏）
 SpeechOutputManager.swift     SessionIndex.swift             SettingsMenuFactory.swift
-DuoyunSpeechProvider.swift    CommandRouter.swift            InputPanelController.swift
-EdgeTTSProvider.swift         AppDelegate.swift（胶水层）      DeskPetConfig.swift
-DeskPetHermesProfile.swift    HermesClient.swift             DeskPetState.swift
+DuoyunSpeechProvider.swift    CommandRouter.swift            AppDelegate.swift（胶水层）      DeskPetConfig.swift
+EdgeTTSProvider.swift         HermesClient.swift             DeskPetState.swift
+MiMoSpeechProvider.swift      MiMoASRProvider.swift          DeskPetHermesProfile.swift
 ```
 
 - **AppDelegate** 是胶水：接线 ①↔②↔③，`showBubble`/`feedback` 是唯一气泡/反馈入口，NSWindow 操作主线程收口
@@ -124,7 +124,7 @@ seed 版本号存 SessionIndex（`mainSeedVersion`，当前 4）——版本不�
 
 ## 4. 播报机制（SpeechOutputManager）
 
-- provider 链：豆包 TTS → Edge TTS → 系统语音（`speechChain` 配置，失败自动降级）
+- provider 链：豆包 TTS → Edge TTS → 系统语音 → MiMo TTS（`speechChain` 配置，失败自动降级）
 - **优先级**：high（主回复/反馈/状态直答）立即打断；low（任务完成结果/开始确认）入队，当前播完推进
 - **串行合成（2026-08-13 修复）**：high 多句逐句——只提交第 1 句，播放完成回调推进下一句（`pendingHigh` 队列）——杜绝多句并发合成完成顺序乱导致交叉/乱序
 - **打断语义（2026-08-16 修订「最新优先」）**：新 high → stop（停当前播放 + 清 pendingHigh + 作废在途合成 generation+1 + 清低优队列）→ 播新内容——**最终结果优先，中间与排队播报全部丢弃**；唯一例外是轻确认「收到」（clearsQueue=false，播报中/多句未完时直接跳过不打断）
@@ -133,6 +133,14 @@ seed 版本号存 SessionIndex（`mainSeedVersion`，当前 4）——版本不�
 - **任务播报分级（2026-08-16）**：过程性消息（非 isFinal）**只出气泡不出声**（时效短、插进对话造成穿插）；isFinal 结果保留语音（spoken 直报，>150 字截断护栏）+ persistent 气泡；任务失败仍语音播报（结果类）；「好嘞，开始执行！」为派发即时确认保留语音
 - P0-2：`onSpeakingChange` 通知播报状态（持续聆听采集闸门用）
 - 线程收口（2026-08-16）：provider 完成回调与降级 `fallbackSpeak` 统一派发主线程后再动队列/共享状态（NSSound delegate 线程无保证，防并发改队列）；`advanceHigh` 加 isSpeaking 守卫——主线程派发引入的「迟到回调」在新旧播报交接窗口不得提前弹出下一句（交由新句自己的完成回调推进）
+
+### 4.1 MiMo 语音（2026-08-16）
+
+- **端点**：`POST https://api.xiaomimimo.com/v1/chat/completions`（OpenAI 兼容；`Authorization: Bearer`；TTS/ASR 共用端点与 `mimoApiKey`；`mimoBaseURL` 非空可覆盖；TTS 限时免费）
+- **TTS 三模式**（`mimoTTSMode`）：`preset`（`mimo-v2.5-tts`，audio.voice=预置音色名，user 风格指令可选）/ `design`（`mimo-v2.5-tts-voicedesign`，user 消息=音色设计描述 `mimoVoiceDesignPrompt` 必填、不带 audio.voice）/ `clone`（`mimo-v2.5-tts-voiceclone`，audio.voice="data:audio/mpeg;base64,样本mp3" `mimoVoiceClonePath`）。响应 `choices[0].message.audio.data`=base64 WAV → NSSound（B-1 三件套与豆包同型）
+- **ASR 整段语义**（`mimo-v2.5-asr`）：**无中间结果**——feedAudio 累积 16k16bit PCM（VAD 滤静音省流量，上限 ~7MB），静默提交（handleSilenceCommit）时 `flushSegment()` 整段 WAV 上传，**1-3s 后 final 一次性返回**再提交；停止后 final 迟到到达 → 提交后回收，**20s 看门狗**兜底回收 provider（身份守卫防误杀新会话）。持续聆听中 final 后**不 restart**（MiMo 无服务端会话状态——换实例会丢在途段，与豆包 WS 会话终点语义的关键差异）
+- **接入面**：`SpeechInputController` 以 `CloudPCMASR` 协议 + kind（duoyun/mimo）参数化（豆包行为零改动）；配置键 `mimoApiKey/mimoBaseURL/mimoTTSMode/mimoVoice/mimoVoiceDesignPrompt/mimoVoiceClonePath/mimoStyleInstruction/mimoASRLanguage`；用户指南 `DeskPet/MiMo音色指南.md`；401=Key 无效、429=限流（错误直译）
+- 默认 `speechChain` 追加 `mimo` 于 duoyun 后（只改默认数组——存量配置不动）；voice-services.json 升级合并（`upgradeServiceIDs`+墓碑）使存量清单补入 mimo 且删除语义保持
 
 ## 5. 语音闭环防护（P0，2026-08-13）
 
@@ -323,6 +331,7 @@ swift run DeskPet --self-test-router            # 指令路由 60/60（三分控
 swift run DeskPet --self-test-markers           # 标记协议 + state-sync + task-slot + dual-agent + ux-details + workspace 绑定纯逻辑
 swift run DeskPet --self-test-wake              # 唤醒决策 17/17（零音频触碰）
 swift run DeskPet --self-test-vad               # 静音分段 8/8 + segmenter 23/23
+swift run DeskPet --self-test-mimo              # MiMo 语音 29/29（WAV 头布局 + TTS/ASR 请求体构造纯函数）
 swift run DeskPet --self-test-asr-seg           # ASR 分段回归 10/10
 swift run DeskPet --self-test-history-storage   # 历史存储隔离回归（workspace + 专属 SOUL 生命周期：缺失创建/旧链接替换/保留/冲突/幂等）
 ```

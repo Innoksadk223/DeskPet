@@ -23,11 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // M2：语音
     let speechInput = SpeechInputController()
 
-    /// 豆包识别失败 → 本次会话回退本地 + 提示（语音输入自动降级，无需用户操作）
+    /// 云端识别（豆包/MiMo）失败 → 本次会话回退本地 + 提示（语音输入自动降级，无需用户操作）
     private func wireSpeechInput() {
         speechInput.onASRError = { [weak self] message in
             DispatchQueue.main.async {
-                self?.feedback("⚠️ 豆包识别不可用（\(message.prefix(40))）——本次会话已回退本地识别")
+                self?.feedback("⚠️ 云端识别不可用（\(message.prefix(40))）——本次会话已回退本地识别")
             }
         }
     }
@@ -1080,6 +1080,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - MiMo 语音（2026-08-16）
+
+    /// ④ MiMo 语音设置（结构对齐豆包设置弹窗）：API Key（密文）+ 预置音色下拉 + 测试发声。
+    /// 设计/克隆音色为高级项——不入弹窗（配置文件 mimoTTSMode/mimoVoiceDesignPrompt/
+    /// mimoVoiceClonePath，见 DeskPet/MiMo音色指南.md）；informativeText 给出文件路径指引。
+    private func mimoSettings() {
+        let cfg = DeskPetConfig.load()
+        let a = alert("MiMo 语音设置",
+                      "API Key 在 platform.xiaomimimo.com 注册创建（控制台 → API Key 管理）；语音合成目前限时免费，识别与合成共用同一 Key。\n\n高级玩法（设计音色/克隆音色/朗读风格）：编辑配置文件中的 mimoTTSMode / mimoVoiceDesignPrompt / mimoVoiceClonePath 等键，详见 DeskPet/MiMo音色指南.md。",
+                      buttons: ["保存", "取消", "测试发声"])
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 118))
+        let keyLabel = NSTextField(labelWithString: "MiMo API Key")
+        keyLabel.frame = NSRect(x: 0, y: 104, width: 300, height: 14)
+        keyLabel.font = NSFont.systemFont(ofSize: 10)
+        keyLabel.textColor = NSColor.secondaryLabelColor
+        container.addSubview(keyLabel)
+        let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 74, width: 300, height: 24))
+        keyField.stringValue = cfg.mimoApiKey
+        keyField.placeholderString = "粘贴 MiMo API Key"
+        keyField.setAccessibilityLabel("MiMo API Key")
+        container.addSubview(keyField)
+        let voiceLabel = NSTextField(labelWithString: "预置音色（preset 模式生效）")
+        voiceLabel.frame = NSRect(x: 0, y: 52, width: 300, height: 14)
+        voiceLabel.font = NSFont.systemFont(ofSize: 10)
+        voiceLabel.textColor = NSColor.secondaryLabelColor
+        container.addSubview(voiceLabel)
+        let voicePopup = NSPopUpButton(frame: NSRect(x: 0, y: 20, width: 300, height: 26), pullsDown: false)
+        for v in MiMoSpeechProvider.presetVoiceCatalog {
+            voicePopup.addItem(withTitle: v.name)
+        }
+        // 当前音色不在目录（自定义/留空）→ 追加显示项（不丢配置）
+        if let match = MiMoSpeechProvider.presetVoiceCatalog.first(where: { $0.id == cfg.mimoVoice }) {
+            voicePopup.selectItem(withTitle: match.name)
+        } else {
+            voicePopup.addItem(withTitle: "当前：\(cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice)")
+            voicePopup.selectItem(withTitle: "当前：\(cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice)")
+        }
+        container.addSubview(voicePopup)
+        a.accessoryView = container
+        a.window.initialFirstResponder = keyField
+        let resp = a.runModal()
+        func selectedVoiceID() -> String {
+            let idx = voicePopup.indexOfSelectedItem
+            guard idx >= 0, idx < MiMoSpeechProvider.presetVoiceCatalog.count else { return cfg.mimoVoice }
+            return MiMoSpeechProvider.presetVoiceCatalog[idx].id
+        }
+        func applySave(key: String, voice: String) -> Bool {
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoApiKey = key
+            newCfg.mimoVoice = voice
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return false
+            }
+            SpeechOutputManager.shared.rebuild()
+            feedback("✅ MiMo 语音设置已保存")
+            return true
+        }
+        if resp == .alertFirstButtonReturn {   // 保存
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                feedback("⚠️ API Key 不能为空")
+                return
+            }
+            _ = applySave(key: key, voice: selectedVoiceID())
+        } else if resp == .alertThirdButtonReturn {   // 测试发声（先临时保存再测——链上立即生效）
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                feedback("⚠️ 请先填写 API Key 再测试")
+                return
+            }
+            if applySave(key: key, voice: selectedVoiceID()) {
+                testMiMoVoice()
+            }
+        }
+    }
+
+    /// ④ MiMo 测试发声：真实合成往返，成功播报 + 气泡确认；失败提示原因（401/429 直译）。
+    private func testMiMoVoice() {
+        let provider = MiMoSpeechProvider()
+        Task {
+            let result = await provider.testSpeak()
+            await MainActor.run {
+                if result.ok {
+                    LogManager.shared.info("MiMo 测试发声成功：\(result.detail)")
+                    let currentName = SpeechOutputManager.shared.channelList().first(where: { $0.isCurrent })?.name ?? "系统语音"
+                    feedback("✅ MiMo 发声成功！当前语音：\(currentName)——设置 ▸ 语音 ▸ 播报方式选「MiMo 语音」即可用它说话")
+                } else {
+                    LogManager.shared.warn("MiMo 测试发声失败：\(result.detail)")
+                    feedback("⚠️ MiMo 发声失败：\(String(result.detail.prefix(80)))")
+                }
+            }
+        }
+    }
+
     // MARK: - Edge 语音（默认读轨）
 
     /// Edge 中文音色清单（2026-08-12 微软端点实测 9 个可用：晓晓/晓伊/云希/云扬/晓萱/云健/
@@ -1169,6 +1264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let channels = SpeechOutputManager.shared.channelList()
         let edgeOK = channels.first(where: { $0.id == "edge" })?.available ?? false
         let duoyunOK = channels.first(where: { $0.id == "duoyun" })?.available ?? false
+        let mimoOK = channels.first(where: { $0.id == "mimo" })?.available ?? false
         let cfg = DeskPetConfig.load()
         return manifest.services.map { s in
             let enabled: Bool
@@ -1177,11 +1273,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "system": enabled = true
             case "edge-tts": enabled = edgeOK
             case "duoyun": enabled = duoyunOK
+            case "mimo":
+                // MiMo（2026-08-16）：Key+模式可用性由 channelList 判定（design 缺描述/clone 缺样本同样不可用）
+                enabled = mimoOK
+                note = (note.map { "\($0) · " } ?? "") + (mimoOK ? "模式：\(cfg.mimoTTSMode)" : "未配置 Key")
             case "cloud-asr":
-                // 豆包识别来源联动：当前来源显示在副行（asrProvider 实际值）
-                let active = cfg.asrProvider == "duoyun"
-                enabled = active || !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                note = (note.map { "\($0) · " } ?? "") + "当前识别：\(active ? "豆包" : "本地")"
+                // 云端识别来源联动：当前来源显示在副行（asrProvider 实际值——豆包流式/MiMo 整段）
+                let providerName: String
+                switch cfg.asrProvider {
+                case "duoyun": providerName = "豆包"
+                case "mimo": providerName = "MiMo"
+                default: providerName = "本地"
+                }
+                let active = cfg.asrProvider == "duoyun" || cfg.asrProvider == "mimo"
+                enabled = active
+                    || !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !cfg.mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                note = (note.map { "\($0) · " } ?? "") + "当前识别：\(providerName)"
             default: enabled = s.enabled
             }
             return VoiceServicesPanelController.Row(
@@ -1221,13 +1329,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "edgeVoice": cfg.edgeVoice = ""               // 合成 fallback 默认音色，安全
             case "duoyunApiKey": cfg.duoyunApiKey = ""         // 清空 → isAvailable false → 链跳过
             case "duoyunVoiceType": cfg.duoyunVoiceType = ""   // fallback 默认音色，安全
+            case "mimoApiKey": cfg.mimoApiKey = ""             // 2026-08-16：MiMo Key 清空 → 链/识别跳过
+            case "mimoVoice": cfg.mimoVoice = defaults.mimoVoice
+            case "mimoTTSMode": cfg.mimoTTSMode = defaults.mimoTTSMode
+            case "mimoVoiceDesignPrompt": cfg.mimoVoiceDesignPrompt = ""
+            case "mimoVoiceClonePath": cfg.mimoVoiceClonePath = ""
             case "asrProvider": cfg.asrProvider = defaults.asrProvider
             case "asrApiKey": cfg.asrApiKey = ""
             default: break
             }
         }
         // 播报链移除该服务（服务 id → 链 id 映射）
-        let chainIDs = ["edge-tts": "edge", "duoyun": "duoyun", "system": "system"]
+        let chainIDs = ["edge-tts": "edge", "duoyun": "duoyun", "system": "system", "mimo": "mimo"]
         if let chainID = chainIDs[id] {
             cfg.speechChain.removeAll { $0 == chainID }
         }
@@ -1411,12 +1524,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectChannel(id)
     }
     @objc func menuDuoyunSettings() { duoyunSettings() }
+    @objc func menuMiMoSettings() { mimoSettings() }
 
     private static func channelName(_ id: String) -> String {
         switch id {
         case "edge": return "Edge 语音"
         case "system": return "系统语音"
         case "duoyun": return "豆包语音"
+        case "mimo": return "MiMo 语音"
         case "thirdparty": return "第三方"
         case "hermes": return "Hermes 内置"
         default: return id
@@ -2142,11 +2257,12 @@ extension AppDelegate: PetViewDelegate {
     func petViewRequestedEditVoicePromptsFile(_ view: PetView) { editVoicePromptsFile() }
     func petViewRequestedSetExitPhrases(_ view: PetView) { setExitPhrases() }
 
-    // MARK: - 听写识别来源（豆包流式 ASR）
+    // MARK: - 听写识别来源（豆包流式 / MiMo 整段云端 ASR）
 
-    /// 当前识别来源（设置菜单勾选用）。
+    /// 当前识别来源（设置菜单勾选用）：local/duoyun/mimo 直读，其余未知值按 local。
     func asrProviderCurrent() -> String {
-        DeskPetConfig.load().asrProvider == "duoyun" ? "duoyun" : "local"
+        let p = DeskPetConfig.load().asrProvider
+        return (p == "duoyun" || p == "mimo") ? p : "local"
     }
 
     func petViewRequestedASRProvider(_ view: PetView) -> String {
@@ -2161,13 +2277,17 @@ extension AppDelegate: PetViewDelegate {
         selectASRProvider(sender.representedObject as? String ?? "local")
     }
 
-    /// 切换识别来源：保存 + 提示（豆包：消耗时长额度提示；无 key 不切换）
+    /// 切换识别来源：保存 + 提示（云端：消耗额度/整段延迟提示；无 key 不切换）
     private func selectASRProvider(_ id: String) {
-        guard id == "local" || id == "duoyun" else { return }
+        guard id == "local" || id == "duoyun" || id == "mimo" else { return }
         var cfg = DeskPetConfig.load()
         guard cfg.asrProvider != id else { return }
         if id == "duoyun", cfg.duoyunApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             feedback("⚠️ 需先配置豆包 API Key（设置 ▸ 语音 ▸ 豆包语音设置…）")
+            return
+        }
+        if id == "mimo", cfg.mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            feedback("⚠️ 需先配置 MiMo API Key（见 指南：DeskPet/MiMo音色指南.md）")
             return
         }
         cfg.asrProvider = id
@@ -2175,9 +2295,13 @@ extension AppDelegate: PetViewDelegate {
             feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
             return
         }
-        if id == "duoyun" {
+        switch id {
+        case "duoyun":
             feedback("✅ 听写识别已切换：豆包（流式）——持续聆听会消耗时长额度")
-        } else {
+        case "mimo":
+            // MiMo 整段语义：说完停 2 秒才上传，结果比豆包多等 1-3 秒
+            feedback("✅ 听写识别已切换：MiMo（云端整段）")
+        default:
             feedback("✅ 听写识别已切换：本地")
         }
     }
@@ -2192,6 +2316,7 @@ extension AppDelegate: PetViewDelegate {
         selectSystemVoice(identifier)
     }
     func petViewRequestedDuoyunSettings(_ view: PetView) { duoyunSettings() }
+    func petViewRequestedMiMoSettings(_ view: PetView) { mimoSettings() }
     func petViewRequestedEdgeVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)] {
         edgeVoiceMenuList()
     }
