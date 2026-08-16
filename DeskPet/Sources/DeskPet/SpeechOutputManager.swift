@@ -69,11 +69,12 @@ extension SystemSpeechProvider: AVSpeechSynthesizerDelegate {
 }
 
 /// 播报管理器：provider 链 + 流式分句（按句边界切分，逐句播报，可打断）。
-/// P1-4：优先级队列——high（用户对话/主回复）立即打断；low（任务完成/进度）入队，
+/// P1-4：优先级队列——high（用户对话/主回复）立即打断；low（任务完成）入队，
 /// 当前播报结束（provider 完成回调，禁轮询）后才播。
-/// P3-1（队列语义修订，pm 前瞻走查）：stop/打断**不再清空**低优队列——
-/// 说话打断只停当前播报，任务结果语音保留排队（2s 后空闲自动推进）；
-/// 新 high 播报仍清队列（新内容优先）。
+/// 播报策略（2026-08-16 用户决策「最新优先」）：stop/打断**清空**低优队列——
+/// 用户开口或任何新 high 播报即代表最新意图，旧任务播报不再回头续播（细节看气泡/历史）；
+/// 轻确认「收到」（clearsQueue=false）仍不打断不吞队列。
+/// 原 P3-1「stop 保留队列 2s 后续播」语义废弃——实测旧内容回头续播造成话题穿插、听感混乱。
 final class SpeechOutputManager {
     enum Priority { case high, low }
 
@@ -153,15 +154,18 @@ final class SpeechOutputManager {
         }
         if chain.isEmpty { chain = [systemProvider] }   // 兜底：系统语音
         providerChain = chain
-        // 低优队列推进：provider 完成回调（S-P1-2 协议化，主线程）
+        // 低优队列推进：provider 完成回调（S-P1-2 协议化）——NSSound delegate 线程无主线程
+        // 保证，统一收口主线程再动队列（避免后台回调与 speak/stop 并发改 lowQueue）
         for p in providerChain {
             p.onPlaybackFinished = { [weak self] in
-                // R-2026-08-13：高优多句逐句推进（当前句播完 → 合成下一句）
-                self?.advanceHigh()
-                self?.advanceLowQueue()
-                // P0-2：自然播完（且无后续条目接管）→ 通知播报结束（持续聆听恢复采集）
-                if let self, !self.isSpeaking {
-                    self.notifySpeaking(false)
+                DispatchQueue.main.async {
+                    // R-2026-08-13：高优多句逐句推进（当前句播完 → 合成下一句）
+                    self?.advanceHigh()
+                    self?.advanceLowQueue()
+                    // P0-2：自然播完（且无后续条目接管）→ 通知播报结束（持续聆听恢复采集）
+                    if let self, !self.isSpeaking {
+                        self.notifySpeaking(false)
+                    }
                 }
             }
         }
@@ -194,7 +198,7 @@ final class SpeechOutputManager {
             return
         }
         // high：打断当前播报；清低优队列仅当 clearsQueue（新内容优先）
-        stop()
+        stopPlayback()
         if clearsQueue { lowQueue.removeAll() }
         // R-2026-08-13：逐句串行——只提交第一句，其余句入 pendingHigh 播完推进
         // （多句并发合成 → 完成顺序乱 → 播放交叉，实测）。
@@ -266,36 +270,44 @@ final class SpeechOutputManager {
         advanceLowQueue()
     }
 
-    /// 停止当前播报（打断）。P3-1：**不清空低优队列**——说话打断只停当前，
-    /// 任务结果语音保留排队（用户决策「任务完成不卡断对话」+「说话打断」冲突的解法：
-    /// 打断停当前，等用户说完/空闲后由延迟推进继续播）。
-    /// 新 high 播报的清队语义在 speak(.high) 内显式执行（新内容优先）。
-    func stop() {
+    /// 停止当前播报（内部原语）：停 activeProvider + 作废未播高优句；**不动低优队列**。
+    /// speak(.high) 打断路径与「收到」确认（clearsQueue=false）共用。
+    private func stopPlayback() {
         pendingHigh = []   // R-2026-08-13：打断清高优多句剩余（未播句作废）
         activeProvider?.stop()
         activeProvider = nil
-        // P0-2：停止 = 播报结束（持续聆听恢复采集；去重——无播报时 stop 不误报）
         notifySpeaking(false)
-        // P3-1：stop 后 provider 无完成回调（打断不触发 didFinish）——延迟推进恢复低优队列；
-        // advanceLowQueue 幂等（空队列/在播/静音守卫），多次 stop 的延迟任务无副作用
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.advanceLowQueue()
-        }
+    }
+
+    /// 停止当前播报并**清空低优队列**（用户开口/外部打断——最新优先）。
+    /// 2026-08-16 语义修订：用户开口即代表关注新内容，旧任务播报排队条目全部丢弃，
+    /// 不再 2s 后回头续播（原 P3-1 保留语义实测造成话题穿插）；细节看气泡/历史。
+    func stop() {
+        stopPlayback()
+        lowQueue.removeAll()
     }
 
     /// B-2：降级统一走链上 systemProvider 实例（Edge/Duoyun 合成失败时调用）——
     /// 可被 stop() 控制（打断/静音/新播报），不与链上 system 双声重叠。
+    /// 线程收口：provider 失败路径可能在后台网络上下文调用——统一派发主线程再动共享状态。
     static func fallbackSpeak(_ text: String, from provider: String = "system", reason: String? = nil) {
-        guard !text.isEmpty else { return }
-        shared.systemProvider.speak(text)
-        shared.activeProvider = shared.systemProvider
-        shared.notifySpeaking(true)   // P0-2：降级播报同样通知（回声防护）
-        // 降级可见化：5 分钟冷却防刷屏（同一 provider 连续失败只提示一次）
-        guard provider != "system" else { return }
-        if Date().timeIntervalSince(shared.lastFallbackNoticeAt) > 300 {
-            shared.lastFallbackNoticeAt = Date()
-            let msg = reason.map { "\(provider)不可用（\($0)），已改用系统语音" } ?? "\(provider)不可用，已改用系统语音"
-            shared.onFallbackNotice?(msg)
+        let work: () -> Void = {
+            guard !text.isEmpty else { return }
+            shared.systemProvider.speak(text)
+            shared.activeProvider = shared.systemProvider
+            shared.notifySpeaking(true)   // P0-2：降级播报同样通知（回声防护）
+            // 降级可见化：5 分钟冷却防刷屏（同一 provider 连续失败只提示一次）
+            guard provider != "system" else { return }
+            if Date().timeIntervalSince(shared.lastFallbackNoticeAt) > 300 {
+                shared.lastFallbackNoticeAt = Date()
+                let msg = reason.map { "\(provider)不可用（\($0)），已改用系统语音" } ?? "\(provider)不可用，已改用系统语音"
+                shared.onFallbackNotice?(msg)
+            }
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
         }
     }
 

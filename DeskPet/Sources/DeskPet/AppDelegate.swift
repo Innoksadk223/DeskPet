@@ -522,15 +522,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     return
                 }
-                // 进度消息：低优入队，念 spoken（<30 字兜底 formal 清洗后）+ 任务实例 tag 抢占
+                // 进度消息（2026-08-16 播报策略「最新优先」）：只出气泡不出声——
+                // 过程性内容时效短、价值低，出声会在任务期间不断插进对话造成话题穿插；
+                // 文字仍可见（自动消失），最终结果仍由 isFinal 分支语音播报。
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
-                let speakText: String
+                let progressText: String
                 if cleanedSpoken.count >= 30 || msg.formal.isEmpty {
-                    speakText = cleanedSpoken
+                    progressText = cleanedSpoken
                 } else {
-                    speakText = SpeechOutputManager.cleanForSpeech(msg.formal)
+                    progressText = SpeechOutputManager.cleanForSpeech(msg.formal)
                 }
-                SpeechOutputManager.shared.speak(speakText, priority: .low, tag: msg.speechTag)
+                if !progressText.isEmpty {
+                    self?.showBubble("⏳ \(progressText)")
+                }
             }
         }
         bridge.onTaskComplete = { [weak self] title in
@@ -1542,7 +1546,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let summary = bridge.taskStatusSummary()
             showBubble(summary)
-            SpeechOutputManager.shared.speak(summary, priority: .low)
+            // 2026-08-16：状态查询是用户当下直接问的——按 high 播（最新优先，可打断旧播报），
+            // 不再 low 排队（排队期间用户已在等答案，反而被旧内容抢先）
+            SpeechOutputManager.shared.speak(summary)
         case .newChat:
             startNewConversation()
         case .history:
