@@ -96,9 +96,10 @@ final class BubblePanel: NSPanel {
         fullText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         isExpanded = false
         render()
-        // 三档限时（用户最终需求）：非 persistent 统一 2s；persistent 用传入 maxDuration；
-        // nil 兑底 5s（错误/会话期长留提示也限时）
-        activeMaxDuration = persistent ? (maxDuration ?? 5) : 2
+        // 三档限时（fix-live-ux-details）：非 persistent 按可见字符数动态延长（2s 基础 + 每 40 字 +1s，
+        // 上限 12s——短回复≈现状不拖沓，长回复可读）；persistent 用传入 maxDuration（nil 兑底 5s，
+        // 任务详情/过渡气泡语义不变）
+        activeMaxDuration = Self.autoHideDuration(visibleChars: fullText.count, persistent: persistent, maxDuration: maxDuration)
         scheduleAutoHide()
 
         setFrame(anchoredFrame(petFrame: petFrame, screen: screen), display: true)
@@ -163,6 +164,17 @@ final class BubblePanel: NSPanel {
         return NSRect(origin: origin, size: NSSize(width: w, height: h))
     }
 
+    /// fix-live-ux-details：气泡自动隐藏时长（纯函数，可离线单测）。
+    /// - persistent：用传入 maxDuration（nil 兑底 5s）——任务详情等不受影响
+    /// - 非 persistent：2s 基础 + 每 40 可见字符 +1s，上限 12s（短回复≈现状，长回复可读）
+    static func autoHideDuration(visibleChars: Int, persistent: Bool, maxDuration: TimeInterval?) -> TimeInterval {
+        if persistent { return maxDuration ?? 5 }
+        let base: TimeInterval = 2
+        let perChar: TimeInterval = 40
+        let cap: TimeInterval = 12
+        return min(base + TimeInterval(max(0, visibleChars)) / perChar, cap)
+    }
+
     /// 当前气泡的自动隐藏时长（nil=长留）；交互重置计时（toggleExpand）复用。
     private var activeMaxDuration: TimeInterval?
 
@@ -176,8 +188,12 @@ final class BubblePanel: NSPanel {
         hideTimer?.cancel()
         // 展开态至少 5s 阅读时间；收起后按原档（2s/4s/5s）重新计时
         let seconds = isExpanded ? max(activeMaxDuration ?? 5, 5) : (activeMaxDuration ?? 5)
-        let item = DispatchWorkItem { [weak self] in
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            // T4（fix-audio-task-state）：身份守卫——仅本展示对应的定时器可结束本展示；
+            // 旧定时器（取消竞态/迟到触发）不得清掉后来显示的新气泡
+            guard self.hideTimer === item else { return }
             // T3：自动隐藏必须清 currentText——否则 endWakeFeedback 的 E-3 分支
             // 误判"听写期间有新气泡"，preWakeBubble 恢复丢失
             self.currentText = nil

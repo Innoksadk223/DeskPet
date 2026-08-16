@@ -26,6 +26,9 @@ enum RouterSelfTest {
             case .deleteHistory: actual = "deleteHistory"
             case .mute: actual = "mute"
             case .interrupt: actual = "interrupt"
+            case .interruptMain: actual = "interruptMain"
+            case .interruptAll: actual = "interruptAll"
+            case .taskStatus: actual = "taskStatus"
             case .newChat: actual = "newChat"
             case .history: actual = "history"
             case .help: actual = "help"
@@ -41,12 +44,29 @@ enum RouterSelfTest {
         check("跟任务说：改成红色", "steerTask:改成红色")
         check("打断任务", "interrupt")
         check("停止任务", "interrupt")
+        // v3：任务状态本地直答
+        check("还在工作吗", "taskStatus")
+        check("在工作吗", "taskStatus")
+        check("任务状态", "taskStatus")
+        check("任务进度", "taskStatus")
+        check("任务做完了吗", "taskStatus")
+        check("你工作累不累", "chat")   // 不误伤闲聊（不含触发子串）
         // #36-1：自然用语补充（用户实测「中断任务」未命中缺口）
         check("中断任务", "interrupt")
         check("取消任务", "interrupt")
         check("停一下", "interrupt")
         check("停下来", "interrupt")
         check("打断一下", "interrupt")   // prefix「打断」命中（语音场景，无需改）
+        // v10（split-interrupt-commands）：三分控制——停止回答（main-only）/ 全部停止（主+任务）
+        check("停止回答", "interruptMain")
+        check("停止回答，谢谢", "interruptMain")   // 前缀 + 尾部任意
+        check("停止回答我", "interruptMain")       // 明确触发词开头即命中（前缀语义）
+        check("全部停止", "interruptAll")
+        check("全部停止！", "interruptAll")
+        // 误伤反例：非前缀否定句/闲聊不得命中（prefix 语义，非宽泛 contains）
+        check("请不要停止回答", "chat:请不要停止回答")
+        check("别全部停止", "chat:别全部停止")
+        check("别停止回答我的问题", "chat:别停止回答我的问题")
         check("新开对话", "newChat")
         check("聊天记录", "history")
         check("查询记录", "history")
@@ -82,6 +102,12 @@ enum RouterSelfTest {
         check("帮我查一下我的心情", "chat:帮我查一下我的心情")   // 「帮我查」规则 rest 剥「一下」后命中排除
         check("帮我找一下对象", "chat:帮我找一下对象")
         check("查一下天气", "dispatch:天气")   // 天气是真任务——不排除
+        // v4 安全加速：regex 高置信直派——完整原文直传任务 Agent（不剥前缀）
+        check("帮我运行命令", "dispatch:帮我运行命令")          // 运行类直派，全量原文保留
+        check("请帮我运行pip install", "dispatch:请帮我运行pip install")   // 请+运行+英文参数，原文直传
+        check("请帮我修改代码", "dispatch:请帮我修改代码")        // 修改+代码类直派，全量原文保留
+        check("帮我修改一下代码", "dispatch:帮我修改一下代码")    // 带语气词「一下」仍命中
+        check("帮我整理一下思路", "chat:帮我整理一下思路")        // 无工具对象名词锚定 → 不误派，仍走 chat
 
         print("[router] 通过 \(passed)/\(passed + failed)")
         return failed == 0 ? 0 : 1

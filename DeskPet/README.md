@@ -112,6 +112,16 @@ HERMES_DASHBOARD_SESSION_TOKEN=<token> .build/debug/DeskPet --self-test-bridge  
 - serve 侧模型调用：`~/.hermes/logs/agent.log`（含 response_len/tool 调用）
 - 排查主回复为空：①[EVT] 是否收到 delta/complete ②agent.log 模型是否输出 ③「主回复兜底」日志
 
+## 发布限制（0.5.0，final-evidence 记录）
+
+- **双安装位置**：当前环境中 `/Applications/DeskPet.app` 为外部既有安装（13:28 构建，1999760B，md5 01034bcc…，含 v7 唤醒热生效）；工作区产物 `DeskPet/DeskPet.app` 为 14:33 最新构建（2037872B，含 v8 ASR 分段修复）——两者非同一构建；如需最新版本请以工作区产物为准，或重新安装 /Applications 副本。
+- **语音分段参数（v8）**：分句阈值 1s（静音 1s 标记分句不提交，常量 boundarySeconds）；提交阈值默认 2.0s（config `listenSilenceTimeout`，可调，clamp 1.0...5.0）；停顿 1~2s 内续说两段合并为一条完整任务；豆包/服务器模式/on-device 三 ASR 途径统一走同一分段状态机。
+- **本地运行期配置提示**：`history/config/deskpet-config.json`（gitignored，非交付物）当前含非空 duoyunApiKey（46 字符，本地运行环境数据）——交付物（跟踪的 `config/` 与 .app bundle 内配置）均已剥离为空；若该本地键非本人有意配置，建议清理。
+
+- **自签名未公证**：DeskPet.app 为本地开发者自签名（codesign 通过，TeamIdentifier 未设置），未经 Apple 公证——首次启动需用户右键“打开”或系统设置放行（Gatekeeper 拦截属预期）。
+- **arm64-only**：产物为 arm64 Mach-O（Apple Silicon 专用）；Intel Mac 不支持。
+- **Finder 卸载残留**：卸载/删除 DeskPet.app 不会清理用户目录下的 `~/.deskpet`（桌宠专属 Hermes profile 真实目录）与 `~/.hermes/profiles/deskpet-app`（接入符号链接）——如需彻底卸载请手动移除这两处。
+
 ## 状态与已知问题（2026-08-13）
 
 - 版本 0.3.0；形象 8 个；人设 3 条；唤醒词「猫猫」阈值 0.15；ASR 豆包流式；豆包声线 Vivi（seed-tts-2.0）

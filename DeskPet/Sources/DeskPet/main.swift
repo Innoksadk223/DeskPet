@@ -18,6 +18,18 @@ if args.contains("--self-test-vad") {
 if args.contains("--self-test-markers") {
     exit(HermesBridgeSelfTest.runMarkersSelfTest())
 }
+if args.contains("--self-test-history-storage") {
+    // v5 历史存储隔离回归：纯离线（临时目录 + ObjC runtime 注入 HOME）——不连 serve、不触碰用户 home
+    exit(HistoryStorageSelfTest.run())
+}
+if args.contains("--self-test-wake") {
+    // v7 唤醒词热生效回归：纯离线（决策纯函数 + 状态机 guard）——不触碰真实音频设备/模型
+    exit(WakeControllerSelfTest.run())
+}
+if args.contains("--self-test-asr-seg") {
+    // v8 ASR 分段合并回归：纯离线（SpeechSegmenter 纯值类型事件驱动）——不触碰音频设备/模型/网络
+    exit(SpeechSelfTest.runSegmentationSelfTest())
+}
 if args.contains("--self-test-hermes") || args.contains("--self-test-bridge") || args.contains("--self-test-router") || args.contains("--self-test-tts") || args.contains("--self-test-speech") || args.contains("--self-test-duoyun") || args.contains("--self-test-transcript") || args.contains("--self-test-edge") {
     if args.contains("--self-test-duoyun") {
         exit(DuoyunSpeechProvider.runSelfTest())
@@ -53,6 +65,8 @@ let app = NSApplication.shared
 // runningApplications(withBundleIdentifier:) 查询恒空集，2026-08-13 optimizer 实测推断）。
 // 路径可移植化（F3）：项目内 history/data/deskpet.lock（随项目走；数据/临时文件，可清理）；
 // .app 分发定位失败回退 AS。
+// v6（M4 fresh-install 加固）：单实例锁是硬门槛——无法确认独占锁（另一实例在运行，或
+// 锁文件/目录不可用）必须阻止继续初始化（退出），绝不静默降级为多实例双写会话索引/状态。
 private let lockDirURL = ProjectPaths.projectDataDir()
     ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/DeskPet", isDirectory: true)
 private let instanceLockPath = lockDirURL.appendingPathComponent("deskpet.lock").path
@@ -60,14 +74,13 @@ do {
     try FileManager.default.createDirectory(atPath: (instanceLockPath as NSString).deletingLastPathComponent,
                                             withIntermediateDirectories: true)
     let fd = open(instanceLockPath, O_CREAT | O_RDWR, 0o644)
-    if fd >= 0 {
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            LogManager.shared.info("已有桌宠实例在运行，退出")
-            exit(0)
-        }
+    guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        LogManager.shared.error("单实例锁获取失败（另一桌宠实例在运行，或锁文件不可用）——退出，避免双写")
+        exit(1)
     }
 } catch {
-    LogManager.shared.warn("单实例锁初始化失败：\(error)")
+    LogManager.shared.error("单实例锁初始化失败：\(error)——退出，避免双写")
+    exit(1)
 }
 let delegate = AppDelegate()
 app.delegate = delegate

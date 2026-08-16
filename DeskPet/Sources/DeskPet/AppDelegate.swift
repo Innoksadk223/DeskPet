@@ -40,6 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let connectFailureText = "⚠️ 连不上助手服务——设置菜单「系统▸重新连接助手服务」可重试"
     /// C1：过渡气泡超时（persistent 过渡型气泡最长显示——被新气泡替换则提前结束；防卡死）
     private static let transitionBubbleTimeout: TimeInterval = 4
+    /// fix-live-ux-details：任务启动等待气泡最长显示（8s 无首个活动才显示；60s 内被
+    /// 首个活动/结果/失败/⏹ 反馈气泡替换则提前结束；服务端中断 drain 约 60s 的边界）
+    private static let taskStartPendingBubbleTimeout: TimeInterval = 60
     // E-M3-1：唤醒命中可视反馈（气泡「在听，请说~」+ 聆听状态）标记
     private var wakeDictationActive = false
     private var preWakeState: PetState = .idle
@@ -226,9 +229,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupWakeWord(bridge)
             } catch {
                 LogManager.shared.error("Hermes 桥接初始化失败：\(error)")
-                // P1-02：失败可见化（不再静默）；右键菜单/菜单栏可重试
-                // U5：文案指向真实入口（设置▸系统▸重新连接助手服务），不再误导"点『重新连接』"
-                feedback(Self.connectFailureText)
+                // v6（M1）：Profile/后端能力错误给可行动中文反馈；其余走通用连接失败文案
+                if let pe = error as? DeskPetHermesProfile.ProfileError {
+                    switch pe {
+                    case .conflict(let msg):
+                        // P1-02：失败可见化（不再静默）；U5：文案指向真实入口（设置▸系统▸重新连接助手服务）
+                        feedback("⚠️ 桌宠专属配置冲突：\(msg)\n请先备份并移除 ~/.hermes/profiles/deskpet-app 后重试（设置▸系统▸重新连接助手服务）")
+                    case .directory(let msg):
+                        feedback("⚠️ 桌宠数据目录不可用：\(msg)\n请检查 ~/.deskpet 与 ~/.hermes 的读写权限后重试（设置▸系统▸重新连接助手服务）")
+                    case .backendIncompatible(let msg):
+                        feedback("⚠️ \(msg)\n请升级 hermes-agent 后重试（设置▸系统▸重新连接助手服务）")
+                    }
+                } else {
+                    // U5：文案指向真实入口（设置▸系统▸重新连接助手服务），不再误导"点『重新连接』"
+                    feedback(Self.connectFailureText)
+                }
             }
         }
     }
@@ -398,26 +413,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanedFormal = msg.formal.trimmingCharacters(in: .whitespacesAndNewlines)
                 if cleanedSpoken.isEmpty && cleanedFormal.isEmpty {
-                    LogManager.shared.warn("主回复为空（formal/spoken 均空，isUserTurn=\(msg.isUserTurn), protocolOnly=\(msg.protocolOnly)）——跳过气泡与播报")
-                    if msg.protocolOnly {
-                        self.showBubble("⏳ 正在处理，请稍等…", maxDuration: Self.transitionBubbleTimeout)
-                    } else if msg.isUserTurn {
-                        self.showBubble("刚才那句我没接住，再说一遍？")
+                    if !msg.isUserTurn {
+                        // v3：归档 <ok/> 纯确认（正常路径，非异常）——info 级日志，不弹「没接住」
+                        LogManager.shared.info("归档 ack 已静默（主 Agent 确认存档）")
+                    } else {
+                        LogManager.shared.warn("主回复为空（formal/spoken 均空，protocolOnly=\(msg.protocolOnly)）——跳过气泡与播报")
+                        if msg.protocolOnly {
+                            self.showBubble("⏳ 正在处理，请稍等…", maxDuration: Self.transitionBubbleTimeout)
+                        } else {
+                            self.showBubble("刚才那句我没接住，再说一遍？")
+                        }
                     }
                     return
                 }
+                if !msg.isUserTurn {
+                    // v3：归档轮违反协议多说的话（如「好的已存」）——仅日志，不弹气泡不播报：
+                    // 任务结果详情气泡刚显示，被 ack 废话覆盖是净损失；播报已由任务 spoken 直报完成。
+                    LogManager.shared.info("归档轮多余回复（已忽略，不覆盖任务详情气泡）：\(String((cleanedFormal.isEmpty ? cleanedSpoken : cleanedFormal).prefix(60)))")
+                    return
+                }
                 self.showBubble(cleanedFormal.isEmpty ? msg.spoken : msg.formal)
-                // R-2026-08-13：只念 spoken（口语轨）——formal 仅气泡展示，绝不生成语音；
-                // spoken 空则不播报（气泡仍显示 formal）。此前 spoken<30 字兜底念 formal 已移除。
+                // R-2026-08-13：只念 spoken（口语轨）——formal 仅气泡展示，绝不生成语音。
                 let finalSpeak = cleanedSpoken.count > 200
                     ? String(cleanedSpoken.prefix(200)) + "，更多内容请看气泡"
                     : cleanedSpoken
-                if msg.isUserTurn {
-                    SpeechOutputManager.shared.speak(finalSpeak)
-                } else {
-                    // 播报抢占：非用户轮（回填/状态报告）带任务 tag——新任务派发后旧任务报告按 tag 舍弃
-                    SpeechOutputManager.shared.speak(finalSpeak, priority: .low, tag: msg.taskTag)
-                }
+                SpeechOutputManager.shared.speak(finalSpeak)
             }
         }
         // P1：聊天入队提示（busy 不静默）
@@ -455,26 +475,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SpeechOutputManager.shared.speak(spoken, priority: .low, tag: tag)
             }
         }
-        bridge.onTaskQueued = { [weak self] title, position in
-            LogManager.shared.info("任务排队：第 \(position) 个：\(title)")
+        bridge.onTaskQueued = { [weak self] title, position, starting in
+            LogManager.shared.info("任务排队：第 \(position) 个：\(title)（前置\(HermesBridge.queuedBehindText(starting: starting))）")
             DispatchQueue.main.async {
-                self?.showBubble("⏳ 当前任务还在执行，已排队第 \(position) 项：\(title)", persistent: true)
+                // fix-ghost-task-queue：前置是启动中任务时如实说明「正在启动」，不误报「正在执行」
+                self?.showBubble("⏳ \(HermesBridge.queuedBehindText(starting: starting))，已排队第 \(position) 项：\(title)", persistent: true)
+            }
+        }
+        // fix-live-ux-details：任务启动等待反馈（提交后 8s 无首个 delta/tool 活动才显示一次；
+        // 首个活动/收口回调 nil 时仅收起仍是等待文案的气泡——身份守卫，不覆盖最终结果/新气泡）
+        bridge.onTaskStartPending = { [weak self] title in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let title {
+                    LogManager.shared.info("任务等待反馈：\(title)（8s 无首个活动，可能仍在完成中断收尾）")
+                    self.showBubble("⏳ 任务已提交：\(title)\n模型可能仍在完成上一任务的中断收尾，开始输出后自动消失",
+                                    persistent: true, maxDuration: Self.taskStartPendingBubbleTimeout)
+                } else {
+                    // 仅收起仍是等待文案的气泡（不覆盖任务最终结果/失败/⏹ 反馈/新任务气泡）
+                    if self.bubblePanel?.currentText?.hasPrefix("⏳ 任务已提交") == true {
+                        self.bubblePanel?.hideBubble()
+                    }
+                }
             }
         }
         bridge.onTaskMessage = { [weak self] msg in
             LogManager.shared.info("任务消息 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isFinal=\(msg.isFinal)")
             DispatchQueue.main.async {
                 if msg.isFinal {
-                    // pm3 P1-1：详情气泡 persistent——不被「✅ 完成」覆盖（轻提示仅播报不弹气泡）
+                    // 详情气泡 persistent——结果全文可展开阅读
                     self?.showBubble(msg.formal.isEmpty ? msg.spoken : msg.formal, persistent: true)
-                    // 标记协议（主 Agent 掌控任务 Agent）：详细结果由主 Agent 口语化报告——
-                    // isFinal 只播轻提示防双播（完整总结已在气泡；回填后主 Agent 会完整转述）
-                    SpeechOutputManager.shared.speak("任务完成", priority: .low, tag: msg.speechTag)
+                    // v3 直报：播任务 spoken（任务 Agent 亲自浓缩的 formal 精简版——零二次失真、
+                    // 零回填等待）；spoken 为空兜底 formal（清洗后）；超 150 字（约 35s）截断护栏。
+                    let cleaned = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let base: String
+                    if cleaned.count >= 30 || msg.formal.isEmpty {
+                        base = cleaned
+                    } else {
+                        base = SpeechOutputManager.cleanForSpeech(msg.formal)
+                    }
+                    let speakText = base.count > 150
+                        ? String(base.prefix(150)) + "，更多内容请看气泡"
+                        : base
+                    if !speakText.isEmpty {
+                        SpeechOutputManager.shared.speak(speakText, priority: .low, tag: msg.speechTag)
+                    }
                     return
                 }
-                // P1-4：任务消息播报低优入队；用户决策「口语完整版」——念 spoken 完整转述，
-                // spoken 过短（<30 字）兜底 formal 正文（清洗后）
-                // P4-1：带任务实例 tag（新任务派发后旧任务完成播报被跳过）
+                // 进度消息：低优入队，念 spoken（<30 字兜底 formal 清洗后）+ 任务实例 tag 抢占
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
                 let speakText: String
                 if cleanedSpoken.count >= 30 || msg.formal.isEmpty {
@@ -487,29 +535,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         bridge.onTaskComplete = { [weak self] title in
             LogManager.shared.info("任务完成：\(title)")
-            // pm3 P1-1：轻提示仅播报（isFinal 已播）——不再弹「✅ title 完成」气泡覆盖详情
-            // （详情气泡 persistent 保留；「任务完成」轻提示播报在 isFinal 已入队）
             DispatchQueue.main.async {
                 // R3-1：任务完成 → 执行延迟的 serve 重启（若任务运行中曾触发）
                 ServeManager.shared.flushPendingRestart()
-            }
-        }
-        // pm3 P1-3/P1-4：回填过渡气泡 + 写回失败提示（⚠️ 前缀同时播报）
-        // U2：过渡气泡（⏳）不覆盖任务结果详情——详情气泡长留，主 Agent 口语化报告到达时自然替换
-        bridge.onBackfillNotice = { [weak self] message in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if message.hasPrefix("⏳") {
-                    if let current = self.bubblePanel?.currentText, !current.isEmpty,
-                       !current.hasPrefix("⏳"), !current.hasPrefix("📝"), !current.hasPrefix("📋") {
-                        LogManager.shared.info("当前气泡为内容详情（\(current.prefix(20))…）——跳过整理占位气泡")
-                        return
-                    }
-                }
-                self.showBubble(message, persistent: true, maxDuration: message.hasPrefix("⏳") ? Self.transitionBubbleTimeout : nil)
-                if message.hasPrefix("⚠️") {
-                    SpeechOutputManager.shared.speak(message)
-                }
             }
         }
         // P0-01：任务失败 → ❌ 气泡（带原因摘要）+ 播报 + 回 idle（不卡 failed 态）
@@ -838,12 +866,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
             return
         }
-        // 热生效：更新检测器关键词；监听中重启检测器使新词生效（重新武装）
+        // v7（wake-reload-fix 根因对照）：旧实现仅 listening 时 stop+start——arming 时
+        // start() guard 挡住不生效、disabled（检测器失效）不恢复监听、detected（听写中）
+        // 新词要等 resume 但 resume 不重启子进程（旧词残留）。修复：决策提取为纯函数
+        // wakeReloadAction——listening/arming/disabled 立即 stop+start（stop 幂等，
+        // disabled 也能从失效恢复）；detected 标记延后，resume 后防抖回调内重启（不打断听写）。
         if let wake = wakeController {
             wake.wakePhrase = phrase
-            if wake.currentState == .listening {
-                wake.stop()
+            switch WakeController.wakeReloadAction(for: wake.currentState) {
+            case .reloadNow:
+                wake.stop()   // 幂等：disabled 也安全（从失效恢复监听）
                 wake.start()
+                LogManager.shared.info("唤醒词已更新并重启检测器：\(phrase)")
+            case .reloadAfterResume:
+                wake.pendingReload = true
+                LogManager.shared.info("唤醒词已更新（听写中，resume 后生效）：\(phrase)")
             }
         }
         LogManager.shared.info("唤醒词已更新：\(phrase)")
@@ -884,9 +921,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         feedback("✅ 退出词已更新：\(phrases.joined(separator: " / "))")
     }
 
-    /// 切换人设：写 petID（personas 内容在 config/personas.json，手动编辑）。
-    /// ① 人设热切换：人设提示词每条用户消息前缀注入（HermesBridge.personaPrefixed 按 petID
-    /// 实时读取）——保存后下一条对话立即生效，无需新开对话。
+    /// 切换人设（v3：人设已进 seed——切人设时向当前主会话提交一次变更消息，
+    /// 主 Agent 按新人设打招呼确认（正常用户轮：显示+播报）；新开对话则按新 petID 重建 seed）。
     private func setPersona(_ petID: String) {
         var cfg = DeskPetConfig.load()
         guard cfg.petID != petID else { return }
@@ -897,7 +933,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let name = DeskPetConfig.personaDisplayName(for: petID)
         LogManager.shared.info("人设已切换：\(petID)")
-        feedback("✅ 已切换人设：\(name)——下一条对话即生效")
+        feedback("✅ 已切换人设：\(name)")
+        Task { [weak self] in
+            await self?.bridge?.applyPersonaChange(petID)
+        }
     }
 
     /// 打开 personas.json（默认编辑器；history/config/ 持久化副本——打包副本不覆盖用户编辑）。
@@ -1470,22 +1509,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 showBubble(Self.connectFailureText)   // U5：真实入口路径文案
                 return
             }
+            // v4 安全加速：派发提交前立即显示「已接收 + 标题」——冷启动建任务会话（网络往返）
+            // 期间也有可视反馈；onTaskStarted 到达时替换为同内容气泡（幂等），失败路径由 ⚠️/❌ 替换。
+            // （U9 标题保留完整动词短语原文；语音仍由 onTaskStarted 播「好嘞，开始执行！」——不重复播报）
+            showBubble("📋 \(title)", persistent: true)
             Task {
-                do {
-                    try await bridge.dispatchTask(task, title: title)   // U9：标题保留完整动词短语（原文）
-                    // P2-④：派发后等待气泡（任务开始事件自动替换；语音「📝 收到」不重复弹）
-                    // U4：任务标题（📋）已显示则不弹占位气泡——不被瞬间覆盖
-                    await MainActor.run {
-                        let current = self.bubblePanel?.currentText ?? ""
-                        if !current.hasPrefix("📝"), !current.hasPrefix("📋") {
-                            self.showBubble("⏳ 正在派出任务…", persistent: true, maxDuration: Self.transitionBubbleTimeout)   // 过渡型：4s 超时
-                        }
-                    }
-                } catch {
-                    // U1：任务派发失败可见化（不再 try? 静默吞——用户命令不石沉大海）
-                    LogManager.shared.warn("任务派发失败：\(error.localizedDescription)")
-                    self.feedback("⚠️ 任务派发失败：\(error.localizedDescription)")
-                }
+                // v9（fix-audio-task-state）：派发不再抛错——失败已由 bridge 统一 onTaskFailed 可见收口
+                // （主会话未就绪/队列满/启动异常均不静默，杜绝「任务已接收却无下文」）
+                await bridge.dispatchTask(task, title: title)   // U9：标题保留完整动词短语（原文）
             }
         case .steerTask(let instruction):
             guard let bridge else { return }
@@ -1499,6 +1530,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .interrupt:
             interruptCurrentTask()
+        case .interruptMain:
+            stopMainAnswer()
+        case .interruptAll:
+            stopAllAgents()
+        case .taskStatus:
+            // v3：状态查询本地直答（零延迟零失真——不再绕主 Agent 写回转述）
+            guard let bridge else {
+                showBubble(Self.connectFailureText)   // 与其他路由一致：未就绪不静默
+                return
+            }
+            let summary = bridge.taskStatusSummary()
+            showBubble(summary)
+            SpeechOutputManager.shared.speak(summary, priority: .low)
         case .newChat:
             startNewConversation()
         case .history:
@@ -1568,22 +1612,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// #22 中断任务（语音命令/右键菜单共用——与 CommandRouter 打断命令同路径）。
     /// F3：无运行中任务时如实提示（不做假成功）；F4：打断成功明确告知不会再有结果。
+    /// fix-ghost-task-queue：本地收口始终完成；远端 RPC 失败时如实区分「已本地停止但远端未确认」。
     @objc func interruptCurrentTask() {
         guard let bridge else { return }
         Task {
+            let outcome = await bridge.interruptTask()
+            switch outcome {
+            case .stopped:
+                feedback("⏹ 任务已停止，不会再有结果了")
+            case .stoppedUnconfirmed:
+                // 本地已收口（新任务不再被旧任务阻塞）；远端未确认如实提示。
+                // fix-live-ux-details：逗号连接保证单句播报（分号会触发多句高优串播）
+                feedback("⏹ 任务已本地停止（远端停止未确认，可能短暂恢复），排队任务已清空")
+            case .cancelledDuringStart:
+                feedback("⏹ 任务已取消（尚未开始执行），排队任务已清空")
+            case .inactive:
+                feedback("当前没有正在运行的任务")
+            }
+            // F3：打断后立即刷新菜单栏「中断任务」可用态（任务已结束 → 置灰）
+            statusItemController?.updateState(currentState)
+        }
+    }
+
+    /// v10（split-interrupt-commands）：停止回答——只停主 Agent 当前回复，任务侧不动。
+    /// 主侧不在回复时如实反馈（不伪报成功）；网络失败明确报错。
+    private func stopMainAnswer() {
+        guard let bridge else {
+            showBubble(Self.connectFailureText)   // 未就绪不静默
+            return
+        }
+        Task {
             do {
-                let interrupted = try await bridge.interruptTask()
-                if interrupted {
-                    feedback("⏹ 任务已停止，不会再有结果了")
-                } else {
-                    feedback("当前没有正在运行的任务")
+                let stopped = try await bridge.interruptMainAnswer()
+                await MainActor.run {
+                    if stopped {
+                        self.feedback("🛑 已停止回答")
+                    } else {
+                        self.feedback("主 Agent 当前没有在回答")
+                    }
                 }
-                // F3：打断后立即刷新菜单栏「中断任务」可用态（任务已结束 → 置灰）
-                statusItemController?.updateState(currentState)
             } catch {
-                feedback("⚠️ 打断失败：\(error.localizedDescription)")
+                LogManager.shared.warn("停止回答失败：\(error.localizedDescription)")
+                await MainActor.run { self.feedback("⚠️ 停止回答失败：\(error.localizedDescription)") }
             }
         }
+    }
+
+    /// v10：全部停止——主/任务两侧独立收口；各侧实际结果如实反馈（不伪报失败）。
+    private func stopAllAgents() {
+        guard let bridge else {
+            showBubble(Self.connectFailureText)   // 未就绪不静默
+            return
+        }
+        Task {
+            let result = await bridge.interruptAll()
+            await MainActor.run { self.showInterruptAllFeedback(result) }
+        }
+    }
+
+    /// v10：全部停止反馈组装（两侧独立结果 → 准确文案）。
+    /// fix-live-ux-details：以逗号连接各侧结果——单句播报（分号会拆成多句高优串播，过于打断）。
+    private func showInterruptAllFeedback(_ r: (main: HermesBridge.MainInterruptResult, task: HermesBridge.TaskInterruptResult)) {
+        var parts: [String] = []
+        switch r.main {
+        case .stopped: parts.append("主回答已停止")
+        case .inactive: parts.append("主 Agent 当前没有在回答")
+        case .failed: parts.append("主回答停止失败")
+        }
+        switch r.task {
+        case .stopped: parts.append("任务已停止")
+        case .inactive: parts.append("当前没有运行中的任务")
+        case .failed: parts.append("任务停止失败")
+        case .stoppedUnconfirmed: parts.append("任务已本地停止（远端未确认）")
+        }
+        let text = "🛑 " + parts.joined(separator: "，")
+        showBubble(text)
+        SpeechOutputManager.shared.speak(text.replacingOccurrences(of: "🛑 ", with: ""))
     }
 
     /// #22 开始新对话（语音命令/右键菜单共用——复用「新开对话」逻辑）。
@@ -1663,7 +1767,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 当前主：直接查
             if let main = bridge.mainSession, main.sessionID == id {
                 Task { @MainActor in
-                    await self.showHistoryPanel(sessionID: main.sessionID, label: "主对话", bridge: bridge)
+                    await self.showHistoryPanel(sessionID: main.sessionID, label: "主对话", bridge: bridge,
+                                                profile: bridge.sessionIndex.mainProfile)
                 }
                 return
             }
@@ -1675,8 +1780,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             Task { @MainActor in
                 do {
-                    let info = try await bridge.client.resume(sessionID: rec.storedSessionID)
-                    await self.showHistoryPanel(sessionID: info.sessionID, label: "主对话（历史）", bridge: bridge)
+                    // v5：按记录 profile 恢复（legacy=nil 走默认 profile；deskpet-app 走隔离目录）
+                    let info = try await bridge.client.resume(sessionID: rec.storedSessionID, profile: rec.profile)
+                    await self.showHistoryPanel(sessionID: info.sessionID, label: "主对话（历史）", bridge: bridge, profile: rec.profile)
                     try? await bridge.client.close(sessionID: info.sessionID)
                 } catch {
                     self.presentHistory(title: "🗂 主对话（历史）", lines: ["⚠️ 查询失败（会话可能已失效）"])
@@ -1691,18 +1797,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let label = rec.title
         Task { @MainActor in
-            await self.showHistoryPanel(sessionID: rec.sessionID, label: label, bridge: bridge)
+            await self.showHistoryPanel(sessionID: rec.sessionID, label: label, bridge: bridge, profile: rec.profile)
         }
     }
 
     /// 历史面板统一入口：拉取 → 失败/空区分 → 展示（最近 20 条，内容不截断）。
+    /// v6：按记录 profile 路由（legacy=nil 走默认）。
     /// 线程安全（#36-1 崩溃修复）：@MainActor 编译期强制主线程 + 运行时收口双保险——
     /// HistoryPanelController/NSPanel 非主线程 init 会 EXC_CRASH。
     @MainActor
-    private func showHistoryPanel(sessionID: String, label: String, bridge: HermesBridge) async {
+    private func showHistoryPanel(sessionID: String, label: String, bridge: HermesBridge, profile: String? = nil) async {
         let messages: [[String: Any]]
         do {
-            messages = try await bridge.client.history(sessionID: sessionID)
+            messages = try await bridge.client.history(sessionID: sessionID, profile: profile)
         } catch {
             // P1-2：查询失败 ≠ 空历史（会话可能已失效/服务端错误）
             LogManager.shared.warn("历史查询失败：\(label)（\(error.localizedDescription)）")
@@ -1764,17 +1871,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let confirm = alert("移除任务记录", "从列表移除该任务记录「\(title)」？（常驻任务会话内容保留，不影响其它任务记录）", buttons: ["移除", "取消"])
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
         Task {
-            do {
-                // B-1：删除运行中的任务需先 interrupt（协议拒删活动会话）
-                if let active = bridge.activeTask, active.info.sessionID == rec.sessionID {
-                    try await bridge.interruptTask()
-                }
-                // #39：只删列表记录（常驻会话内容保留——共享语义）
-                bridge.removeTaskRecord(id: rec.id)
-                feedback("✅ 已移除记录：\(title)（会话内容保留）")
-            } catch {
-                feedback("⚠️ 删除失败：\(error.localizedDescription)")
+            // B-1：删除运行中的任务需先 interrupt（协议拒删活动会话）
+            if let active = bridge.activeTask, active.info.sessionID == rec.sessionID {
+                _ = await bridge.interruptTask()   // fix-ghost-task-queue：本地收口不抛错
             }
+            // #39：只删列表记录（常驻会话内容保留——共享语义）
+            bridge.removeTaskRecord(id: rec.id)
+            feedback("✅ 已移除记录：\(title)（会话内容保留）")
         }
     }
 
@@ -1906,7 +2009,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         执行任务：执行任务：<内容>、任务：<内容>、帮我执行：<内容>
         常见任务用语：帮我查… / 查一下… / 帮我搜索… / 搜索一下… / 帮我找… / 帮我打开… / 帮我下载…
         跟任务说：<内容>（转向运行中任务）
-        打断任务 / 停止任务
+        打断任务 / 停止任务（只停后台任务，聊天照常）
+        停止回答（只停当前回复，任务照常）
+        全部停止（主回复 + 任务一起停）
         新开对话 / 聊天记录
         设置：右键 → 设置（语音/交互/外观/系统分组）
         其他直接说，就是普通对话。触发词表可改：config/commands.json

@@ -14,10 +14,34 @@ import Foundation
 final class WakeController {
     enum State { case disabled, arming, listening, detected }
 
+    /// v7（wake-reload-fix）：设置唤醒词后的热生效决策（纯函数，可离线单测）。
+    /// - `.reloadNow`：listening/arming/disabled → 立即 stop+start 重启检测器
+    ///   （stop 幂等；disabled 也能从失效恢复监听，新词随 spawn 参数生效）
+    /// - `.reloadAfterResume`：detected（听写中）→ 不打断进行中的听写，标记延后到
+    ///   resume 后防抖回调内重启（沿用既有 2s 防抖机制）
+    enum WakeReloadAction { case reloadNow, reloadAfterResume }
+    static func wakeReloadAction(for state: State) -> WakeReloadAction {
+        switch state {
+        case .listening, .arming, .disabled: return .reloadNow
+        case .detected: return .reloadAfterResume
+        }
+    }
+
+    /// v9（audio-device-fix）：配置变化后是否值得重建采集（纯函数，可离线单测）。
+    /// 监听态 + 采集引擎在场才重建（detected/disabled/暂停采集均不重建）。
+    static func shouldRebuildOnConfigChange(state: State, hasEngine: Bool) -> Bool {
+        state == .listening && hasEngine
+    }
+
     var onStateChange: ((State) -> Void)?
     var onWakeDetected: (() -> Void)?   // 触发听写
     /// P1-06：唤醒不可用/采集失败原因（武装失败可见化，供 UI 提示）
     var onFailure: ((String) -> Void)?
+
+    /// v7：detected（听写中）设置过新唤醒词 → resume 后重启检测器时消费（见 resume()）。
+    /// 仅 AppDelegate.setWakePhrase 的 .reloadAfterResume 分支写入 true；
+    /// 新一轮 start() 时作废（start 开头清零）；检测器失效（disabled）残留时由下次 reloadNow 覆盖。
+    var pendingReload = false
 
     private var audioEngine: AVAudioEngine?
     private var detectorProc: Process?
@@ -71,6 +95,7 @@ final class WakeController {
     /// 启用唤醒监听（幂等）。
     func start() {
         guard currentState == .disabled else { return }
+        pendingReload = false   // v7：新一轮监听开始，延后重载标记作废
         guard let paths = Self.locateDetector() else {
             currentState = .disabled
             onFailure?(Self.lastDetectorError)   // P1-06：武装失败原因上报
@@ -186,7 +211,15 @@ final class WakeController {
             self.stdoutBufferLock.unlock()
             self.processWakeLines(lines)
         }
-        guard startCapture() else { return }
+        guard startCapture() else {
+            // v9（audio-device-fix）：采集启动失败（设备切换过渡期格式无效等）——
+            // 检测器子进程已 spawn 但无 PCM 可喂（假监听），必须一并清理；
+            // 失败可见性由 startCapture 的 onFailure 上报（不残留孤儿检测器）。
+            detectorProc?.terminate()
+            detectorProc = nil
+            detectorStdin = nil
+            return
+        }
         currentState = .listening
         startHeartbeatMonitor()
     }
@@ -196,6 +229,9 @@ final class WakeController {
 
     /// 停止唤醒监听。
     func stop() {
+        // v9（audio-device-fix）：取消待执行的配置变化重建/重试（用户意图优先——
+        // 停止后不得再被防抖窗口内的重建任务拉起采集）
+        cancelPendingCaptureRebuild()
         stopCapture()
         stopHeartbeatMonitor()
         detectorProc?.terminate()
@@ -222,7 +258,17 @@ final class WakeController {
         // E3：命中恢复防抖——听写刚结束的语音尾巴不再连环触发
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, self.currentState == .detected else { return }
-            guard self.startCapture() else { return }
+            // v7（wake-reload-fix）：听写期间设置过新唤醒词 → 防抖回调内重启检测器
+            // （新词随 spawn 参数生效），不打断已结束的听写；否则恢复采集。
+            if self.pendingReload {
+                self.pendingReload = false
+                LogManager.shared.info("唤醒词热生效：听写结束，重启检测器（新词：\(self.wakePhrase)）")
+                self.stop()   // 幂等：完整清理（采集/心跳/子进程）
+                self.start()
+                return
+            }
+            // v9b：听写结束恰逢设备切换过渡期 → 恢复采集失败自动重试（不永久回退 disabled）
+            if !self.startCaptureWithRetry() { return }
             self.currentState = .listening
         }
     }
@@ -230,6 +276,9 @@ final class WakeController {
     /// 手动语音输入期间暂停唤醒采集（macOS 双 AVAudioEngine 共存会静默断流）。
     /// 不改变状态；采集暂停 = 检测器收不到音频 = 天然暂停。
     func suspendCapture() {
+        // v9（audio-device-fix）：暂停期间不得重建采集（否则手动语音输入与唤醒
+        // 双引擎共存断流——防抖窗口内的重建任务一并取消）
+        cancelPendingCaptureRebuild()
         guard currentState == .listening, audioEngine != nil else { return }
         LogManager.shared.info("手动语音输入中：唤醒采集暂停")
         stopCapture()
@@ -238,7 +287,8 @@ final class WakeController {
     /// 手动语音输入结束 → 恢复唤醒采集（若处于监听态）。
     func resumeCapture() {
         guard currentState == .listening, audioEngine == nil else { return }
-        guard startCapture() else { return }
+        // v9b：恢复恰逢设备切换过渡期 → 稳定窗口后自动重试（不永久回退 disabled）
+        guard startCaptureWithRetry() else { return }
         LogManager.shared.info("手动语音输入结束：唤醒采集恢复")
     }
 
@@ -271,8 +321,10 @@ final class WakeController {
         let ratio = 16000.0 / srcFormat.sampleRate
         var buffer16 = Data()
 
-        input.installTap(onBus: 0, bufferSize: 2048, format: srcFormat) { [weak self] buffer, _ in
-            guard let self else { return }
+        // v9（audio-device-fix）：tap 回调携带引擎身份守卫——重建后旧引擎的迟到回调
+        // 不得再喂入新检测器（不遗留旧 tap 可生效回调）
+        input.installTap(onBus: 0, bufferSize: 2048, format: srcFormat) { [weak self, weak engine] buffer, _ in
+            guard let self, let engine, engine === self.audioEngine else { return }
             // 转成 16kHz Float32（保持源声道数）
             let frameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: frameCount) else { return }
@@ -317,15 +369,16 @@ final class WakeController {
                 }
             }
         }
-        // R-2026-08-13：设备配置变化（OBS 切聚合设备/采样率/声道）→ 自动重建采集
+        // v9（audio-device-fix）：设备配置变化（OBS 切聚合设备/采样率/声道/蓝牙切换）→
+        // 稳定窗口后自动重建采集（防抖：切换风暴连发多通知只重建一次；过渡期格式可能
+        // 无效——窗口后重建降低失败率；重建失败有界重试后回退 disabled + onFailure 可见）
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            LogManager.shared.info("唤醒：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
-            if !self.startCapture() {
-                LogManager.shared.warn("唤醒：设备变化重建采集失败（已回退 disabled）")
-            }
+            guard let self,
+                  Self.shouldRebuildOnConfigChange(state: self.currentState, hasEngine: self.audioEngine != nil) else { return }
+            LogManager.shared.info("唤醒：音频设备配置变化（OBS/录屏/蓝牙切换？）→ 稳定窗口后重建采集")
+            self.scheduleCaptureRebuild()
         }
         engine.prepare()
         do {
@@ -335,6 +388,11 @@ final class WakeController {
             return true
         } catch {
             LogManager.shared.error("唤醒音频采集失败：\(error)")
+            // v9b：失败路径同样移除已注册的配置变化 observer（不遗留旧 observer）
+            if let obs = configChangeObserver {
+                NotificationCenter.default.removeObserver(obs)
+                configChangeObserver = nil
+            }
             // R-M3-2：采集失败 → 回退 disabled（避免"看似开启实则无音频"）
             input.removeTap(onBus: 0)
             currentState = .disabled
@@ -369,6 +427,82 @@ final class WakeController {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
+    }
+
+    // MARK: - 配置变化重建（v9 audio-device-fix：稳定窗口防抖 + 有界重试）
+
+    /// 重建稳定窗口：设备切换通知连发期间不重建（过渡期 inputNode 格式可能无效/未就绪）
+    private static let captureRebuildStabilizationDelay: TimeInterval = 0.6
+    /// 重建失败重试上限（初始 1 次 + 重试 N 次，仍失败才回退 disabled）
+    private static let maxCaptureRebuildAttempts = 2
+    private var captureRebuildWorkItem: DispatchWorkItem?
+    private var captureRebuildAttempts = 0
+    /// 重建失败后的重试标记（重试守卫放行：失败路径 audioEngine 已 nil、状态已回退 disabled）
+    private var captureRebuildRetrying = false
+
+    /// 取消待执行的重建/重试（stop/suspendCapture 调用——用户意图优先，防窗口内重建拉起采集）。
+    private func cancelPendingCaptureRebuild() {
+        captureRebuildWorkItem?.cancel()
+        captureRebuildWorkItem = nil
+        captureRebuildAttempts = 0
+        captureRebuildRetrying = false
+    }
+
+    /// v9b：采集启动（resume/resumeCapture）失败且恰逢设备切换过渡期 → 稳定窗口后自动重试
+    /// （有界，与配置变化重建共用重试链）；重试耗尽保持 disabled + onFailure（可见，非假监听）。
+    /// 返回本次是否成功；失败时已恢复监听态并排定重试（最终收敛为 listening 或 disabled）。
+    @discardableResult
+    private func startCaptureWithRetry() -> Bool {
+        if startCapture() {
+            captureRebuildAttempts = 0
+            captureRebuildRetrying = false
+            return true
+        }
+        // startCapture 失败已置 disabled + onFailure——恢复监听态进入重试窗口
+        captureRebuildAttempts += 1
+        if captureRebuildAttempts <= Self.maxCaptureRebuildAttempts {
+            LogManager.shared.warn("唤醒恢复采集失败（第 \(captureRebuildAttempts) 次），稳定窗口后重试")
+            captureRebuildRetrying = true
+            currentState = .listening
+            scheduleCaptureRebuild()
+        } else {
+            captureRebuildRetrying = false
+            LogManager.shared.error("唤醒恢复采集多次失败——保持 disabled（onFailure 已可见上报，非假监听）")
+        }
+        return false
+    }
+
+    /// 防抖调度：设备切换风暴只重建一次；重建失败有界重试；期间用户停唤醒/暂停采集则不重建。
+    private func scheduleCaptureRebuild() {
+        captureRebuildWorkItem?.cancel()
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.captureRebuildWorkItem = nil
+            let retrying = self.captureRebuildRetrying
+            // 首建要求监听态 + 引擎在场；重试（失败恢复路径）仅要求监听态
+            guard self.currentState == .listening, retrying || self.audioEngine != nil else { return }
+            LogManager.shared.info("唤醒：设备变化稳定窗口结束，重建采集（attempt \(self.captureRebuildAttempts + 1)）")
+            if self.startCapture() {
+                self.captureRebuildAttempts = 0
+                self.captureRebuildRetrying = false
+                return
+            }
+            // startCapture 失败路径已置 disabled + onFailure——恢复监听态进入重试窗口；
+            // 重试仍失败则保持 disabled（onFailure 已可见上报，不假监听）
+            self.captureRebuildAttempts += 1
+            if self.captureRebuildAttempts <= Self.maxCaptureRebuildAttempts {
+                LogManager.shared.warn("唤醒：设备变化重建采集失败（第 \(self.captureRebuildAttempts) 次），稳定窗口后重试")
+                self.captureRebuildRetrying = true
+                self.currentState = .listening
+                self.scheduleCaptureRebuild()
+            } else {
+                self.captureRebuildRetrying = false
+                LogManager.shared.error("唤醒：设备变化重建采集多次失败——唤醒已回退 disabled（onFailure 已上报，非假监听）")
+            }
+        }
+        captureRebuildWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.captureRebuildStabilizationDelay, execute: item)
     }
 
     private var feedQueue = DispatchQueue(label: "deskpet.wake.feed")

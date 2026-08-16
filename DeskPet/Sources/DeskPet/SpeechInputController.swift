@@ -102,7 +102,217 @@ struct ASRVAD {
         let sentSegments = perCall.reduce(0, +)
         check("发送量下降 ≥50%（\(sentSegments)/25 段）", sentSegments <= 25 / 2)
         print("[vad] 自测：\(passed)/8")
-        return passed == 8 ? 0 : 1
+        // v8：分段状态机离线自测（同入口，不触音频）
+        let segCode = SpeechSegmenter.runSelfTest()
+        return (passed == 8 && segCode == 0) ? 0 : 1
+    }
+}
+
+/// 语音分段状态机（asr-segmentation-fix v8，用户确认参数）：
+/// - 静音 1s（boundarySeconds）→ 分句标记（不提交）
+/// - 静音 submitSeconds（listenSilenceTimeout，默认 2.0s）→ 提交当前累积文本
+/// - 分句窗口内（1~2s 停顿后）继续说话 → 合并为一条完整任务（前半句不再丢失）
+/// 三 ASR 途径（豆包流式 / Apple on-device / Apple 服务器模式回退）统一走本状态机：
+/// 服务端 final（豆包/服务器模式）到达不立即提交、不一次性丢弃——只更新累积，
+/// 提交由本地静音计时统一驱动；didSubmitFinal 一次性守卫改造为段级 submitted 去重。
+/// 纯值类型：不触碰音频，可离线单测（runSelfTest 经 --self-test-vad 入口）。
+struct SpeechSegmenter {
+    /// 分句阈值：静音 1s 标记分句（用户确认参数，常量）
+    static let boundarySeconds: TimeInterval = 1.0
+
+    private(set) var accumulated = ""        // 当前段累积文本
+    private(set) var boundaryMarked = false   // 已静音 1s 分句标记（不提交）
+    private(set) var submitted = false        // 本段已提交（提交去重）
+    /// 当前 utterance 文本（尾部替换用：同 utterance 的 partial 递增/服务端 final 收尾）
+    private var currentUtterance = ""
+
+    enum Event {
+        /// 全文式更新：on-device/服务器模式 request 内 partial（bestTranscription 累积全文）
+        case updateFull(String)
+        /// 同 utterance 收尾：服务端 final（豆包/服务器模式，替换当前 utterance 尾部；幂等）
+        case utteranceUpdate(String)
+        /// 新 utterance 开始：restart 后首个内容（服务端已切 utterance）——分句窗口内拼接合并
+        case utteranceStart(String)
+        /// 静音 1s：标记分句（不提交）
+        case silenceBoundary
+        /// 静音 submitSeconds：提交累积（单次）
+        case silenceCommit
+        /// 会话收尾（stop/error/final 兜底）：提交剩余累积（单次）
+        case finish
+    }
+    enum Output: Equatable { case submit(String); case none }
+
+    /// 提交后新内容到达 → 自动开始新分段（submitted 自愈复位）
+    private mutating func beginSegmentIfNeeded() {
+        if submitted {
+            submitted = false
+            accumulated = ""
+            currentUtterance = ""
+            boundaryMarked = false
+        }
+    }
+
+    mutating func handle(_ e: Event) -> Output {
+        switch e {
+        case .updateFull(let t):
+            let text = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return .none }
+            beginSegmentIfNeeded()
+            accumulated = text
+            currentUtterance = text
+            boundaryMarked = false
+            return .none
+        case .utteranceUpdate(let t):
+            let text = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return .none }
+            beginSegmentIfNeeded()
+            if accumulated.isEmpty {
+                accumulated = text
+            } else if !currentUtterance.isEmpty, accumulated.hasSuffix(currentUtterance) {
+                // 同 utterance 递增/final 收尾：替换尾部（幂等——重复 final 不叠加）
+                accumulated = String(accumulated.dropLast(currentUtterance.count)) + text
+            } else {
+                accumulated = text
+            }
+            currentUtterance = text
+            boundaryMarked = false
+            return .none
+        case .utteranceStart(let t):
+            let text = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return .none }
+            beginSegmentIfNeeded()
+            if boundaryMarked && !accumulated.isEmpty {
+                // 分句窗口内继续说话 → 合并为一条完整任务（前半句保留）
+                accumulated += text
+            } else {
+                accumulated = text
+            }
+            currentUtterance = text
+            boundaryMarked = false
+            return .none
+        case .silenceBoundary:
+            if !accumulated.isEmpty { boundaryMarked = true }   // 分句标记：不提交
+            return .none
+        case .silenceCommit, .finish:
+            guard !accumulated.isEmpty, !submitted else { return .none }
+            submitted = true
+            let out = accumulated
+            accumulated = ""
+            currentUtterance = ""
+            boundaryMarked = false
+            return .submit(out)
+        }
+    }
+
+    /// 新分段会话（startRecording 时调用）：清空累积与提交标记。
+    mutating func reset() {
+        accumulated = ""
+        currentUtterance = ""
+        boundaryMarked = false
+        submitted = false
+    }
+
+    // MARK: - 离线自测（--self-test-vad 经 ASRVAD.runSelfTest 挂载；不触音频）
+
+    static func runSelfTest() -> Int32 {
+        var passed = 0
+        func check(_ name: String, _ cond: Bool) {
+            print("[segmenter] \(cond ? "✓" : "✗") \(name)")
+            if cond { passed += 1 }
+        }
+        // 1) 静音 1s 分句标记不提交；静音 2s 提交
+        var s = SpeechSegmenter()
+        _ = s.handle(.updateFull("帮我查一下"))
+        check("内容累积", s.accumulated == "帮我查一下")
+        check("静音 1s：分句标记不提交", s.handle(.silenceBoundary) == .none && s.boundaryMarked)
+        check("静音 2s：提交累积", {
+            if case .submit(let t) = s.handle(.silenceCommit) { return t == "帮我查一下" }
+            return false
+        }())
+        check("提交后去重（单次）", s.handle(.silenceCommit) == .none && s.handle(.finish) == .none)
+        // 2) 停顿 1~2s 内继续说话 → 合并（前半句不丢）
+        var m = SpeechSegmenter()
+        _ = m.handle(.utteranceUpdate("帮我查一下"))     // 服务端 final1（同 utterance 收尾）
+        check("final1 累积（不立即提交）", m.accumulated == "帮我查一下" && !m.submitted)
+        _ = m.handle(.silenceBoundary)                    // 静音 1s 分句
+        check("分句窗口内新 utterance → 拼接合并", {
+            _ = m.handle(.utteranceStart("今天天气怎么样"))   // restart 后新 final2
+            return m.accumulated == "帮我查一下今天天气怎么样"
+        }())
+        check("合并后 2s 提交完整任务", {
+            if case .submit(let t) = m.handle(.silenceCommit) { return t == "帮我查一下今天天气怎么样" }
+            return false
+        }())
+        // 3) 同 utterance partial 递增 → 尾部替换不叠加
+        var p = SpeechSegmenter()
+        _ = p.handle(.utteranceUpdate("帮我"))
+        _ = p.handle(.utteranceUpdate("帮我查一下"))
+        check("同 utterance 递增替换", p.accumulated == "帮我查一下")
+        // 4) final 幂等（重复 final 不叠加）
+        _ = p.handle(.utteranceUpdate("帮我查一下"))
+        check("重复 final 幂等", p.accumulated == "帮我查一下")
+        // 5) 阈值边界：1s 前不分句；无内容不分句不提交
+        var b = SpeechSegmenter()
+        check("无内容静音 1s 不标记", b.handle(.silenceBoundary) == .none && !b.boundaryMarked)
+        check("无内容静音 2s 不提交", b.handle(.silenceCommit) == .none)
+        // 6) 提交后新内容 → 新分段（submitted 自愈）
+        _ = m.handle(.utteranceStart("第二段"))
+        check("提交后新内容开启新分段", m.accumulated == "第二段" && !m.submitted)
+        // 7) finish 收尾提交（stop/error 路径）
+        var f = SpeechSegmenter()
+        _ = f.handle(.updateFull("查一下天气"))
+        check("finish 提交剩余累积", {
+            if case .submit(let t) = f.handle(.finish) { return t == "查一下天气" }
+            return false
+        }())
+        // 8) 分句窗口无新内容 → 2s 提交单句（前半句保留语义不误并）
+        var single = SpeechSegmenter()
+        _ = single.handle(.utteranceStart("打开音乐"))
+        _ = single.handle(.silenceBoundary)
+        check("单句停顿后无新内容提交原文", {
+            if case .submit(let t) = single.handle(.silenceCommit) { return t == "打开音乐" }
+            return false
+        }())
+        // 9) 服务端路径时序回归 A：final1→停顿→final2→合并提交（豆包/服务器模式同构：
+        //    final 到达即分句边界已过，utteranceStart 拼接；提交由 2s 计时驱动）
+        var svc = SpeechSegmenter()
+        _ = svc.handle(.utteranceUpdate("帮我查一下"))    // final1（累积不提交）
+        _ = svc.handle(.silenceBoundary)                   // final 到达 = 分句边界已过（端点静音 ≥ ~1s）
+        check("服务端 final1 后分句标记即时生效", svc.boundaryMarked)
+        _ = svc.handle(.utteranceStart("今天天气怎么样"))  // 停顿 1~2s 续说 → final2（restart 后新 utterance）
+        check("服务端路径合并：final1+final2 拼接", svc.accumulated == "帮我查一下今天天气怎么样")
+        check("服务端路径合并后 2s 提交完整任务", {
+            if case .submit(let t) = svc.handle(.silenceCommit) { return t == "帮我查一下今天天气怎么样" }
+            return false
+        }())
+        // 10) 服务端路径时序回归 B：final1→2s commit 先发→final2 独立段（停顿 >2s）
+        var split = SpeechSegmenter()
+        _ = split.handle(.utteranceUpdate("帮我查一下"))
+        _ = split.handle(.silenceBoundary)
+        check("停顿 >2s：前半句先提交", {
+            if case .submit(let t) = split.handle(.silenceCommit) { return t == "帮我查一下" }
+            return false
+        }())
+        _ = split.handle(.utteranceStart("今天天气怎么样"))   // 已提交 → beginSegmentIfNeeded 新分段
+        check("停顿 >2s：final2 独立段（不误并）", split.accumulated == "今天天气怎么样" && !split.submitted)
+        check("独立段可再提交", {
+            if case .submit(let t) = split.handle(.silenceCommit) { return t == "今天天气怎么样" }
+            return false
+        }())
+        // 11) VAD 语音活动重置语义（豆包：计时相对说话停止——语音段重置后提交窗口延长）
+        var vad = SpeechSegmenter()
+        _ = vad.handle(.utteranceUpdate("帮我查一下"))
+        _ = vad.handle(.silenceBoundary)          // 静音 1s
+        _ = vad.handle(.utteranceStart("今天天气怎么样"))   // 续说（VAD 重置后未到提交点）
+        check("VAD 重置窗口内合并（停顿 1~2s 续说未提交）", vad.accumulated == "帮我查一下今天天气怎么样" && !vad.submitted)
+        // 12) 提交去重（状态机层：无新内容时 finish 不重复；新内容开启新分段由测试 6 覆盖；
+        //     迟到 final 的重复防护在控制器收尾路径的 submitted 守卫——不在状态机内）
+        var dedup = SpeechSegmenter()
+        _ = dedup.handle(.updateFull("查天气"))
+        check("2s 先提交", dedup.handle(.silenceCommit) == .submit("查天气"))
+        check("提交后 finish 不重复（无新内容）", dedup.handle(.finish) == .none)
+        print("[segmenter] 自测：\(passed)/23")
+        return passed == 23 ? 0 : 1
     }
 }
 
@@ -145,6 +355,21 @@ final class SpeechInputController: NSObject {
     /// P0-1：最近 partial 的平均段置信（0...1；提交闸门用——低置信噪声不提交）
     private var lastPartialConfidence: Float = 0
 
+    /// v8（asr-segmentation-fix）：语音分段状态机（三 ASR 途径统一入口，见 SpeechSegmenter）
+    private var segmentState = SpeechSegmenter()
+    /// v8：restart（新 request/WS 会话）后首个内容事件 = 新 utterance（服务端已切）
+    private var nextUtteranceIsNew = false
+    /// v8：当前识别途径是否 on-device（服务器模式回退时 false）——final 收尾/续听语义区分
+    private var usingOnDeviceRecognition = false
+    /// v8：静音计时器——1s 分句标记（boundaryTimer）/ submitSeconds 提交（commitTimer）
+    private var boundaryTimer: DispatchWorkItem?
+    private var commitTimer: DispatchWorkItem?
+    /// v8：提交阈值 = config.listenSilenceTimeout（默认 2.0s，可调；clamp 1.0...5.0）
+    private var submitSilenceSeconds: Double {
+        let raw = DeskPetConfig.load().listenSilenceTimeout
+        return raw.isFinite && raw >= 1.0 && raw <= 5.0 ? raw : 2.0
+    }
+
     /// P0-2：订阅播报状态变化（SpeechOutputManager 单例，主线程回调）。
     /// 持续聆听中：播报开始 → 暂停采集（引擎停，TTS 回声不进识别链）；播报结束 → 恢复。
     override init() {
@@ -169,6 +394,11 @@ final class SpeechInputController: NSObject {
             guard isRecording, !pausedForTTS else { return }
             pausedForTTS = true
             silenceTimer?.cancel()
+            boundaryTimer?.cancel()   // v9：暂停期间清分段计时（旧计时不得作用于恢复后的新会话）
+            boundaryTimer = nil
+            commitTimer?.cancel()
+            commitTimer = nil
+            cancelPendingCaptureRebuild()   // v9：暂停期间不重建采集（TTS 回声防护）
             stopRecordingInternal()   // 不发 onStateChange——唤醒/互斥链零抖动
             isRecording = false
             LogManager.shared.info("持续聆听：TTS 播报中，暂停采集（回声防护）")
@@ -178,7 +408,8 @@ final class SpeechInputController: NSObject {
             if SpeechOutputManager.shared.isSpeaking { return }
             pausedForTTS = false
             isRecording = false
-            startRecording()   // 新 epoch 续流（旧回调按 epoch 丢弃）
+            // v9：preserveSegment——暂停不抹除未提交语音段（设备切换/播报打断不丢用户说的话）
+            startRecording(preserveSegment: true)   // 新 epoch 续流（旧回调按 epoch 丢弃）
             LogManager.shared.info("持续聆听：TTS 播报结束，恢复采集")
         }
     }
@@ -220,8 +451,8 @@ final class SpeechInputController: NSObject {
         onTranscript?(t)
     }
 
-    /// 静默分段阈值：持续聆听 3s（长句中途停顿不易误切碎片——2s 会把「然后」当一句提交）；
-    /// 手动/唤醒听写 2s（说话节奏与响应速度平衡，不变）。
+    /// v8：静音分段计时（内容后由 armSilenceTimers 接管——1s 分句 / submitSeconds 提交）；
+    /// 未开口超时（10s/60s）仍走本方法（无内容不武装分段计时）。
     private static let continuousSilenceDelay: TimeInterval = 3.0
     private static let normalSilenceDelay: TimeInterval = 2.0
     /// P0-1：分段有效性阈值（提交闸门判定用——待实机校准，校准只改此处）
@@ -246,10 +477,13 @@ final class SpeechInputController: NSObject {
     }
 
     /// 开始录音识别（按住说话）。asrProvider=duoyun 且 key 已配 → 豆包流式；否则 Apple 本地。
-    func startRecording() {
+    /// v8（attempt 4 reviewer 修复）：preserveSegment=true 为服务端 final 续听专用——
+    /// 跳过段状态 reset 与 L2 补交（续听不抹除已累积前半句、不在 restart 时刻补交提前提交）；
+    /// 真正的新会话（用户停止后新录音、唤醒听写结束）仍走完整 reset。
+    func startRecording(preserveSegment: Bool = false) {
         guard !isRecording else { return }
         if useDuoyunASR {
-            startDuoyunRecording()
+            startDuoyunRecording(preserveSegment: preserveSegment)
             return
         }
         guard recognizer?.isAvailable == true else {
@@ -260,22 +494,29 @@ final class SpeechInputController: NSObject {
         }
         do {
             // L2（todo #19）：epoch 边界快速连说——新轮开始、重置状态前，
-            // 旧轮若已有未提交文本（lastPartialText 非空且 didSubmitFinal == false），
+            // 旧轮若已有未提交文本（lastPartialText 非空且状态机未提交），
             // 先补交再重置。否则旧轮迟到回调被 epoch 校验丢弃后上一句永久丢失。
-            // 时序保证：旧轮回调要么先到（epoch 匹配 → V1 兜底已提交，此处 didSubmitFinal
+            // 时序保证：旧轮回调要么先到（epoch 匹配 → 收尾已提交，此处状态机 submitted
             // 为 true 不重复）；要么后到（epoch 不匹配 → 丢弃，此处已补交）。
-            // 持续聆听模式跳过：restart 是自动分段（非用户主动停止），partial 由静默超时
-            // 路径提交（见 scheduleSilenceTimeout）——补交会造成碎片重复提交（用户实测）。
-            if !continuousMode && !lastPartialText.isEmpty && !didSubmitFinal {
-                didSubmitFinal = true   // 标记旧轮已提交，防任何路径重复
+            // 持续聆听模式跳过：restart 是自动分段（非用户主动停止），partial 由静默提交
+            // 路径处理（见 armSilenceTimers/handleSilenceCommit）——补交会造成碎片重复提交（用户实测）。
+            // v8（attempt 4）：preserveSegment（服务端 final 续听）同样跳过——
+            // 续听时刻用 lastPartialText 补交会提前 ~1.2s 提交并破坏合并窗口；
+            // 补交仅限用户停止后的快速连说场景。
+            if !preserveSegment && !continuousMode && !lastPartialText.isEmpty && !segmentState.submitted {
                 let text = lastPartialText
                 LogManager.shared.info("旧轮未提交文本补交（快速连说）：\(text)")
-                onTranscript?(text)
+                _ = segmentState.handle(.updateFull(text))
+                let out = segmentState.handle(.finish)
+                if case .submit(let t) = out { onTranscript?(t) }
             }
             recognitionEpoch += 1
             let epoch = recognitionEpoch   // R2A：本轮代次 token（回调捕获比对）
-            didSubmitFinal = false
-            lastPartialText = ""   // F1：每轮识别重置兜底文本
+            if !preserveSegment {
+                segmentState.reset()           // v8：新分段会话（submitted/累积清空）
+                nextUtteranceIsNew = false
+            }
+            lastPartialText = ""   // F1：每轮识别重置兜底文本（续听时清空不影响——累积在 segmentState）
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
             // E-W4：优先 on-device 识别——无服务器自动端点（停顿不自动 final），
@@ -283,15 +524,20 @@ final class SpeechInputController: NSObject {
             // 服务器模式会自动端点检测（停顿 ~1-2s 即 final，截断说话节奏）。
             if let rec = recognizer, rec.supportsOnDeviceRecognition {
                 request.requiresOnDeviceRecognition = true
+                usingOnDeviceRecognition = true
             } else {
+                usingOnDeviceRecognition = false
                 LogManager.shared.warn("语音识别：on-device 不可用，回退服务器模式（自动端点）")
             }
             recognitionRequest = request
 
             let inputNode = audioEngine.inputNode
             let format = inputNode.outputFormat(forBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-                self?.recognitionRequest?.append(buffer)
+            // v9（audio-device-fix）：tap 回调携带 epoch 守卫——重建后旧 tap 的迟到回调
+            // 不得 append 到新会话的 recognitionRequest（不遗留旧 epoch 可生效回调）
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, epoch] buffer, _ in
+                guard let self, epoch == self.recognitionEpoch else { return }
+                self.recognitionRequest?.append(buffer)
             }
             audioEngine.prepare()
             try audioEngine.start()
@@ -303,11 +549,8 @@ final class SpeechInputController: NSObject {
                       epoch == self.recognitionEpoch,
                       self.isRecording,
                       self.duoyunASR == nil else { return }
-                LogManager.shared.info("本地听写：音频设备配置变化 → 重建采集")
-                self.stopRecordingInternal()
-                self.isRecording = false
-                self.onStateChange?(false)
-                self.startRecording()
+                LogManager.shared.info("本地听写：音频设备配置变化 → 稳定窗口后重建采集")
+                self.scheduleCaptureRebuild(epoch: epoch)
             }
 
             recognitionTask = recognizer?.recognitionTask(with: request) { [weak self, epoch] result, error in
@@ -322,19 +565,44 @@ final class SpeechInputController: NSObject {
                         let text = result.bestTranscription.formattedString
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         if result.isFinal {
-                            // T1：final 只提交一次 + 同步结束识别（onStateChange(false)
-                            // 立即触发，唤醒监听不拖 5s 空窗；去重防 cancel 回调双提交）
-                            // F1：final 文本为空（on-device 偶发）→ lastPartialText 兜底
+                            // v8：final 不再立即提交、不再一次性丢弃——更新段累积（同 utterance 收尾），
+                            // 收尾提交（本地 2s 计时未提交时）由 finish 去重驱动；唤醒/持续语义保留。
                             let finalText = text.isEmpty ? self.lastPartialText : text
                             // P0-1：final 置信度（文本兜底时沿用 partial 置信）
                             let finalConfidence = text.isEmpty ? self.lastPartialConfidence : Self.segmentConfidence(result)
-                            if !finalText.isEmpty && !self.didSubmitFinal {
-                                self.didSubmitFinal = true
-                                self.submitTranscript(finalText, confidence: finalConfidence)
+                            if !finalText.isEmpty && !self.segmentState.submitted {
+                                let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(finalText) : .utteranceUpdate(finalText)
+                                self.nextUtteranceIsNew = false
+                                _ = self.segmentState.handle(event)
+                                self.lastPartialText = finalText   // F1：兜底文本保持最新
+                                if self.usingOnDeviceRecognition {
+                                    // on-device：final = endAudio 后会话收尾（无自动端点）→ 收尾提交
+                                    let out = self.segmentState.handle(.finish)
+                                    if case .submit(let t) = out {
+                                        self.submitTranscript(t, confidence: finalConfidence)
+                                    }
+                                } else {
+                                    // 服务器模式（v8 reviewer 修复）：final = 服务端自动端点切 utterance——
+                                    // 仅累积（不立即收尾提交），分句边界即时标记（端点静音已 ≥ ~1s），
+                                    // 续听开新 request（分句窗口内用户可能继续说 → 合并）；
+                                    // 提交统一由本地 1s/2s 计时（handleSilenceCommit）与用户停止（stopRecording）驱动——
+                                    // 唤醒听写在 2s 静默后才结束，持续模式停顿 1~2s 续说可合并。
+                                    _ = self.segmentState.handle(.silenceBoundary)
+                                    self.armSilenceTimers()
+                                    if self.isRecording {
+                                        self.restartRecognition(cancelTimers: false, preserveSegment: true)
+                                        return
+                                    }
+                                    // 已停止（用户松开）：收尾提交（去重）
+                                    let out = self.segmentState.handle(.finish)
+                                    if case .submit(let t) = out {
+                                        self.submitTranscript(t, confidence: finalConfidence)
+                                    }
+                                }
                             }
                             if self.continuousMode {
                                 // P1-1：持续聆听——分段提交后自动重启识别（引擎不拆）
-                                LogManager.shared.info("持续聆听：分段 final 提交，自动重启识别")
+                                LogManager.shared.info("持续聆听：分段 final 收尾，自动重启识别")
                                 self.restartRecognition()
                             } else {
                                 self.stopRecording()
@@ -342,24 +610,32 @@ final class SpeechInputController: NSObject {
                         } else if !text.isEmpty {
                             self.lastPartialText = text   // F1：记录最新 partial 兜底
                             self.lastPartialConfidence = Self.segmentConfidence(result)   // P0-1
-                            // 开口后：静默分段——持续聆听 3s（防碎片误切），
-                            // 听写/唤醒 2s（用户反馈 5s 太久——说完等 2s 即提交）
-                            let silenceDelay = self.continuousMode ? Self.continuousSilenceDelay : Self.normalSilenceDelay
-                            self.scheduleSilenceTimeout(delay: silenceDelay)
+                            // v8：统一分段状态机——restart 后首个内容=新 utterance（服务端已切，
+                            // 拼接合并）；request 内 partial=全文式更新。随后武装 1s/2s 静音计时。
+                            let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(text) : .updateFull(text)
+                            self.nextUtteranceIsNew = false
+                            _ = self.segmentState.handle(event)
+                            self.armSilenceTimers()
                         }
                     }
                     if error != nil {
                         // V1 兜底：cancel/error 时若已有识别文本也提交（松开即丢字防护）；
-                        // T1：已提交过则不重复提交（去重）
+                        // v8：提交由状态机 finish 去重（已提交过则不重复）
                         // F1：cancel 回调 result 常为 nil（on-device）→ lastPartialText 兜底
                         let fallback = (result?.bestTranscription.formattedString
                             .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
                         let submitText = fallback.isEmpty ? self.lastPartialText : fallback
                         // P0-1：置信度同兜底规则（result 缺失 → 沿用 partial 置信）
                         let submitConfidence = fallback.isEmpty ? self.lastPartialConfidence : Self.segmentConfidence(result)
-                        if !submitText.isEmpty && !self.didSubmitFinal {
-                            self.didSubmitFinal = true
-                            self.submitTranscript(submitText, confidence: submitConfidence)
+                        // v8 竞态收敛：已提交（2s 计时先到）→ 迟到 error 收尾不重复提交
+                        if !submitText.isEmpty && !self.segmentState.submitted {
+                            let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(submitText) : .updateFull(submitText)
+                            self.nextUtteranceIsNew = false
+                            _ = self.segmentState.handle(event)
+                            let out = self.segmentState.handle(.finish)
+                            if case .submit(let t) = out {
+                                self.submitTranscript(t, confidence: submitConfidence)
+                            }
                         }
                         if self.continuousMode {
                             // L-1：持续聆听识别 error（音频中断/引擎异常）→ 自动重启续听
@@ -383,20 +659,40 @@ final class SpeechInputController: NSObject {
             // R-M2-3：直接清理（isRecording 可能仍为 false，stopRecording 会被 guard 拦截）
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
+            // v9b：失败路径同样移除已注册的配置变化 observer（不遗留旧 observer）
+            if let obs = audioConfigObserver {
+                NotificationCenter.default.removeObserver(obs)
+                audioConfigObserver = nil
+            }
             recognitionRequest = nil
             recognitionTask = nil
             // W3：失败也要通知状态变化（唤醒恢复链依赖 onStateChange(false)）
             onStateChange?(false)
+            // v9（audio-device-fix）：持续聆听下启动失败（设备切换过渡期/引擎异常）→
+            // 稳定窗口后自动重试续听（聆听不假死；重试次数有界，最终失败保持 onStateChange(false) 可见）
+            if continuousMode {
+                LogManager.shared.warn("持续聆听：识别启动失败，稳定窗口后自动重试")
+                scheduleCaptureRebuild(epoch: recognitionEpoch)
+            }
         }
     }
 
     /// P1-1：持续聆听分段重启——清旧识别会话（保持 isRecording/引擎状态）→ 新 request 续流。
     /// 不经 stopRecording（不发 onStateChange(false)，路由/互斥链零抖动）。
-    private func restartRecognition() {
+    /// v8：cancelTimers=false 时保留已武装的 1s/2s 静音计时（服务端 final 续听场景——
+    /// 等待本地计时统一提交）；默认 true（提交后/收尾后重启——计时已消费，清掉防重复触发）。
+    /// v8（attempt 4）：preserveSegment=true 为服务端 final 续听专用——startRecording 跳过
+    /// segmentState.reset 与 L2 补交，保留已累积前半句（boundaryMarked/submitted 同保留）；
+    /// 新会话（用户停止后新录音/唤醒结束）默认 false 走完整 reset。
+    private func restartRecognition(cancelTimers: Bool = true, preserveSegment: Bool = false) {
+        if cancelTimers {
+            boundaryTimer?.cancel(); boundaryTimer = nil
+            commitTimer?.cancel(); commitTimer = nil
+        }
+        nextUtteranceIsNew = true   // v8：新 request/WS 会话首个内容 = 新 utterance
         stopRecordingInternal()   // 清 tap/endAudio/延迟 cancel 旧 task
         isRecording = false       // 绕过 startRecording 的 guard
-        startRecording()          // 新 epoch + 新 request（onStateChange(true) 重复触发——
-        // AppDelegate 已按持续模式抑制弹气泡/唤醒恢复等副作用）
+        startRecording(preserveSegment: preserveSegment)   // 新 epoch + 新 request
     }
 
     /// E-W2c：静默自动结束——识别到内容后 2s 无更新自动停止（提交结果）。
@@ -404,12 +700,52 @@ final class SpeechInputController: NSObject {
     /// 2s 兼顾说话节奏（中途停顿不截断）与响应速度（用户反馈 5s 太久）。
     /// P1-1：持续聆听模式未开口放宽到 60s，超时后自动重启（聆听不退出）。
     private var silenceTimer: DispatchWorkItem?
+
+    /// v8（asr-segmentation-fix）：内容事件后武装两级静音计时——
+    /// 静音 1s → 分句标记（不提交）；静音 submitSeconds（config.listenSilenceTimeout）→ 提交。
+    /// 每次内容（partial/final）到达都重置两个计时（说话/停顿节奏实时跟随）。
+    private func armSilenceTimers() {
+        boundaryTimer?.cancel()
+        commitTimer?.cancel()
+        let boundary = DispatchWorkItem { [weak self] in
+            _ = self?.segmentState.handle(.silenceBoundary)   // 仅标记分句，不提交
+        }
+        boundaryTimer = boundary
+        DispatchQueue.main.asyncAfter(deadline: .now() + SpeechSegmenter.boundarySeconds, execute: boundary)
+        let commitDelay = submitSilenceSeconds
+        let commit = DispatchWorkItem { [weak self] in self?.handleSilenceCommit() }
+        commitTimer = commit
+        DispatchQueue.main.asyncAfter(deadline: .now() + commitDelay, execute: commit)
+    }
+
+    /// v8：静音 submitSeconds 到期——提交当前累积文本（服务端 final 不立即提交，统一由本路径提交）。
+    /// 提交后：持续聆听重启识别（新分段）、非持续结束听写（既有语义保留）。
+    private func handleSilenceCommit() {
+        guard isRecording else { return }
+        let out = segmentState.handle(.silenceCommit)
+        switch out {
+        case .submit(let text):
+            LogManager.shared.info("静音 \(Int(submitSilenceSeconds))s：提交分段（段累积）\(text.prefix(30))…")
+            submitTranscript(text, confidence: lastPartialConfidence)
+            if continuousMode {
+                LogManager.shared.info("持续聆听静默提交：自动重启识别")
+                restartRecognition()
+            } else {
+                LogManager.shared.info("语音静默提交：自动结束听写")
+                stopRecording()
+            }
+        case .none:
+            // 无累积（已提交/空段）——持续模式仍重启续听（既有未开口语义由 scheduleSilenceTimeout 覆盖）
+            if continuousMode {
+                LogManager.shared.info("持续聆听静默：无累积内容，自动重启识别")
+                restartRecognition()
+            }
+        }
+    }
     /// R2A：识别代次 token——每轮 startRecording 递增；回调捕获本轮 epoch，
     /// 处理前校验，过期回调（上一轮的 final/cancel 延迟到达）直接丢弃，
     /// 防止停掉新一轮录音（竞态：轮1 结束 <2s 内开始轮2，轮1 回调误 stopRecording）。
     private var recognitionEpoch = 0
-    /// T1：本轮识别是否已提交过最终结果（防 endAudio final 与 cancel 回调双提交）
-    private var didSubmitFinal = false
     /// F1：兜底文本——每次 partial 非空时更新；final/cancel 回调无文本时兜底提交
     /// （on-device 识别 final 可能 >0.5s 才到，且 cancel 后回调 result 常为 nil，
     /// 不兜底则用户说的话全丢：日志表现为「识别开始→静默→结束」无提交）
@@ -419,17 +755,9 @@ final class SpeechInputController: NSObject {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isRecording else { return }
             if self.continuousMode {
-                // P1-1：持续聆听静默超时 = 分段（不退出聆听）。提交语义：
-                // 未提交且有 partial → 先提交（V1 兜底）→ 标记 didSubmitFinal → 重启；
-                // 已提交（final 先行）→ 直接重启不重复。L2 补交已跳过（continuous）——
-                // 本路径是持续模式唯一 partial 提交点，无碎片重复。
-                // P0-1：有效性判定（低置信/过短 → 丢弃不提交，仅日志）。
-                if !self.didSubmitFinal && !self.lastPartialText.isEmpty {
-                    self.didSubmitFinal = true
-                    let text = self.lastPartialText
-                    LogManager.shared.info("持续聆听静默 \(Int(delay))s：提交分段 \(text.prefix(30))…")
-                    self.submitTranscript(text, confidence: self.lastPartialConfidence)
-                }
+                // P1-1：持续聆听未开口静默超时 = 重启（不退出聆听）。
+                // v8：有内容时的分段提交/重启由 armSilenceTimers 的 1s/2s 计时接管；
+                // 本路径只覆盖「未开口 60s」（无内容 → 不提交，直接重启续听）。
                 // P0-3：onTranscript 同步路径可能已退出聆听（退出词命中 → stopListening
                 // 同步置 continuousMode=false 并停引擎）——退出后绝不自动重启识别
                 // （voice-loop.log 闭环根因：退出后「自动重启识别」→ 重启听写把
@@ -438,7 +766,7 @@ final class SpeechInputController: NSObject {
                     LogManager.shared.info("持续聆听：已退出聆听，跳过自动重启")
                     return
                 }
-                LogManager.shared.info("持续聆听静默 \(Int(delay))s：自动重启识别")
+                LogManager.shared.info("持续聆听未开口 \(Int(delay))s：自动重启识别")
                 self.restartRecognition()
             } else {
                 LogManager.shared.info("语音静默 \(Int(delay))s：自动结束听写")
@@ -453,6 +781,61 @@ final class SpeechInputController: NSObject {
     private var asrVAD = ASRVAD()
     /// R-2026-08-13：音频设备配置变化监听（OBS/录屏切设备 → 重建采集）
     private var audioConfigObserver: NSObjectProtocol?
+
+    // MARK: - 配置变化重建（v9 audio-device-fix：稳定窗口防抖 + 段保留 + 有界重试）
+
+    /// 重建稳定窗口：设备切换（蓝牙/聚合设备）通知常连发多通知且过渡期 inputNode 格式可能无效
+    private static let captureRebuildStabilizationDelay: TimeInterval = 0.6
+    /// 重建失败重试上限（初始 1 次 + 重试 N 次，仍失败才停止采集——保持可见非假开启）
+    private static let maxCaptureRebuildAttempts = 2
+    private var captureRebuildWorkItem: DispatchWorkItem?
+    private var captureRebuildAttempts = 0
+
+    /// 取消待执行的重建/重试（用户主动停止/TTS 暂停时调用——防窗口内重建拉起采集）。
+    private func cancelPendingCaptureRebuild() {
+        captureRebuildWorkItem?.cancel()
+        captureRebuildWorkItem = nil
+        captureRebuildAttempts = 0
+    }
+
+    /// 音频设备配置变化重建：防抖窗口后单次重建；未提交语音段保留（preserveSegment）；
+    /// 重建失败有界重试（过渡期格式未稳定）；最终失败保持 isRecording=false + onStateChange(false)
+    /// （可见回调而非假开启）。epoch 守卫：窗口期内会话已重启（epoch 变化）则不重建；
+    /// 用户停止/TTS 暂停路径已取消待执行项（cancelPendingCaptureRebuild）。
+    private func scheduleCaptureRebuild(epoch: Int) {
+        captureRebuildWorkItem?.cancel()
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
+            guard let self, epoch == self.recognitionEpoch else { return }
+            self.captureRebuildWorkItem = nil
+            // 旧分段/静默计时不得作用于新会话（本次重建统一重新武装）
+            self.boundaryTimer?.cancel(); self.boundaryTimer = nil
+            self.commitTimer?.cancel(); self.commitTimer = nil
+            self.silenceTimer?.cancel(); self.silenceTimer = nil
+            LogManager.shared.info("音频设备配置变化：稳定窗口结束，重建采集（attempt \(self.captureRebuildAttempts + 1)）")
+            self.stopRecordingInternal()
+            self.isRecording = false
+            self.onStateChange?(false)
+            // 未提交语音段不重置（preserveSegment）——设备切换不丢用户正在说的话；
+            // 新会话首个内容视为新 utterance（分句合并窗口保留）
+            self.nextUtteranceIsNew = true
+            self.startRecording(preserveSegment: true)
+            if self.isRecording {
+                self.captureRebuildAttempts = 0
+            } else {
+                self.captureRebuildAttempts += 1
+                if self.captureRebuildAttempts <= Self.maxCaptureRebuildAttempts {
+                    LogManager.shared.warn("音频设备变化重建采集失败（第 \(self.captureRebuildAttempts) 次），稳定窗口后重试")
+                    // 失败路径已递增 epoch（startRecording 内部）——以当前 epoch 重排
+                    self.scheduleCaptureRebuild(epoch: self.recognitionEpoch)
+                } else {
+                    LogManager.shared.error("音频设备变化重建采集多次失败——本次采集已停止（onStateChange(false) 已上报，非假开启）")
+                }
+            }
+        }
+        captureRebuildWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.captureRebuildStabilizationDelay, execute: item)
+    }
 
     private func stopRecordingInternal() {
         if let obs = audioConfigObserver {
@@ -497,10 +880,13 @@ final class SpeechInputController: NSObject {
 
     /// 豆包流式路径：采集 PCM（转 16kHz int16）→ 200ms 段喂 WS → 静默/停止 → 末包 → final 文本。
     /// 仅最终结果（无中间字）；失败 → onASRError（AppDelegate 本次会话回退本地 + 提示）。
-    private func startDuoyunRecording() {
+    private func startDuoyunRecording(preserveSegment: Bool = false) {
         recognitionEpoch += 1
         let epoch = recognitionEpoch
-        didSubmitFinal = false
+        if !preserveSegment {
+            segmentState.reset()   // v8：新分段会话（续听时保留累积前半句）
+            nextUtteranceIsNew = false
+        }
         lastPartialText = ""
         let asr = DuoyunASRProvider()
         let asrIdentity = ObjectIdentifier(asr)
@@ -511,12 +897,35 @@ final class SpeechInputController: NSObject {
                 guard let self,
                       epoch == self.recognitionEpoch,
                       let currentASR = self.duoyunASR,
-                      ObjectIdentifier(currentASR) == asrIdentity,
-                      !self.didSubmitFinal else { return }
-                self.didSubmitFinal = true
-                LogManager.shared.info("豆包识别 final：\(text.prefix(40))…")
-                // P0-1：豆包路径无置信度（VAD 已滤静音）——仅长度规则生效
-                self.submitTranscript(text, confidence: nil)
+                      ObjectIdentifier(currentASR) == asrIdentity else { return }
+                LogManager.shared.info("豆包识别 final（段累积）：\(text.prefix(40))…")
+                // v8：final 不立即提交、不一次性丢弃——更新段累积（utteranceUpdate 幂等收尾 /
+                // restart 后新 utterance 拼接合并），提交统一由本地 1s/2s 静音计时驱动。
+                let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
+                self.nextUtteranceIsNew = false
+                _ = self.segmentState.handle(event)
+                // v8（reviewer 修复）：服务端 final 到达即分句边界已过（端点检测静音 ≥ ~1s）——
+                // 立即标记，保证停顿 1~2s 续说时 final2 走 utteranceStart 拼接合并。
+                _ = self.segmentState.handle(.silenceBoundary)
+                self.lastPartialText = text   // F1：兜底文本保持最新
+                if !self.isRecording && !self.continuousMode {
+                    // 用户已松开/听写已结束（stopRecordingInternal 末包触发）→ 收尾提交（去重）
+                    // utteranceUpdate：幂等替换当前 utterance 尾部（保留分句窗口内的拼接合并）
+                    if !self.segmentState.submitted {   // 竞态收敛：2s 计时已提交 → 迟到 final 不重复
+                        let event: SpeechSegmenter.Event = self.nextUtteranceIsNew ? .utteranceStart(text) : .utteranceUpdate(text)
+                        self.nextUtteranceIsNew = false
+                        _ = self.segmentState.handle(event)
+                        let out = self.segmentState.handle(.finish)
+                        if case .submit(let t) = out {
+                            self.submitTranscript(t, confidence: nil)
+                        }
+                    }
+                } else if self.isRecording {
+                    // 服务端 final = WS 会话终点：续听开新 WS（分句窗口内用户可能继续说 → 合并；
+                    // preserveSegment：restart 不抹除已累积前半句、不 L2 补交）
+                    self.armSilenceTimers()   // 本地 1s/2s 计时统一提交（保留——restart 不取消）
+                    self.restartRecognition(cancelTimers: false, preserveSegment: true)
+                }
             }
         }
         asr.onError = { [weak self, epoch, asrIdentity] message in
@@ -551,7 +960,8 @@ final class SpeechInputController: NSObject {
                                             epoch: epoch, asrIdentity: asrIdentity)
                 }
             }
-            // R-2026-08-13：设备配置变化（OBS 切聚合设备/采样率/声道）→ 重建采集与转换链
+            // v9（audio-device-fix）：设备配置变化（OBS 切聚合设备/采样率/声道/蓝牙切换）→
+            // 稳定窗口后重建采集（防抖 + 未提交段保留 + 失败重试，见 scheduleCaptureRebuild）
             audioConfigObserver = NotificationCenter.default.addObserver(
                 forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
             ) { [weak self, epoch, asrIdentity] _ in
@@ -560,14 +970,8 @@ final class SpeechInputController: NSObject {
                       self.isRecording,
                       let currentASR = self.duoyunASR,
                       ObjectIdentifier(currentASR) == asrIdentity else { return }
-                LogManager.shared.info("豆包听写：音频设备配置变化（OBS/录屏切换？）→ 重建采集")
-                // 幂等重建：停旧 tap/引擎 → 重走豆包启动（重新读格式 + 重装 tap + 重连 ASR）
-                self.stopRecordingInternal()
-                self.isRecording = false
-                self.onStateChange?(false)
-                self.startDuoyunRecording()
-                self.isRecording = true
-                self.onStateChange?(true)
+                LogManager.shared.info("豆包听写：音频设备配置变化（OBS/录屏/蓝牙切换？）→ 稳定窗口后重建采集")
+                self.scheduleCaptureRebuild(epoch: epoch)
             }
             audioEngine.prepare()
             try audioEngine.start()
@@ -586,6 +990,12 @@ final class SpeechInputController: NSObject {
                         self.isRecording = false
                         self.onStateChange?(false)
                         self.onASRError?("\(error.localizedDescription)")
+                        // v9（audio-device-fix）：持续聆听下会话建立失败 → 稳定窗口后自动重试
+                        // （重试经 useDuoyunASR 判定已回退本地，聆听不假死）
+                        if self.continuousMode {
+                            LogManager.shared.warn("持续聆听：豆包会话建立失败，稳定窗口后自动重试（本地）")
+                            self.scheduleCaptureRebuild(epoch: self.recognitionEpoch)
+                        }
                     }
                 }
             }
@@ -599,8 +1009,18 @@ final class SpeechInputController: NSObject {
             duoyunFailedThisSession = true
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
+            // v9b：失败路径同样移除已注册的配置变化 observer（不遗留旧 observer）
+            if let obs = audioConfigObserver {
+                NotificationCenter.default.removeObserver(obs)
+                audioConfigObserver = nil
+            }
             onStateChange?(false)
             onASRError?("\(error.localizedDescription)")
+            // v9（audio-device-fix）：持续聆听下启动失败 → 稳定窗口后自动重试续听（不假死）
+            if continuousMode {
+                LogManager.shared.warn("持续聆听：豆包识别启动失败，稳定窗口后自动重试（本地）")
+                scheduleCaptureRebuild(epoch: recognitionEpoch)
+            }
         }
     }
 
@@ -648,8 +1068,15 @@ final class SpeechInputController: NSObject {
                     let seg = self.pcmAccumulator.prefix(6400)
                     self.pcmAccumulator.removeFirst(6400)
                     // VAD（executor8）：静音段不喂 WS；说话段 + 前后缓冲发送
-                    for s in self.asrVAD.process(segment: Data(seg)) {
+                    let sent = self.asrVAD.process(segment: Data(seg))
+                    for s in sent {
                         asr.feedAudio(s)
+                    }
+                    // v8（reviewer 修复）：语音活动（VAD 有段发出）→ 重置 1s/2s 分段计时——
+                    // 提交判定相对实际说话停止时刻（而非 final 到达时刻），
+                    // 保证停顿 1~2s 续说场景 final2 到达时未提交、可拼接合并。
+                    if !sent.isEmpty {
+                        self.armSilenceTimers()
                     }
                 }
             }
@@ -659,6 +1086,13 @@ final class SpeechInputController: NSObject {
     func stopRecording() {
         silenceTimer?.cancel()
         silenceTimer = nil
+        boundaryTimer?.cancel()   // v8：清分段计时（1s 分句/提交计时）
+        boundaryTimer = nil
+        commitTimer?.cancel()
+        commitTimer = nil
+        // v9（audio-device-fix）：用户主动停止 → 取消待执行的配置变化重建/重试
+        // （停止后防抖窗口内的重建不得再把采集拉起）
+        cancelPendingCaptureRebuild()
         guard isRecording else { return }
         stopRecordingInternal()
         isRecording = false

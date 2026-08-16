@@ -51,7 +51,8 @@ struct DeskPetConfig: Codable {
     /// P1：聆听退出词（用户决策 2026-08-12：退出词=「晚安」；「退下/再见」回归对话，
     /// 不再 contains 误伤拦截；UI 文案已对齐实际——只提「晚安」）
     var listenExitPhrases: [String] = ["晚安"]   // 用户决策（2026-08-12）：退出词=晚安
-    /// P1：聆听分段静默时长（秒，说完停顿多久提交并续听）
+    /// v8（asr-segmentation-fix）：语音分段提交阈值——静音满该时长提交当前累积文本
+    /// （分句阈值固定 1s 标记不提交；默认 2.0s，可编辑 deskpet-config.json 调整，clamp 1.0...5.0）
     var listenSilenceTimeout: Double = 2.0
     /// 唤醒词灵敏度（sherpa KWS 阈值，默认 0.25；范围 0.1-0.5：
     /// 越低越灵敏越易误触发，越高越迟钝越易漏；非法值回退默认）
