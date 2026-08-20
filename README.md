@@ -11,7 +11,7 @@
 - **对话能力**：接入 Hermes 双 Agent——聊天、派任务、联网查资料、操作终端/文件/浏览器
 - **速度与思考**：响应速度与所配置模型一致；思考等级（reasoning_effort，high / medium / max）在 Hermes 侧调整（`~/.hermes/config.yaml`），调低思考等级可加快响应
 
-> 📦 最新版本：[Releases](https://github.com/Innoksadk223/DeskPet/releases) 下载 `DeskPet-0.6.0.dmg`
+> 📦 最新版本：[Releases](https://github.com/Innoksadk223/DeskPet/releases) 下载 `DeskPet-0.7.0.dmg`
 
 ## 一、安装（第一次用）
 

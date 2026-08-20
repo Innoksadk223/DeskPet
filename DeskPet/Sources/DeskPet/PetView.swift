@@ -67,7 +67,7 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedWakeState(_ view: PetView) -> Bool
     /// F9：唤醒状态三态文案（已关闭/启动中/监听中）
     func petViewRequestedWakeStatusText(_ view: PetView) -> String
-    /// F3：「中断任务」可用态（无运行中任务置灰）
+    /// F3：「中断任务」可用态（主 Agent 或任务 Agent 均忙时可用）
     func petViewRequestedIsTaskRunning(_ view: PetView) -> Bool
     func petViewRequestedAbout(_ view: PetView)
     func petViewRequestedHelp(_ view: PetView)   // P3-1：使用帮助（右键菜单入口）

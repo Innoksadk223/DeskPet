@@ -1384,6 +1384,12 @@ final class HermesBridge {
         return running || reserved
     }
 
+    /// GUI 菜单的中断可用态：主 Agent 回复或任务链路任一忙即可中断。
+    /// 语音「中断任务」仍由 interruptTask() 保持 task-only 语义。
+    func isAnyAgentBusy() -> Bool {
+        mainTurnActive || isTaskBusy()
+    }
+
     private func setTaskSlotOccupied(_ occupied: Bool) {
         taskLifecycleLock.lock()
         taskSlotOccupied = occupied

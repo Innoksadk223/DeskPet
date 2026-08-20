@@ -56,10 +56,10 @@ final class StatusItemController: NSObject {
 
         // U11：会话区（与右键菜单同步——中断任务/开始新对话/唤醒词开关，菜单栏此前缺失）
         menu.addItem(.separator())
-        let interrupt = NSMenuItem(title: "中断任务", action: #selector(AppDelegate.interruptCurrentTask), keyEquivalent: "")
+        let interrupt = NSMenuItem(title: "中断任务", action: #selector(AppDelegate.interruptAllFromMenu), keyEquivalent: "")
         interrupt.target = app
-        // F3：无运行中任务时置灰（不做假成功；语音命令路径仍有明确提示）
-        interrupt.isEnabled = app?.isTaskRunning() ?? false
+        // F3：主 Agent 或任务 Agent 任一忙时可用；GUI 菜单语义是两侧同时停止。
+        interrupt.isEnabled = app?.isAnyAgentBusy() ?? false
         menu.addItem(interrupt)
 
         let newChat = NSMenuItem(title: "开始新对话", action: #selector(AppDelegate.startNewConversation), keyEquivalent: "")

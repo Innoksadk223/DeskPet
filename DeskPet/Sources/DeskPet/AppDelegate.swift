@@ -388,8 +388,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// F3：当前是否有运行中任务（菜单「中断任务」可用态——无任务置灰防假成功）。
+    /// F3：当前是否有运行中任务（语音/状态路径用）。
     func isTaskRunning() -> Bool { bridge?.activeTask != nil }
+
+    /// GUI 菜单「中断任务」同时覆盖主 Agent 与任务 Agent；任一侧忙时可用。
+    func isAnyAgentBusy() -> Bool { bridge?.isAnyAgentBusy() ?? false }
 
     private func wireBridgeCallbacks(_ bridge: HermesBridge) {
         // 崩溃修复（DeskPet-2026-08-12-135431.ips）：HermesBridge 的 Task 内部
@@ -1916,7 +1919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 设置 ▸ 菜单栏入口。
     @objc func menuToggleListenMode() { toggleListenMode() }
 
-    /// #22 中断任务（语音命令/右键菜单共用——与 CommandRouter 打断命令同路径）。
+    /// #22 中断任务（语音命令路径，task-only；GUI 菜单走 interruptAllFromMenu）。
     /// F3：无运行中任务时如实提示（不做假成功）；F4：打断成功明确告知不会再有结果。
     /// fix-ghost-task-queue：本地收口始终完成；远端 RPC 失败时如实区分「已本地停止但远端未确认」。
     @objc func interruptCurrentTask() {
@@ -1939,6 +1942,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItemController?.updateState(currentState)
         }
     }
+
+    /// GUI 菜单「中断任务」语义：主 Agent 与任务 Agent 同时停止。
+    /// 语音「中断任务」仍保留 task-only；语音「全部停止」继续走同一 all-stop 路径。
+    @objc func interruptAllFromMenu() { stopAllAgents() }
 
     /// v10（split-interrupt-commands）：停止回答——只停主 Agent 当前回复，任务侧不动。
     /// 主侧不在回复时如实反馈（不伪报成功）；网络失败明确报错。
@@ -1972,7 +1979,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Task {
             let result = await bridge.interruptAll()
-            await MainActor.run { self.showInterruptAllFeedback(result) }
+            await MainActor.run {
+                self.showInterruptAllFeedback(result)
+                self.statusItemController?.updateState(self.currentState)
+            }
         }
     }
 
@@ -2413,7 +2423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - PetViewDelegate
 
 extension AppDelegate: PetViewDelegate {
-    func petViewRequestedInterrupt(_ view: PetView) { interruptCurrentTask() }
+    func petViewRequestedInterrupt(_ view: PetView) { interruptAllFromMenu() }
     func petViewRequestedNewChat(_ view: PetView) { startNewConversation() }
     func petViewRequestedClearHistory(_ view: PetView) { clearChatHistory() }
     func petViewRequestedRetry(_ view: PetView) { retryConnection() }
@@ -2421,8 +2431,8 @@ extension AppDelegate: PetViewDelegate {
     func petViewRequestedWakeState(_ view: PetView) -> Bool { wakeController?.isEnabled ?? false }
     /// F9：右键菜单唤醒状态文案（与菜单栏一致的三态）
     func petViewRequestedWakeStatusText(_ view: PetView) -> String { wakeWordStatusText() }
-    /// F3：右键菜单「中断任务」可用态
-    func petViewRequestedIsTaskRunning(_ view: PetView) -> Bool { isTaskRunning() }
+    /// F3：右键菜单「中断任务」可用态——主 Agent 或任务 Agent 任一忙即可中断。
+    func petViewRequestedIsTaskRunning(_ view: PetView) -> Bool { isAnyAgentBusy() }
     func petViewRequestedWakeThresholds(_ view: PetView) -> [(value: Double, name: String, isCurrent: Bool)] {
         wakeThresholdMenuList()
     }
