@@ -162,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.showBubble("📝 收到：\(text)", persistent: true, maxDuration: Self.transitionBubbleTimeout)   // 过渡型：4s 无替换自动隐藏（防任务运行中卡死）
             // P2-07：正在播报（主回复/任务消息）时不打断——仅气泡确认
             // U6：播报确认去重——「收到」移到 routeUserInput 内按路由结果决定
-            // （任务派发路径只播「好嘞，开始执行！」；纯聊天/其他路径播「收到」）
+            // （任务派发路径只播气泡「📋 标题」，不再额外语音确认；纯聊天/其他路径播「收到」）
             self.routeUserInput(text, fromVoice: true)
         }
         speechInput.onStateChange = { [weak self] recording in
@@ -513,15 +513,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.showBubble("⚠️ \(message)")
             }
         }
-        bridge.onTaskStarted = { [weak self] title, tag in
+        bridge.onTaskStarted = { [weak self] title, _ in
             LogManager.shared.info("任务开始：\(title)")
-            // E-W3：任务接受要有声反馈（语音 + 气泡）——播报低优入队（不卡断当前对话）。
-            // P2-2：播报不读 title（英文逐字母卡带/句中截断）——title 只进气泡
-            // P4-1：任务播报带实例 tag（新任务派发抢占——旧任务播报全部丢弃）
-            let spoken = "好嘞，开始执行！"
+            // 用户反馈（活人感）：任务开始不再读「好嘞，开始执行！」——派发确认语音太打扰。
+            // 只保留气泡「📋 标题」视觉确认；任务过程/完成/失败播报照旧。（P2-2：title 只进气泡）
             DispatchQueue.main.async {
                 self?.showBubble("📋 \(title)")
-                SpeechOutputManager.shared.speak(spoken, priority: .low, tag: tag)
             }
         }
         bridge.onTaskQueued = { [weak self] title, position, starting in
@@ -1847,13 +1844,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 触发词路由：本地指令表 → 未命中走主会话闲聊（M1-4）。
-    /// fromVoice=true：语音路径确认播报（U6 去重——任务派发只播「好嘞，开始执行！」，
+    /// fromVoice=true：语音路径确认播报（U6 去重——任务派发不播「收到」与开始确认语，
     /// 其余路径播「收到」；T-2 语义保留：不清低优队列、播报中不插播）
     private func routeUserInput(_ text: String, fromVoice: Bool = false) {
         // P1：持续聆听退出词拦截（聆听模式下、CommandRouter 之前——不进 chat 路径）
         if listeningCoordinator.handleText(text) { return }
         let result = router.route(text)
-        // U6：语音确认播报去重——任务派发路径跳过「收到」（onTaskStarted 播「好嘞，开始执行！」）
+        // U6：语音确认播报去重——任务派发路径跳过「收到」（任务开始也不再额外语音确认——用户反馈太打扰）
         if fromVoice, !SpeechOutputManager.shared.isSpeaking {
             if case .dispatch = result {} else {
                 SpeechOutputManager.shared.speak("收到", clearsQueue: false)
@@ -1890,7 +1887,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // v4 安全加速：派发提交前立即显示「已接收 + 标题」——冷启动建任务会话（网络往返）
             // 期间也有可视反馈；onTaskStarted 到达时替换为同内容气泡（幂等），失败路径由 ⚠️/❌ 替换。
-            // （U9 标题保留完整动词短语原文；语音仍由 onTaskStarted 播「好嘞，开始执行！」——不重复播报）
+            // （U9 标题保留完整动词短语原文；任务开始无语音确认——用户反馈太打扰）
             showBubble("📋 \(title)", persistent: true)
             Task {
                 // v9（fix-audio-task-state）：派发不再抛错——失败已由 bridge 统一 onTaskFailed 可见收口
