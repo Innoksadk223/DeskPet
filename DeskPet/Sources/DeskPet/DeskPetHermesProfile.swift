@@ -259,6 +259,31 @@ enum DeskPetHermesProfile {
         }
     }
 
+    /// 只读诊断 profile/workspace/SOUL 边界；不创建目录、不读取聊天正文或凭证。
+    static func diagnosticSummary(_ fm: FileManager = .default) -> String {
+        var isDir: ObjCBool = false
+        let homeOK = fm.fileExists(atPath: realHome.path, isDirectory: &isDir) && isDir.boolValue
+        let workspaceOK = validateWorkspace(fm, workspace: Self.workspace, realHome: realHome)
+        let linkTarget: String?
+        do {
+            linkTarget = try fm.destinationOfSymbolicLink(atPath: linkPath.path)
+        } catch {
+            linkTarget = nil
+        }
+        let linkOK = linkTarget.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path == realHome.standardizedFileURL.path
+        } ?? false
+        let soulExists = fm.fileExists(atPath: soulURL.path, isDirectory: &isDir) && !isDir.boolValue
+        let soulTarget: String?
+        do {
+            soulTarget = try fm.destinationOfSymbolicLink(atPath: soulURL.path)
+        } catch {
+            soulTarget = nil
+        }
+        let soulOK = soulExists && soulTarget == nil
+        return "profile=\(homeOK && linkOK ? "就绪" : "异常")，workspace=\(workspaceOK ? "就绪" : "异常")，SOUL=\(soulOK ? "就绪" : "异常")"
+    }
+
     /// 写入 ownership/version 标记（幂等覆盖自家标记；内容不含隐私）。
     private static func writeOwnershipMarker(_ fm: FileManager) {
         let marker = realHome.appendingPathComponent(markerName)

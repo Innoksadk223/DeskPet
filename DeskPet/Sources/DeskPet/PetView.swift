@@ -19,6 +19,7 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedLaunch(_ view: PetView)
     func petViewRequestedAutoLaunchState(_ view: PetView) -> Bool   // 设置▸系统▸开机自启 勾选态
     func petViewRequestedRetry(_ view: PetView)
+    func petViewRequestedChooseHermesExecutable(_ view: PetView)
     // P1：持续聆听
     func petViewRequestedListenModeState(_ view: PetView) -> Bool
     func petViewRequestedToggleListenMode(_ view: PetView)
@@ -343,6 +344,7 @@ final class PetView: NSView {
             autoLaunch: #selector(launchToggle),
             listenToggle: #selector(listenToggle),
             retry: #selector(retryConnection),
+            hermesExecutable: #selector(chooseHermesExecutable),
             resetDefaults: #selector(resetDefaults),
             about: #selector(showAbout)
         )
@@ -439,6 +441,7 @@ final class PetView: NSView {
     }
 
     @objc private func retryConnection() { delegate?.petViewRequestedRetry(self) }
+    @objc private func chooseHermesExecutable() { delegate?.petViewRequestedChooseHermesExecutable(self) }
 
     @objc private func setWakePhrase() { delegate?.petViewRequestedSetWakePhrase(self) }
 

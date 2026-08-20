@@ -126,6 +126,7 @@ final class StatusItemController: NSObject {
             autoLaunch: #selector(AppDelegate.toggleAutoLaunch),
             listenToggle: #selector(AppDelegate.menuToggleListenMode),
             retry: #selector(AppDelegate.retryConnection),
+            hermesExecutable: #selector(AppDelegate.chooseHermesExecutable),
             resetDefaults: #selector(AppDelegate.resetDefaults),
             about: #selector(AppDelegate.showAbout)
         )

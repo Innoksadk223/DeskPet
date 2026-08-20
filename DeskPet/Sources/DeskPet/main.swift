@@ -38,6 +38,10 @@ if args.contains("--self-test-asr-seg") {
     // v8 ASR 分段合并回归：纯离线（SpeechSegmenter 纯值类型事件驱动）——不触碰音频设备/模型/网络
     exit(SpeechSelfTest.runSegmentationSelfTest())
 }
+if args.contains("--self-test-hermes-discovery") {
+    // P1：本机 Hermes 候选排序/过滤/空结果诊断——不启动 Hermes、不触碰用户安装。
+    exit(HermesSelfTest.runDiscoverySelfTest())
+}
 if args.contains("--self-test-hermes") || args.contains("--self-test-bridge") || args.contains("--self-test-router") || args.contains("--self-test-tts") || args.contains("--self-test-speech") || args.contains("--self-test-duoyun") || args.contains("--self-test-transcript") || args.contains("--self-test-edge") {
     if args.contains("--self-test-duoyun") {
         exit(DuoyunSpeechProvider.runSelfTest())

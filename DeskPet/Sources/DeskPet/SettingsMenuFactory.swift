@@ -29,6 +29,7 @@ enum SettingsMenuFactory {
         var autoLaunch: Selector          // 开机自启开关（菜单勾选态）
         var listenToggle: Selector        // 持续聆听开关（菜单勾选态）
         var retry: Selector
+        var hermesExecutable: Selector    // 本机 Hermes 可执行文件选择
         var resetDefaults: Selector        // P3-1：恢复默认设置
         var about: Selector               // 关于 DeskPet
     }
@@ -436,6 +437,59 @@ enum SettingsMenuFactory {
 
     private static func makeSystemMenu(target: AnyObject?, actions: Actions, data: Data) -> NSMenu {
         let menu = NSMenu()
+
+        // P1：当前 Hermes 来源只读诊断 + 适配状态（已找到+版本 / 未找到+可行动原因+候选数 /
+        // 多安装提示）——不把 token/profile 内容放进菜单或日志。
+        let hermesManager = ServeManager.shared
+        let discovered = hermesManager.hermesCandidates.isEmpty
+            ? HermesDiscovery.discover()
+            : hermesManager.hermesCandidates
+        let selectedPath = hermesManager.selectedHermesPath ?? discovered.first?.path
+        let selectedCandidate = discovered.first(where: { $0.path == selectedPath })
+        let statuses = HermesDiscovery.statuses(from: discovered)
+        let decision = HermesDiscovery.adaptationDecision(statuses)
+        let hermesEntryPath = "设置▸系统▸选择 Hermes 可执行文件…"   // 真实菜单条目（U5）
+        let hermesTitle: String
+        var hermesTip: String
+        if let selectedPath {
+            let version = hermesManager.selectedHermesVersion ?? "版本未探测"
+            hermesTitle = "Hermes：已找到（\(version)）"
+            hermesTip = "来源：\(selectedCandidate?.sourceName ?? "本机探测")\n路径：\(selectedPath)\n候选数：\(discovered.count)"
+            if discovered.count > 1 {
+                hermesTip += "\n⚠️ 检测到 \(discovered.count) 个 Hermes 安装，可在（\(hermesEntryPath)）中另选"
+            }
+        } else {
+            hermesTitle = "Hermes：未找到（候选数：\(discovered.count)）"
+            hermesTip = "\(decision.message)\n修复入口：\(decision.repairEntry ?? hermesEntryPath)"
+        }
+        let hermesStatus = NSMenuItem(title: hermesTitle, action: nil, keyEquivalent: "")
+        hermesStatus.isEnabled = false
+        hermesStatus.toolTip = hermesTip
+        menu.addItem(hermesStatus)
+        // 多安装提示（可视化，不需悬停）——不打扰、保留「选择 Hermes 可执行文件…」入口
+        if discovered.count > 1 {
+            let multiHint = NSMenuItem(
+                title: "⚠️ 检测到 \(discovered.count) 个 Hermes 安装（当前用首个，可在（\(hermesEntryPath)）另选）",
+                action: nil,
+                keyEquivalent: ""
+            )
+            multiHint.isEnabled = false
+            menu.addItem(multiHint)
+        }
+
+        let chooseHermes = NSMenuItem(title: "选择 Hermes 可执行文件…", action: actions.hermesExecutable, keyEquivalent: "")
+        chooseHermes.target = target
+        chooseHermes.toolTip = "多个 Hermes 安装时选择并记住本机可执行文件路径"
+        menu.addItem(chooseHermes)
+
+        let profileStatus = NSMenuItem(
+            title: "DeskPet profile：\(DeskPetHermesProfile.diagnosticSummary())",
+            action: nil,
+            keyEquivalent: ""
+        )
+        profileStatus.isEnabled = false
+        profileStatus.toolTip = "profile：\(DeskPetHermesProfile.realHome.path)\nworkspace：\(DeskPetHermesProfile.workspace.path)"
+        menu.addItem(profileStatus)
 
         // 开机自启（勾选态）
         let autoLaunchItem = NSMenuItem(title: "开机自启", action: actions.autoLaunch, keyEquivalent: "")

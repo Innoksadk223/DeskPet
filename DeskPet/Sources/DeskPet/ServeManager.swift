@@ -16,6 +16,10 @@ final class ServeManager {
     private var process: Process?
     /// C5：复用 serve 时无 Process 句柄——按端口反查的 PID（kill 兜底用；重启后置 nil）
     private var reusedPID: Int32?
+    /// 最近一次候选探测结果，供设置/诊断展示；不保存 token 或聊天内容。
+    private(set) var hermesCandidates: [HermesExecutableCandidate] = []
+    private(set) var selectedHermesPath: String?
+    private(set) var selectedHermesVersion: String?
 
     // MARK: - 长跑失效自愈（R3-1：serve 跑 9h 后 ws 挂——HTTP 活着 ws 坏，重启进程才恢复）
 
@@ -358,9 +362,16 @@ final class ServeManager {
 
     private func launch(token: String, port: Int) async throws -> Bool {
         // P1-03：launchd 下 PATH 为空——不用 /usr/bin/env hermes，探测绝对路径
-        guard let hermesPath = Self.resolveHermesPath() else {
-            LogManager.shared.error("serve 启动失败：未找到 hermes 可执行文件")
+        guard let hermesPath = resolveHermesPath() else {
             return false
+        }
+        // P1：复用 HermesDiscovery.probeVersion（async、2s 有界、取消感知；失败返回 nil 仅诊断、不误判可用性）
+        selectedHermesVersion = await HermesDiscovery.probeVersion(path: hermesPath)
+        if let version = selectedHermesVersion {
+            LogManager.shared.info("Hermes 版本探测：\(version)")
+        } else {
+            // --version 只是诊断信号；某些包装脚本不实现它，最终仍以 serve 握手与 profile contract 为准。
+            LogManager.shared.warn("Hermes --version 探测失败：\(hermesPath)；继续尝试 serve 握手验证")
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: hermesPath)
@@ -413,29 +424,46 @@ final class ServeManager {
     }
 
     func stop() {
+        let pid = reusedPID
         process?.terminate()
         process = nil
+        reusedPID = nil
+        // 复用分支没有 Process 句柄，但 token 握手已确认这是 DeskPet 自己的 serve；
+        // 切换可执行文件/退出时也要收掉它，避免旧进程抢先被新路径复用。
+        if let pid, kill(pid, SIGTERM) == 0 {
+            LogManager.shared.info("ServeManager: 已停止复用的 serve（pid \(pid)）")
+        }
     }
 
-    /// P1-03：探测 hermes 可执行文件绝对路径（launchd 环境 PATH 为空，固定候选优先）。
-    private static func resolveHermesPath() -> String? {
-        let home = NSHomeDirectory()
-        let candidates = [
-            home + "/.hermes/hermes-agent/venv/bin/hermes",
-            home + "/.local/bin/hermes",
-            "/usr/local/bin/hermes",
-            "/opt/homebrew/bin/hermes",
-        ]
-        if let hit = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            return hit
+    /// P1：探测 hermes 可执行文件绝对路径。顺序由 HermesDiscovery 统一维护：
+    /// 已保存路径 → PATH → 用户/包管理器路径 → ~/.hermes → 系统路径。
+    /// 接入 adaptationDecision 分类：无候选 → 明确错误日志 + 分类原因（不静默失败）；
+    /// 多候选 → 自动选第一个可用 + 记录来源 + 日志提示可在设置另选。
+    /// probeVersion 由 launch 复用（只诊断，不把 --version 失败误判为不可用）。
+    private func resolveHermesPath() -> String? {
+        let candidates = HermesDiscovery.discover()
+        hermesCandidates = candidates
+        let statuses = HermesDiscovery.statuses(from: candidates)
+        let decision = HermesDiscovery.adaptationDecision(statuses)
+        selectedHermesPath = decision.selectedPath
+        selectedHermesVersion = nil
+        switch decision.mode {
+        case .notInstalled:
+            // 无候选：明确错误日志 + 分类原因（不静默失败，也不伪造「已安装」）
+            LogManager.shared.error("serve 启动失败（Hermes 未安装）：\(decision.message)")
+            return nil
+        case .allFailed:
+            LogManager.shared.error("serve 启动失败（Hermes 候选均不可用）：\(decision.message)")
+            return nil
+        case .autoUse(let path, let source):
+            LogManager.shared.info("Hermes 可执行文件（唯一可用 → 自动使用）：\(path)（来源：\(HermesExecutableCandidate(path: "", source: source).sourceName)）")
+            return path
+        case .multiple(let selected, _):
+            // 多候选：自动选第一个可用并记录来源；日志提示可在设置另选（U5：指向真实条目）
+            let label = candidates.first(where: { $0.path == selected })?.sourceName ?? "本机探测"
+            LogManager.shared.warn("检测到 \(candidates.count) 个 Hermes 安装，当前自动使用（\(label)）：\(selected)。可在（设置▸系统▸选择 Hermes 可执行文件…）中另选。\(decision.message)")
+            return selected
         }
-        // PATH 兜底（正常终端环境）
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            for dir in path.split(separator: ":") where !dir.isEmpty {
-                let p = "\(dir)/hermes"
-                if FileManager.default.isExecutableFile(atPath: p) { return p }
-            }
-        }
-        return nil
     }
+
 }

@@ -38,6 +38,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let listeningCoordinator = ListeningCoordinator()
     /// U5：连接失败统一文案——气泡纯文本无按钮，给真实菜单路径（设置▸系统▸重新连接助手服务）
     private static let connectFailureText = "⚠️ 连不上助手服务——设置菜单「系统▸重新连接助手服务」可重试"
+    /// 真实菜单入口（U5：文案只指向真实存在的条目，避免误导）——选择与重连两个入口。
+    private static let hermesSelectEntry = "设置▸系统▸选择 Hermes 可执行文件…"
+    private static let hermesRetryEntry = "设置▸系统▸重新连接助手服务"
+
+    /// P1：启动适配引导（纯函数，可离线断言）。把 HermesDiscovery 的适配决策转成
+    /// 「新用户可见引导」文案：只对「未安装/全失败」给可行动文案——说清原因 + 指向真实菜单
+    /// 条目（选择 Hermes 可执行文件… / 重新连接助手服务）；正常（已找到/多安装自动接管）返回 nil 不打扰。
+    static func adaptationGuidanceText(for decision: HermesAdaptationDecision) -> String? {
+        switch decision.mode {
+        case .notInstalled:
+            return "🚫 检测到 Hermes 未安装（未找到任何本机安装）。请先安装 Hermes 后重启桌宠，或在（\(hermesSelectEntry)）手动指定路径；完成后到（\(hermesRetryEntry)）重试。"
+        case .allFailed:
+            return "🚫 本机 Hermes 候选均不可用（\(decision.message)）。请检查候选权限/安装完整性，或在（\(hermesSelectEntry)）指定可用路径；再到（\(hermesRetryEntry)）重试。"
+        case .autoUse, .multiple:
+            return nil
+        }
+    }
+
+    /// P1：启动适配检测——本地纯逻辑评估 + 可见引导（气泡+播报走 feedback 收口）。
+    /// 缺失/不可用 → 主动气泡+播报说清原因；已找到/多安装只记日志不打扰（多安装由
+    /// ServeManager 自动选首个可用）。不启动 serve、不联网、不触碰 Hermes 本体。
+    private func runStartupHermesGuidance() {
+        let decision = HermesDiscovery.adaptationDecision(HermesDiscovery.statuses(from: HermesDiscovery.discover()))
+        switch decision.mode {
+        case .notInstalled:
+            LogManager.shared.error("启动适配检测：Hermes 未安装（候选 0）")
+        case .allFailed:
+            LogManager.shared.error("启动适配检测：\(decision.message)")
+        case .autoUse(let path, let source):
+            LogManager.shared.info("启动适配检测：已找到唯一可用 Hermes（\(HermesExecutableCandidate(path: "", source: source).sourceName)）：\(path)")
+        case .multiple(let selected, let alternatives):
+            LogManager.shared.warn("启动适配检测：多 Hermes 安装，自动使用 \(selected)，可选项：\(alternatives.joined(separator: "、"))")
+        }
+        guard let text = Self.adaptationGuidanceText(for: decision) else { return }
+        feedback(text)
+    }
     /// C1：过渡气泡超时（persistent 过渡型气泡最长显示——被新气泡替换则提前结束；防卡死）
     private static let transitionBubbleTimeout: TimeInterval = 4
     /// fix-live-ux-details：任务启动等待气泡最长显示（8s 无首个活动才显示；60s 内被
@@ -160,6 +196,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // M1：Hermes 桥接初始化（异步，不阻塞 GUI）
+        // P1：启动前先做本地适配评估——缺失/不可用立即气泡+播报引导（说清原因，指向真实菜单入口）
+        runStartupHermesGuidance()
         initializeBridge()
 
         // P3-1：首启引导（一次性）——气泡显示核心用法，标记后不再弹
@@ -806,6 +844,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LogManager.shared.info("用户请求重试连接")
         feedback("🔄 正在重新连接助手服务…")
         initializeBridge(isUserRetry: true)
+    }
+
+    /// P1：选择本机 Hermes 可执行文件。只保存路径，不读取或记录 token/凭证。
+    @objc func chooseHermesExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Hermes 可执行文件"
+        panel.prompt = "选择"
+        panel.message = "请选择本机可执行的 hermes 文件；不要选择 Hermes 项目目录或配置文件。"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            guard FileManager.default.isExecutableFile(atPath: url.path) else {
+                self.feedback("⚠️ 选择的文件不可执行：\(url.path)")
+                return
+            }
+            UserDefaults.standard.set(url.standardizedFileURL.path, forKey: HermesDiscovery.configuredPathKey)
+            LogManager.shared.info("用户选择 Hermes 可执行文件：\(url.standardizedFileURL.path)")
+            ServeManager.shared.stop()
+            self.feedback("✅ 已记住 Hermes 路径，正在重新连接…")
+            // 给 TERM 一个短暂的端口释放窗口，避免旧 serve 抢在新路径前被复用。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.initializeBridge(isUserRetry: true)
+            }
+        }
     }
 
     // MARK: - 设置（todo #15/#16）
@@ -2427,6 +2491,7 @@ extension AppDelegate: PetViewDelegate {
     func petViewRequestedNewChat(_ view: PetView) { startNewConversation() }
     func petViewRequestedClearHistory(_ view: PetView) { clearChatHistory() }
     func petViewRequestedRetry(_ view: PetView) { retryConnection() }
+    func petViewRequestedChooseHermesExecutable(_ view: PetView) { chooseHermesExecutable() }
     func petViewRequestedMuteState(_ view: PetView) -> Bool { SpeechOutputManager.shared.isMuted }
     func petViewRequestedWakeState(_ view: PetView) -> Bool { wakeController?.isEnabled ?? false }
     /// F9：右键菜单唤醒状态文案（与菜单栏一致的三态）
