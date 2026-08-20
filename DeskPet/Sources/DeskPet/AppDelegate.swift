@@ -446,9 +446,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // spoken 过短（<30 字）时兜底念 formal 正文（Markdown 清洗后））
         // pm3 P1-2：回填/状态写回触发的报告降 low（不打断当前对话/不清队列——high 仅用户主动对话）
         bridge.onMainMessage = { [weak self] msg in
-            LogManager.shared.info("主回复 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isUserTurn=\(msg.isUserTurn)")
+            LogManager.shared.info("主回复 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isUserTurn=\(msg.isUserTurn) feedback=\(msg.feedback.map { "有(\($0.count)字)" } ?? "无")")
             DispatchQueue.main.async {
                 guard let self else { return }
+                // companion：任务归档 <ok/>+<feedback> 情绪收尾（主 Agent 以 persona 口吻生成）——
+                // 先于空回复保护处理：气泡 + 短播报（low 排队、不打断当前播报）。feedback 只收尾、
+                // 不转述任务结果（结果全文仍由任务 Agent 直报，此处不重复）；无 feedback 时与现状一致。
+                if let fb = msg.feedback, !fb.isEmpty {
+                    self.showBubble(fb)
+                    SpeechOutputManager.shared.speak(fb, priority: .low)
+                    return
+                }
                 // U1：空回复保护——formal/spoken 均空（trim 后）：不弹空气泡不播报（仅日志）；
                 // 用户命令路径给可见 fallback（不静默丢失）
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)

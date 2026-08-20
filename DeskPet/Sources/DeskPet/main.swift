@@ -26,6 +26,10 @@ if args.contains("--self-test-mimo") {
 if args.contains("--self-test-markers") {
     exit(HermesBridgeSelfTest.runMarkersSelfTest())
 }
+if args.contains("--self-test-companion") {
+    // 陪伴伙伴（活人感 MVP）纯离线自测：feedback 解析 / <ok/>+<feedback> 混合 / 迟到 ok+feedback 抑制 / 向后兼容
+    exit(HermesSelfTest.runCompanionSelfTest())
+}
 if args.contains("--self-test-history-storage") {
     // v5 历史存储隔离回归：纯离线（临时目录 + ObjC runtime 注入 HOME）——不连 serve、不触碰用户 home
     exit(HistoryStorageSelfTest.run())

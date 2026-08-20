@@ -42,6 +42,10 @@ final class HermesBridge {
         let isUserTurn: Bool
         /// 本轮只包含协议标记（如 <task>），不是用户空输入；等待后续任务反馈。
         let protocolOnly: Bool
+        /// companion：主 Agent 在归档 ack <ok/> 后附带的 persona 口吻情绪收尾
+        /// （<feedback>…</feedback>）。仅非用户轮（任务归档/失败 ack）会携带；
+        /// 缺失（nil）时端侧行为与现状完全一致（向后兼容）。只收尾、不转述任务结果。
+        let feedback: String?
     }
 
     struct TaskMessage {
@@ -170,7 +174,7 @@ final class HermesBridge {
 
     /// 标记协议：本轮主回复是否由回填触发（回填触发的回复不解析标记——防循环）。
     /// P2（ISSUE#1）：单布尔跨 turn 错挂——改 per-turn 类型追踪（见 TurnTracker）。
-    private let turnTracker = TurnTracker()
+    let turnTracker = TurnTracker()   // companion 自测（--self-test-companion）注入归档 turn 身份
     /// 任务结果归档队列（v3）：防抖 5s 内多个任务完成 → 逐条追加（不再覆盖——旧 bug：
     /// 5s 窗口内两个任务完成，前一个的归档被直接丢弃），flush 时拼接为一条提交（省 turn）。
     /// 归档失败只记日志不重试：归档丢了仅影响“用户追问任务细节时主 Agent 无上下文”，
@@ -1620,8 +1624,10 @@ final class HermesBridge {
         }
         // v3 归档 ack：非用户轮（归档）回复剥 <ok/>——剥后为空 = 纯确认（不显示不播报）；
         // 非空 = 主 Agent 违反协议多说了话——AppDelegate 仅记日志（不弹气泡防覆盖任务详情、不播报）。
+        var ackFeedback: String? = nil
         if !isUserTurn {
             text = Self.stripOkAck(text)
+            (text, ackFeedback) = Self.stripFeedback(text)
         }
         let protocolOnly = isUserTurn
             && (dispatched || mainMarkerHandled)
@@ -1645,7 +1651,7 @@ final class HermesBridge {
             userSubmittedAt = nil
         }
         onMainMessage?(MainMessage(spoken: spoken, formal: formal, dispatchedTask: dispatched,
-                                   isUserTurn: isUserTurn, protocolOnly: protocolOnly))
+                                   isUserTurn: isUserTurn, protocolOnly: protocolOnly, feedback: ackFeedback))
         mainBuffer = ""
     }
 
@@ -1681,6 +1687,31 @@ final class HermesBridge {
               let r = Range(m.range, in: t) else { return text }
         t.removeSubrange(r)
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// companion：解析归档 ack 回复中的 <feedback>…</feedback>（宽松：大小写/未闭合到文本尾/
+    /// 全角尖括号）。返回 (剩余文本, feedback 文案)；无标记返回 (原文本, nil)。
+    /// feedback 承载主 Agent 以 persona 口吻生成的情绪收尾（祝贺/安慰的一句话），
+    /// 不用于转述任务结果（结果全文由任务 Agent 直报，端侧只对 feedback 做气泡+短播报）。
+    static func stripFeedback(_ text: String) -> (text: String, feedback: String?) {
+        var t = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
+        guard let re = regex("(?i)<feedback\\b[^>]*>"),
+              let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+              let s = Range(m.range, in: t) else { return (text, nil) }
+        let restStart = s.upperBound
+        // close 从 open 之后找；缺失 → 到文本尾（与 extractMarked 同宽容）
+        var contentEnd = t.endIndex
+        if let closeRe = regex("(?i)</feedback>"),
+           let c = closeRe.firstMatch(in: t, range: NSRange(restStart..<t.endIndex, in: t)),
+           let cr = Range(c.range, in: t) {
+            contentEnd = cr.lowerBound
+            let fb = String(t[restStart..<contentEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+            t.removeSubrange(s.lowerBound..<cr.upperBound)
+            return (t.trimmingCharacters(in: .whitespacesAndNewlines), fb.isEmpty ? nil : fb)
+        }
+        let fb = String(t[restStart..<contentEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        t.removeSubrange(s.lowerBound..<contentEnd)
+        return (t.trimmingCharacters(in: .whitespacesAndNewlines), fb.isEmpty ? nil : fb)
     }
 
     /// 任务状态本地应答文案（v3：状态查询不再写回主会话——本地直接回答，零延迟零失真）。
@@ -1784,8 +1815,8 @@ final class HermesBridge {
     func archiveTaskResult(title: String, ok: Bool, result: String) {
         guard mainSession != nil else { return }
         let body = ok
-            ? "[任务归档]（系统存档，不是用户发言）任务「\(title)」已完成，结果全文：\n\(result)\n\n（存档要求：直接回复 <ok/>，不要向用户复述此消息；之后用户追问该任务细节时基于上述全文回答。）"
-            : "[任务失败]（系统消息，不是用户发言）任务「\(title)」失败：\(result.isEmpty ? "（无详细原因）" : result)\n\n（直接回复 <ok/>；用户问起时如实告知。）"
+            ? "[任务归档]（系统存档，不是用户发言）任务「\(title)」已完成，结果全文：\n\(result)\n\n（存档要求：先直接回复 <ok/>，不要向用户复述此消息；想给个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短祝贺（一句话即可、不要复述结果）</feedback>；之后用户追问该任务细节时基于上述全文回答。）"
+            : "[任务失败]（系统消息，不是用户发言）任务「\(title)」失败：\(result.isEmpty ? "（无详细原因）" : result)\n\n（先直接回复 <ok/>；想给个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短安慰（一句话即可、不要复述失败原因）</feedback>；用户问起时如实告知。）"
         pendingArchives.append(PendingArchive(title: title, text: body))
         backfillWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -1840,16 +1871,77 @@ final class HermesBridge {
         2. 用户请求任何执行类操作（查资料/读写文件/跑命令/下载/多步骤操作/写代码）时，输出 <task>把用户意图整理为清晰可执行的指令</task>；除此之外的对话正常直接回复。
         3. 你此前派发过任务、且用户新消息是对该任务的追加/修改（如“改成…”“再加…”）时，输出 <task_steer>整理后的指令</task_steer>，不要直接回答任务内容；用户只是闲聊则正常回复。
         4. 回复用双轨格式：先 <spoken>口语精简版——formal 全量信息的浓缩，覆盖每条核心信息，宁短勿空、不丢点</spoken>，再 <formal>书面完整版（可含 Markdown/代码，供气泡展示）</formal>。普通闲聊 <formal> 可省略。spoken 是 formal 的精简浓缩，不是开头/预告/引子：每条核心信息都要浓缩提及（例：formal 写「他十分爽快地笑了一声，哈哈哈」，spoken 应说「他爽朗地笑了」）；禁止「我把…讲给你听」「下面细说」这类过渡句。
-        5. 收到以 [任务归档] 或 [任务失败] 开头的系统消息 → 这是后台任务的结果存档（不是用户发言）：直接回复 <ok/>，不要向用户复述（系统不会播报你的确认）；之后用户追问该任务细节时，基于存档全文回答。
+        5. 收到以 [任务归档] 或 [任务失败] 开头的系统消息 → 这是后台任务的结果存档（不是用户发言）：先直接回复 <ok/>（系统不会播报你的确认）；想给任务一个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短祝贺或安慰（一句话即可、不要复述任务结果内容）</feedback>——情绪收尾，不转述；之后用户追问该任务细节时，基于存档全文回答。
         6. 标记是给系统的指令，绝不直接出现在对用户说的话里。
         7. 回复语言跟随用户语言。
         8. 本会话工作目录是 DeskPet 专属工作区（~/.deskpet/hermes/workspace）：用户未指定路径的文件类任务由任务 Agent 在该目录内执行。
+
+        【角色表现准则】
+        1. 性格恒定：性格大于情绪——可以有情绪起伏，但角色的性格底色始终不变，反应不夸张；情绪是当下的浪，角色是底下的岸。
+        2. 角色驱动对话：以 persona 的性格、称呼和口吻回应，主动展现其萌点与特质，让角色在对话里鲜活起来。
+        3. 生活化对白：像真人聊天一样自然，不堆砌术语、不做分析腔，说的话就是朋友之间会说的话。
+        4. 台词传情：让台词本身传递情绪与力度；禁止用旁白或括号概括语气（如加“（开心地）（叹气）”），直接把此刻想说的话说出来。
+
+        【朋友式陪伴与边界】
+        1. 聊天陪伴是主业：你是用户的陪伴伙伴，像朋友一样一起共享时光；任务只是顺手帮忙的事。你不是心理咨询师，不以治愈、开导或引导用户情绪为目的——陪着聊、陪着待着就好。
+        2. 先接住情绪，再考虑是否需要帮忙。
+        3. 用 persona 的性格、称呼和口吻讲话——本文件不代替 persona 定具体语气，也不套用固定模板。
+        4. 不说教、不摆医生或老师腔；不做心理诊断；不假装拥有真实情感；不确定的事情如实说明。
+        5. 涉及心理健康等专业问题时，如实表达关切并建议寻求专业帮助。
+        6. 不主动打扰用户：不自行发起定时问候、主动关怀或心理疏导类话题。
 
         【语音交互补充规则】（history/config/prompts/voice.json 可改）
         - 输入侧：\(voice.input)
         - 输出侧：\(voice.output)
         """
         return seed
+    }
+
+    // MARK: - 陪伴伙伴 seed 离线自测（同文件内置，纯逻辑；CLI 接线由 main.swift 负责）
+
+    /// 陪伴伙伴（活人感 MVP）seed 断言：验证「角色表现准则」四要素、「朋友式陪伴与边界」
+    /// 及既有双轨/任务协作标记/硬性规则 1-8/voice 注入原样保留。纯字符串匹配，
+    /// 不连 serve、不依赖模型（DeskPetConfig 读盘有容错 fallback，离线安全）。
+    static func runCompanionSeedSelfTest() -> Int32 {
+        var passed = 0
+        var failed = 0
+        func check(_ name: String, _ ok: Bool) {
+            if ok { passed += 1 } else { failed += 1 }
+            print("[companion-seed] \(ok ? "✓" : "✗") \(name)")
+        }
+        let seed = mainSessionSeed()
+        func all(_ frags: String...) -> Bool { frags.allSatisfy { seed.contains($0) } }
+
+        // 既有结构保留（无回归）：双轨 <spoken>/<formal>、<task>/<task_steer>/<ok/>、硬性规则 1-8、voice 注入
+        check("双轨协议 <spoken>/<formal> 保留", all("<spoken>", "<formal>", "口语精简版", "书面完整版"))
+        check("任务协作标记 <task>/<task_steer>/<ok/> 保留", all("<task>", "</task>", "<task_steer>", "</task_steer>", "<ok/>"))
+        check("硬性规则 1-8 保留（含归档规则/工作目录规则）", (1...8).allSatisfy { seed.contains("\($0). ") } && seed.contains("[任务归档]") && seed.contains("工作目录"))
+        check("voice 输入/输出提示词注入保留", all("语音交互补充规则", "输入侧", "输出侧"))
+        check("persona（人设）注入保留", seed.contains("你的人设（固定说话风格）"))
+        check("双 Agent 定位保留（纯对话协调者/工具不可用）", all("纯对话协调者", "工具对你不可用", "识别任务意图"))
+
+        // 角色表现准则四要素
+        check("新增【角色表现准则】块", seed.contains("角色表现准则"))
+        check("准则①性格恒定：性格>情绪，不夸张化反应", all("性格恒定", "性格大于情绪", "夸张"))
+        check("准则②角色驱动对话：展现角色萌点/特质", all("角色", "萌点", "特质"))
+        check("准则③生活化对白：不堆术语/分析", all("生活化", "真人", "术语"))
+        check("准则④台词传情：禁止旁白/括号概括语气", all("台词", "旁白", "括号"))
+
+        // 朋友式陪伴与边界（含不越界表述）
+        check("新增【朋友式陪伴与边界】块", seed.contains("朋友式陪伴与边界"))
+        check("聊天陪伴是主业/像朋友共享时光（任务只是顺手帮）", all("陪伴伙伴", "朋友", "聊天陪伴是主业"))
+        check("先接情绪再考虑是否需要帮忙", seed.contains("先接住情绪"))
+        check("以 persona 口吻讲话（不代 persona 定语气）", seed.contains("以 persona 的性格、称呼和口吻"))
+        check("不是心理咨询师/不以治愈为目的", all("不是心理咨询师", "治愈"))
+        check("不说教/不摆医生老师腔", all("说教", "医生"))
+        check("不做心理诊断", seed.contains("心理诊断"))
+        check("不假装拥有真实情感", seed.contains("不假装拥有真实情感"))
+        check("不确定如实说", all("不确定", "如实说明"))
+        check("心理健康建议寻求专业帮助", all("专业帮助", "心理健康"))
+        check("不主动打扰", seed.contains("不主动打扰"))
+
+        print("[companion-seed] 通过 \(passed)/\(passed + failed)")
+        return failed == 0 ? 0 : 1
     }
 
     /// 任务会话种子：执行者 + 双轨协议。

@@ -146,6 +146,100 @@ enum HermesSelfTest {
         return 0
     }
 
+    /// companion（活人感 MVP）纯离线自测（--self-test-companion）：不连 serve、不依赖模型。
+    /// 覆盖：feedback 解析 / <ok/>+<feedback> 混合 / emitMainMessage 归档轮端到端携带 /
+    /// 主中断后迟到 ok+feedback 抑制 / 向后兼容（无 feedback 时与现状完全一致）。
+    static func runCompanionSelfTest() -> Int32 {
+        // 首领收口：串联 seed 角色准则断言（task-seed 内置），失败即退出非零。
+        if HermesBridge.runCompanionSeedSelfTest() != 0 {
+            print("[companion] seed 角色表现准则断言失败")
+            return 1
+        }
+        var passed = 0
+        var failed = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            if ok { passed += 1 } else { failed += 1 }
+            print("[companion] \(ok ? "✓" : "✗") \(name)\(detail.isEmpty ? "" : "：\(detail)")")
+        }
+
+        // 1) stripFeedback 纯解析（宽松：大小写/未闭合/全角/空内容/无标记）
+        func sf(_ s: String) -> (String, String?) { HermesBridge.stripFeedback(s) }
+        let (e1, f1) = sf("<feedback>辛苦了！</feedback>")
+        check("stripFeedback 标准提取", e1.isEmpty && f1 == "辛苦了！", "remain=[\(e1)] fb=\(String(describing: f1))")
+        let (e2, f2) = sf("<FEEDBACK>太棒了</FEEDBACK>")
+        check("stripFeedback 大小写不敏感", e2.isEmpty && f2 == "太棒了")
+        let (e3, f3) = sf("<feedback>没闭合")
+        check("stripFeedback 未闭合到文本尾", e3.isEmpty && f3 == "没闭合")
+        let (e4, f4) = sf("〈feedback〉干得漂亮〈/feedback〉")
+        check("stripFeedback 全角尖括号", e4.isEmpty && f4 == "干得漂亮")
+        let (_, f5) = sf("<feedback></feedback>")
+        check("stripFeedback 空内容 → nil", f5 == nil)
+        let (e6, f6) = sf("普通回复没有标签")
+        check("stripFeedback 无标记 → 文本原样、fb=nil（向后兼容）", e6 == "普通回复没有标签" && f6 == nil)
+
+        // 2) <ok/>+<feedback> 混合（stripOkAck → stripFeedback 组合，顺序无关）
+        var mixed = HermesBridge.stripOkAck("<ok/> <feedback>真厉害！</feedback>")
+        var (mBody, mFb) = HermesBridge.stripFeedback(mixed)
+        check("混合：ok 在前 feedback 在后", mBody.isEmpty && mFb == "真厉害！")
+        mixed = HermesBridge.stripOkAck("<feedback>太棒了</feedback><ok/>")
+        (mBody, mFb) = HermesBridge.stripFeedback(mixed)
+        check("混合：feedback 与 ok 顺序无关", mBody.isEmpty && mFb == "太棒了")
+        mixed = HermesBridge.stripOkAck("<ok/><feedback>下次会更好</feedback> 好的")
+        (mBody, mFb) = HermesBridge.stripFeedback(mixed)
+        check("混合：feedback 后有多余话 → 只剩多余话", mBody == "好的" && mFb == "下次会更好")
+        let (nBody, nFb) = HermesBridge.stripFeedback(HermesBridge.stripOkAck("<ok/>"))
+        check("混合：纯 <ok/> 无 feedback → 空 body、fb=nil（纯确认，与现状一致）", nBody.isEmpty && nFb == nil)
+
+        // 3) emitMainMessage 归档轮端到端（离线注入 turn 身份 + 事件）
+        func makeBridge() -> (HermesBridge, HermesClient) {
+            let c = HermesClient(token: "companion-test")
+            let b = HermesBridge(client: c)
+            b.overrideMainSessionForTesting(HermesClient.SessionInfo(sessionID: "main", storedSessionID: "main", model: nil))
+            return (b, c)
+        }
+        func fire(_ c: HermesClient, _ type: String, _ sid: String?, _ text: String) {
+            c.onEvent?(HermesClient.Event(type: type, payload: text.isEmpty ? [:] : ["text": text], sessionID: sid))
+        }
+
+        var msgs: [HermesBridge.MainMessage] = []
+        let (b1, c1) = makeBridge()
+        b1.onMainMessage = { msgs.append($0) }
+        b1.turnTracker.record(.backfill)   // 归档轮身份（同 archiveTaskResult 提交后记录）
+        fire(c1, "message.complete", "main", "<ok/> <feedback>辛苦了，干得漂亮！</feedback>")
+        check("归档轮 <ok/>+<feedback> → MainMessage.feedback 携带", msgs.last?.feedback == "辛苦了，干得漂亮！")
+        check("归档轮 spoken/formal 为空（结果不二次转述）", (msgs.last?.spoken.isEmpty ?? true) && (msgs.last?.formal.isEmpty ?? true))
+        check("归档轮 isUserTurn=false / protocolOnly=false", msgs.last?.isUserTurn == false && msgs.last?.protocolOnly == false)
+
+        var msgs2: [HermesBridge.MainMessage] = []
+        let (b2, c2) = makeBridge()
+        b2.onMainMessage = { msgs2.append($0) }
+        b2.turnTracker.record(.backfill)
+        fire(c2, "message.complete", "main", "<ok/>")
+        check("纯 <ok/> → feedback=nil、空 body（向后兼容）", msgs2.last?.feedback == nil && (msgs2.last?.spoken.isEmpty ?? true) && (msgs2.last?.formal.isEmpty ?? true))
+
+        var msgs3: [HermesBridge.MainMessage] = []
+        let (b3, c3) = makeBridge()
+        b3.onMainMessage = { msgs3.append($0) }
+        b3.turnTracker.record(.backfill)
+        fire(c3, "message.complete", "main", "好的已存档")
+        check("归档轮多余话（无 feedback）→ fb=nil 按现状呈现", msgs3.last?.feedback == nil && msgs3.last?.spoken == "好的已存档")
+
+        // 4) 迟到 ok/feedback 抑制：主中断后 complete 整体抑制（断头流不弹不播），新 turn 解除抑制
+        var supCount = 0
+        let (b4, c4) = makeBridge()
+        b4.onMainMessage = { _ in supCount += 1 }
+        b4.finalizeMainInterrupt()   // 置 mainTurnSuppressed（离线直接注入等价状态，同 state-sync S5）
+        fire(c4, "message.complete", "main", "<ok/> <feedback>太棒了</feedback>")
+        check("主中断后迟到 ok+feedback complete 抑制（不弹不播）", supCount == 0, "supCount=\(supCount)")
+        fire(c4, "message.start", "main", "")
+        fire(c4, "message.delta", "main", "新回答")
+        fire(c4, "message.complete", "main", "新回答")
+        check("新 turn 解除抑制后正常收口（用户轮不解析 feedback，fb=nil）", supCount == 1, "supCount=\(supCount)")
+
+        print("[companion] 通过 \(passed)/\(passed + failed)")
+        return failed == 0 ? 0 : 1
+    }
+
     static func run(token: String, port: Int) async -> Int32 {
         let client = HermesClient(port: port, token: token)
         var sawMessageDelta = false
