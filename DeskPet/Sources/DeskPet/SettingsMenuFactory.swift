@@ -11,7 +11,10 @@ enum SettingsMenuFactory {
         var duoyunSettings: Selector
         var duoyunVoice: Selector          // NSMenuItem 动作（representedObject = 声线 id）
         var duoyunCustomVoice: Selector
-        var mimoVoice: Selector             // MiMo 声线（预置音色；design/clone 模式下不生效——tooltip 说明）
+        var mimoVoice: Selector             // MiMo 声线（预置音色列表项——preset 模式展示）
+        var mimoMode: Selector              // MiMo 声线模式单选（representedObject = 模式 id：preset/design/clone）
+        var mimoDesignPrompt: Selector      // 设计音色描述编辑（design 模式入口）
+        var mimoClonePath: Selector         // 克隆样本路径编辑（clone 模式入口）
         var mimoSettings: Selector          // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
         var edgeVoice: Selector            // NSMenuItem 动作（representedObject = Edge 声线 id）
         var voiceServices: Selector        // 语音服务管理（清单展示）
@@ -40,6 +43,9 @@ enum SettingsMenuFactory {
         var duoyunKeyOK: Bool
         var mimoVoices: [(id: String, name: String, isCurrent: Bool)]
         var mimoKeyOK: Bool
+        var mimoMode: String                // 当前 MiMo 声线模式（preset/design/clone——顶部单选勾选）
+        var mimoDesignPrompt: String        // 设计音色描述当前值（design 分支 tooltip 用；空=未填写）
+        var mimoClonePath: String           // 克隆样本路径当前值（clone 分支 tooltip 用；空=未配置）
         var edgeVoices: [(id: String, name: String, isCurrent: Bool)]
         var edgeAvailable: Bool
         var asrProvider: String          // 当前识别来源（local/duoyun/mimo）
@@ -213,22 +219,59 @@ enum SettingsMenuFactory {
             menu.addItem(duoyunVoicesItem)
         }
 
-        // MiMo 声线（2026-08-16：与豆包声线同款入口——只在清单含 mimo 时显示；
-        // 无 key 置灰；preset 模式生效，design/clone 模式音色来自配置文件——tooltip 说明）
+        // MiMo 声线（2026-08-16：preset/design/clone 三模式热切换面板——顶部三模式单选，
+        // 分隔线后按 data.mimoMode 动态分支；仅清单含 mimo 时显示；无 key 置灰）
         if manifestIDs.contains("mimo") {
             let keyOK = data.mimoKeyOK
             let mimoVoicesItem = NSMenuItem(title: "MiMo 声线", action: nil, keyEquivalent: "")
             mimoVoicesItem.isEnabled = keyOK
             mimoVoicesItem.toolTip = keyOK
-                ? "MiMo 语音的预置音色（preset 模式生效；设计/克隆音色见 MiMo音色指南.md）"
+                ? "MiMo 声线：预置/设计/克隆三模式热切换——design=文字描述生成音色，clone=样本克隆音色（见 MiMo音色指南.md）"
                 : "先配置 MiMo API Key（MiMo 语音设置…）"
             let mvMenu = NSMenu()
-            for mv in data.mimoVoices {
-                let item = NSMenuItem(title: mv.name, action: actions.mimoVoice, keyEquivalent: "")
+
+            // ① 顶部三模式单选（当前模式勾选——data.mimoMode；点击 action=mimoMode 立即热切换）
+            let modes: [(id: String, name: String, tip: String)] = [
+                ("preset", "预置音色", "MiMo 官方预置音色清单"),
+                ("design", "设计音色", "用文字描述生成专属音色（来源见 MiMo音色指南.md）"),
+                ("clone", "克隆音色", "用 10-20s 干净人声样本克隆音色（来源见 MiMo音色指南.md）"),
+            ]
+            for m in modes {
+                let item = NSMenuItem(title: m.name, action: actions.mimoMode, keyEquivalent: "")
                 item.target = target
-                item.representedObject = mv.id
-                item.state = mv.isCurrent ? .on : .off
+                item.representedObject = m.id
+                item.state = (data.mimoMode == m.id) ? .on : .off
+                item.toolTip = m.tip
                 mvMenu.addItem(item)
+            }
+
+            // ② 分隔线后按当前模式动态分支（preset→预置列表；design→描述编辑；clone→路径编辑）
+            mvMenu.addItem(.separator())
+            if data.mimoMode == "design" {
+                let prompt = data.mimoDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let designItem = NSMenuItem(title: "设计音色描述…", action: actions.mimoDesignPrompt, keyEquivalent: "")
+                designItem.target = target
+                designItem.toolTip = prompt.isEmpty
+                    ? "未填写——design 模式需先填写描述才能发声"
+                    : "当前描述：\(prompt)"
+                mvMenu.addItem(designItem)
+            } else if data.mimoMode == "clone" {
+                let path = data.mimoClonePath.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cloneItem = NSMenuItem(title: "克隆样本文件夹…", action: actions.mimoClonePath, keyEquivalent: "")
+                cloneItem.target = target
+                cloneItem.toolTip = path.isEmpty
+                    ? "未配置——点击打开样本文件夹，把 10-20s 干净人声 mp3 复制进去即可"
+                    : "当前样本：\(path)"
+                mvMenu.addItem(cloneItem)
+            } else {
+                // preset：官方预置音色列表（现有行为）
+                for mv in data.mimoVoices {
+                    let item = NSMenuItem(title: mv.name, action: actions.mimoVoice, keyEquivalent: "")
+                    item.target = target
+                    item.representedObject = mv.id
+                    item.state = mv.isCurrent ? .on : .off
+                    mvMenu.addItem(item)
+                }
             }
             mimoVoicesItem.submenu = mvMenu
             menu.addItem(mimoVoicesItem)

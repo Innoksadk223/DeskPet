@@ -42,6 +42,13 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedDuoyunSettings(_ view: PetView)
     /// MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
     func petViewRequestedMiMoSettings(_ view: PetView)
+    // MiMo 声线三模式热切换（preset/design/clone）：只读数据源 + 动作转发
+    func petViewRequestedMiMoMode(_ view: PetView) -> String
+    func petViewRequestedMiMoDesignPromptText(_ view: PetView) -> String
+    func petViewRequestedMiMoClonePathText(_ view: PetView) -> String
+    func petViewRequestedSetMiMoMode(_ view: PetView, modeID: String)
+    func petViewRequestedEditMiMoDesignPrompt(_ view: PetView)
+    func petViewRequestedEditMiMoClonePath(_ view: PetView)
     func petViewRequestedEdgeVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)]
     func petViewRequestedEdgeAvailable(_ view: PetView) -> Bool
     func petViewRequestedSetEdgeVoice(_ view: PetView, voiceID: String)
@@ -70,7 +77,7 @@ protocol PetViewDelegate: AnyObject {
 }
 
 /// 桌宠渲染视图：Petdex 帧动画 + 左键拖拽 + 右键菜单。
-/// 动画：Timer 按 LOOP_MS / FRAMES_PER_STATE 从预裁剪帧切换 layer.contents。
+/// 动画：Timer 按 LOOP_MS / 当前状态已加载帧数从预裁剪帧切换 layer.contents。
 /// 拖拽：mouseDown/mouseDragged 直接改窗口 frame 原点（不抢焦点）。
 final class PetView: NSView {
     weak var delegate: PetViewDelegate?
@@ -112,22 +119,10 @@ final class PetView: NSView {
 
     func startAnimation() {
         stopAnimation()
+        frameIndex = 0
         showFrame(0)
         lastFrameDate = Date()
-        let interval = PetSpec.loopMS / Double(PetSpec.framesPerState) / 1000.0 // ≈183ms/帧
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self, let frames = self.sprite.frames[self.state], !frames.isEmpty else { return }
-            // 时间戳锚点追帧：休眠恢复/run loop 繁忙时按流逝时间推进，避免长期漂移
-            let now = Date()
-            let elapsedFrames = Int(now.timeIntervalSince(self.lastFrameDate) / interval)
-            if elapsedFrames > 0 {
-                self.lastFrameDate = now
-                self.showFrame((self.frameIndex + elapsedFrames) % frames.count)
-            }
-        }
-        // .common 模式：拖拽（event tracking）期间动画不暂停
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        scheduleAnimationTimer()
     }
 
     func stopAnimation() {
@@ -135,10 +130,41 @@ final class PetView: NSView {
         timer = nil
     }
 
-    /// 切换状态：重置帧序列，160ms 淡入（尊重 reduced-motion）。
+    /// 当前状态按实际已加载帧数均匀分配完整循环时长。
+    private func animationInterval(for state: PetState) -> TimeInterval {
+        let frameCount = sprite.frames[state]?.count ?? 0
+        guard frameCount > 0 else {
+            return PetSpec.loopMS / Double(PetSpec.framesPerState) / 1000.0
+        }
+        return PetSpec.loopMS / Double(frameCount) / 1000.0
+    }
+
+    /// .common 模式下安排当前状态的计时器，拖拽期间动画不暂停。
+    private func scheduleAnimationTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: animationInterval(for: state), repeats: true) { [weak self] _ in
+            guard let self, let frames = self.sprite.frames[self.state], !frames.isEmpty else { return }
+            // 时间戳锚点追帧：休眠恢复/run loop 繁忙时按流逝时间推进，避免长期漂移。
+            let now = Date()
+            let interval = self.animationInterval(for: self.state)
+            let elapsedFrames = Int(now.timeIntervalSince(self.lastFrameDate) / interval)
+            if elapsedFrames > 0 {
+                self.lastFrameDate = now
+                self.showFrame((self.frameIndex + elapsedFrames) % frames.count)
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    /// 切换状态：重置帧序列与时间锚点，160ms 淡入（尊重 reduced-motion）。
     func setState(_ newState: PetState, animated: Bool = true) {
+        let wasAnimating = timer != nil
         state = newState
+        frameIndex = 0
+        lastFrameDate = Date()
         showFrame(0)
+        if wasAnimating { scheduleAnimationTimer() }
         if animated && !reduceMotion { fadeIn() }
     }
 
@@ -300,6 +326,9 @@ final class PetView: NSView {
             duoyunVoice: #selector(selectDuoyunVoice(_:)),
             duoyunCustomVoice: #selector(customDuoyunVoice),
             mimoVoice: #selector(selectMiMoVoice(_:)),
+            mimoMode: #selector(selectMiMoMode(_:)),
+            mimoDesignPrompt: #selector(editMiMoDesignPrompt),
+            mimoClonePath: #selector(editMiMoClonePath),
             mimoSettings: #selector(mimoSettings),
             edgeVoice: #selector(selectEdgeVoice(_:)),
             voiceServices: #selector(voiceServices),
@@ -326,6 +355,9 @@ final class PetView: NSView {
             duoyunKeyOK: delegate?.petViewRequestedDuoyunKeyConfigured(self) ?? false,
             mimoVoices: delegate?.petViewRequestedMiMoVoices(self) ?? [],
             mimoKeyOK: delegate?.petViewRequestedMiMoKeyConfigured(self) ?? false,
+            mimoMode: delegate?.petViewRequestedMiMoMode(self) ?? "preset",
+            mimoDesignPrompt: delegate?.petViewRequestedMiMoDesignPromptText(self) ?? "",
+            mimoClonePath: delegate?.petViewRequestedMiMoClonePathText(self) ?? "",
             edgeVoices: delegate?.petViewRequestedEdgeVoices(self) ?? [],
             edgeAvailable: delegate?.petViewRequestedEdgeAvailable(self) ?? false,
             asrProvider: delegate?.petViewRequestedASRProvider(self) ?? "local",
@@ -442,6 +474,16 @@ final class PetView: NSView {
         guard let id = sender.representedObject as? String else { return }
         delegate?.petViewRequestedSetMiMoVoice(self, voice: id)
     }
+
+    /// MiMo 声线模式单选（preset/design/clone——representedObject = 模式 id）
+    @objc private func selectMiMoMode(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        delegate?.petViewRequestedSetMiMoMode(self, modeID: id)
+    }
+
+    @objc private func editMiMoDesignPrompt() { delegate?.petViewRequestedEditMiMoDesignPrompt(self) }
+
+    @objc private func editMiMoClonePath() { delegate?.petViewRequestedEditMiMoClonePath(self) }
 
     @objc private func customDuoyunVoice() { delegate?.petViewRequestedCustomDuoyunVoice(self) }
 

@@ -377,6 +377,7 @@ struct DeskPetConfig: Codable {
         case "cache-capy": return "卡皮巴拉"
         case "xiaolemi": return "小蕾米"
         case "momonga": return "卖萌小可爱（Momonga）"
+        case "whale-girl": return "鲸鱼娘"
         default: return id
         }
     }

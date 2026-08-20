@@ -1409,6 +1409,155 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         feedback("✅ 已切换 MiMo 声线：\(name)\(suffix)")
     }
 
+    // MARK: MiMo 声线模式（2026-08-16：preset/design/clone 三模式热切换）
+
+    /// 当前 MiMo 声线模式（菜单顶部单选勾选用；未知值按 preset）。
+    func mimoModeCurrent() -> String {
+        let mode = DeskPetConfig.load().mimoTTSMode
+        return (mode == "design" || mode == "clone") ? mode : "preset"
+    }
+
+    /// 当前设计音色描述（design 分支 tooltip 用；空 = 未填写）。
+    func mimoDesignPromptText() -> String {
+        DeskPetConfig.load().mimoVoiceDesignPrompt
+    }
+
+    /// 当前克隆样本路径（clone 分支 tooltip 用；空 = 未配置）。
+    func mimoClonePathText() -> String {
+        DeskPetConfig.load().mimoVoiceClonePath
+    }
+
+    /// 克隆样本路径可读性：非空 + 存在 + 常规文件 + 可读。空/目录/无权限均 false。
+    private func cloneSampleReadable(_ path: String) -> Bool {
+        let p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !p.isEmpty else { return false }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue else { return false }
+        return FileManager.default.isReadableFile(atPath: p)
+    }
+
+    /// 切换 MiMo 声线模式（菜单栏入口）：校验 id → 与当前不同 → 改 mimoTTSMode →
+    /// save() → rebuild()（内部 refreshConfig 清缓存）→ 气泡反馈（立即生效）；
+    /// design 描述为空 / clone 样本不可读时附加提示。
+    @objc func menuSelectMiMoMode(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectMiMoMode(id)
+    }
+
+    private func selectMiMoMode(_ id: String) {
+        guard id == "preset" || id == "design" || id == "clone" else { return }
+        var cfg = DeskPetConfig.load()
+        guard cfg.mimoTTSMode != id else { return }
+        cfg.mimoTTSMode = id
+        guard cfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()   // 热切换立即生效（内部 refreshConfig 清缓存）
+        let names: [String: String] = ["preset": "预置音色", "design": "设计音色", "clone": "克隆音色"]
+        let name = names[id] ?? id
+        LogManager.shared.info("MiMo 声线模式已切换：\(name)（\(id)）")
+        let cfgAfter = DeskPetConfig.load()
+        var note = ""
+        if id == "design", cfgAfter.mimoVoiceDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            note = "；⚠️ 设计音色描述未填写——点「设计音色描述…」填写后才能发声"
+        } else if id == "clone", !cloneSampleReadable(cfgAfter.mimoVoiceClonePath) {
+            note = "；⚠️ 样本未就绪（文件夹里还没有 mp3）——点「克隆样本文件夹…」打开文件夹放入 10-20s 干净人声"
+        }
+        feedback("✅ 已切换 MiMo 声线模式：\(name)（立即生效）\(note)")
+    }
+
+    /// 设计音色描述编辑（design 模式入口）：多行输入预填当前描述 → 保存写
+    /// mimoVoiceDesignPrompt + save + rebuild + 反馈；「测试发声」= 临时保存成功后 testMiMoVoice()。
+    @objc func menuEditMiMoDesignPrompt() {
+        let current = DeskPetConfig.load().mimoVoiceDesignPrompt
+        let currentText = current.isEmpty ? "未填写" : current
+        let a = alert("设计音色描述",
+                      "用文字描述你想要的音色——design 模式由此生成专属音色，如：\n「沉稳的男声，语速适中，像纪录片旁白」\n\n（当前：\(currentText)）",
+                      buttons: ["保存", "取消", "测试发声"])
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 84))
+        field.stringValue = current
+        field.placeholderString = "例如：沉稳的男声，语速适中，像纪录片旁白"
+        field.setAccessibilityLabel("设计音色描述")
+        field.cell?.wraps = true
+        field.cell?.isScrollable = false
+        field.usesSingleLineMode = false
+        field.maximumNumberOfLines = 0
+        a.accessoryView = field
+        a.window.initialFirstResponder = field
+        let resp = a.runModal()
+        guard resp != .alertSecondButtonReturn else { return }   // 取消
+        let prompt = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch resp {
+        case .alertFirstButtonReturn:   // 保存
+            guard !prompt.isEmpty else {
+                feedback("⚠️ 设计音色描述不能为空（design 模式需要描述才能发声）")
+                return
+            }
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoVoiceDesignPrompt = prompt
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return
+            }
+            SpeechOutputManager.shared.rebuild()
+            LogManager.shared.info("设计音色描述已保存：\(String(prompt.prefix(40)))…")
+            feedback("✅ 设计音色描述已保存（design 模式现在可以发声了）")
+        default:   // 测试发声：临时保存成功后测试
+            guard !prompt.isEmpty else {
+                feedback("⚠️ 请先填写设计音色描述再测试")
+                return
+            }
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoVoiceDesignPrompt = prompt
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return
+            }
+            SpeechOutputManager.shared.rebuild()
+            testMiMoVoice()
+        }
+    }
+
+    /// 克隆样本文件夹（固定位置：Application Support/DeskPet/mimo-samples/——
+    /// App 自己的数据目录，与源码/安装版路径无关，用户可直观在 Finder 找到）。
+    private func mimoSamplesDir() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("DeskPet/mimo-samples", isDirectory: true)
+    }
+
+    /// 克隆样本编辑（clone 模式入口）：打开固定样本文件夹，用户把 mp3 复制进去即可。
+    /// 目录内已有 mp3 → 自动采用最新一个并保存生效；无 → 提示放好后再次点击。
+    @objc func menuEditMiMoClonePath() {
+        let dir = mimoSamplesDir()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)   // Finder 打开样本文件夹
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let mp3s = files
+            .filter { $0.pathExtension.lowercased() == "mp3" }
+            .sorted { lhs, rhs in
+                let lt = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rt = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lt > rt
+            }
+        guard let sample = mp3s.first else {
+            LogManager.shared.info("克隆样本文件夹已打开（空）：\(dir.path)")
+            feedback("📂 已打开样本文件夹：\(dir.path)\n请把 10-20s 干净人声 mp3 复制进去，放好后再次点击「克隆样本文件夹…」")
+            return
+        }
+        var newCfg = DeskPetConfig.load()
+        newCfg.mimoVoiceClonePath = sample.path
+        guard newCfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()
+        LogManager.shared.info("克隆样本已采用：\(sample.path)（\(sample.lastPathComponent)）")
+        feedback("✅ 已采用样本：\(sample.lastPathComponent)（clone 模式现在可以发声了）")
+    }
+
     /// 切换豆包音色：保存 duoyunVoiceType + 重建链 + 气泡确认。
     @objc func menuSelectDuoyunVoice(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
@@ -2383,6 +2532,13 @@ extension AppDelegate: PetViewDelegate {
         mimoVoiceMenuList()
     }
     func petViewRequestedSetMiMoVoice(_ view: PetView, voice: String) { selectMiMoVoice(voice) }
+    // MiMo 声线三模式热切换（preset/design/clone）：只读数据源 + 动作转发
+    func petViewRequestedMiMoMode(_ view: PetView) -> String { mimoModeCurrent() }
+    func petViewRequestedMiMoDesignPromptText(_ view: PetView) -> String { mimoDesignPromptText() }
+    func petViewRequestedMiMoClonePathText(_ view: PetView) -> String { mimoClonePathText() }
+    func petViewRequestedSetMiMoMode(_ view: PetView, modeID: String) { selectMiMoMode(modeID) }
+    func petViewRequestedEditMiMoDesignPrompt(_ view: PetView) { menuEditMiMoDesignPrompt() }
+    func petViewRequestedEditMiMoClonePath(_ view: PetView) { menuEditMiMoClonePath() }
     func petViewRequestedInput(_ view: PetView) { requestInput() }
     func petViewRequestedVoice(_ view: PetView) { toggleVoiceInput() }
     func petViewRequestedMute(_ view: PetView) { toggleMute() }

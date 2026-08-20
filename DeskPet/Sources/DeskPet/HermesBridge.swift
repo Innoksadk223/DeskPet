@@ -12,7 +12,9 @@ import Foundation
 ///                                ▼
 ///                    <spoken>口语轨</spoken><formal>正式轨</formal> → 回调 UI
 ///
-/// 状态机：事件 → 桌宠 7 态（idle/wave/run/failed/review/jump/waiting）。
+/// 状态机：Hermes 事件驱动桌宠 7 个业务态（idle/wave/run/failed/review/jump/waiting）。
+/// PetState 另包含 running-right/running-left 两个可显式切换的方向态；标准素材契约为 9 行，
+/// 事件状态机不自动驱动方向态。
 /// 任务完成判定：message.complete → 下一主线程调度机会完成处理（v4：不再固定 1.5s 静默窗口）。
 final class HermesBridge {
     // MARK: - 标记协议（预置进两个会话的系统提示词）
@@ -1860,7 +1862,7 @@ final class HermesBridge {
         """
     }
 
-    // MARK: - 状态机
+    // MARK: - 状态机（7 个 Hermes 业务态；PetState/标准素材 9 行）
 
     private func setState(_ state: PetState) {
         // 任何状态变化都取消待执行的 idle 回退（C-M1-1：单定时器）

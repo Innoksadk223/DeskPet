@@ -5,6 +5,10 @@ import AppKit
 
 // CLI 自测模式：--self-test-hermes / --self-test-bridge / --self-test-router（连本地 serve 跑全链路后退出）
 let args = CommandLine.arguments
+if args.contains("--self-test-pet") {
+    // Pet atlas 状态/行/帧数契约纯离线自测：不读取图片、不连接 Hermes。
+    exit(PetAtlasSelfTest.run())
+}
 if args.contains("--self-test-duoyun-asr") {
     let wav = args.drop(while: { $0 != "--self-test-duoyun-asr" }).dropFirst().first ?? "/tmp/deskpet-asr-test.wav"
     Task {

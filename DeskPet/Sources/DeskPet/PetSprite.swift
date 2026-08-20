@@ -20,7 +20,7 @@ struct PetSprite {
     let rows: Int
     /// 行名表（按 constants.py 规则按行数推导）
     let rowNames: [String]
-    /// 每个状态预裁剪的帧（≤ FRAMES_PER_STATE 帧）
+    /// 每个状态按 atlas 行契约预裁剪的帧（新版各行帧数不同，旧版兼容 6 帧）。
     let frames: [PetState: [CGImage]]
 
     /// 解析素材目录列表（多目录合并去重，bundle 优先）：
@@ -159,8 +159,9 @@ struct PetSprite {
         var frames: [PetState: [CGImage]] = [:]
         for state in PetState.allCases {
             let row = min(state.rowIndex(rowCount: rows), rows - 1) // clamp 越界（自绘小行数素材）
+            let frameCount = PetSpec.frameCount(for: state, columns: columns, rowCount: rows)
             var stateFrames: [CGImage] = []
-            for col in 0..<min(columns, PetSpec.framesPerState) {
+            for col in 0..<frameCount {
                 let rect = CGRect(x: col * PetSpec.frameW, y: row * PetSpec.frameH,
                                   width: PetSpec.frameW, height: PetSpec.frameH)
                 if let f = cg.cropping(to: rect) { stateFrames.append(f) }
@@ -169,7 +170,8 @@ struct PetSprite {
             if stateFrames.isEmpty {
                 LogManager.shared.warn("状态 \(state.rawValue) 无有效帧（行\(row) 越界或裁剪失败）")
             } else {
-                LogManager.shared.info("帧映射 \(state.rawValue) → 行\(row)（\(rowNames[row])），\(stateFrames.count) 帧")
+                let rowName = rowNames.indices.contains(row) ? rowNames[row] : "row\(row)"
+                LogManager.shared.info("帧映射 \(state.rawValue) → 行\(row)（\(rowName)），\(stateFrames.count) 帧")
             }
         }
 
