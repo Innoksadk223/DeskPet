@@ -40,7 +40,7 @@ struct DeskPetConfig: Codable {
     var mimoVoice: String = "茉莉"
     /// MiMo 设计音色描述（design 模式必填——空 = design 模式不可用；如「沉稳的男声，语速适中，像纪录片旁白」）
     var mimoVoiceDesignPrompt: String = ""
-    /// MiMo 克隆音色样本路径（clone 模式：mp3 文件绝对路径，10-20s 干净人声；空/文件不存在 = clone 不可用）
+    /// MiMo 克隆音色样本路径（clone 模式：mp3 文件绝对路径，3-10s 干净人声；空/文件不存在 = clone 不可用）
     var mimoVoiceClonePath: String = ""
     /// MiMo 朗读风格指令（可选：preset/clone 模式的 user 消息——如「语气轻快一些」；空 = 不带）
     var mimoStyleInstruction: String = ""

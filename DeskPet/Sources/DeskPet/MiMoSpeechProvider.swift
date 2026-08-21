@@ -39,7 +39,7 @@ final class MiMoSpeechProvider: NSObject, SpeechProvider {
         ("Dean", "Dean（英文·男）"),
     ]
     /// 请求超时（30s：整段合成非流式，比豆包 20s 略宽）
-    private static let timeout: TimeInterval = 30
+    private static let timeout: TimeInterval = 60   // 克隆推理实测常超 30s（服务端 voiceclone 无流式，整段推理），60s 给足余量
 
     // MARK: - 配置缓存（ISSUE-1 同款：rebuild 时 refreshConfig 清缓存，下次读取重载）
 
@@ -181,37 +181,49 @@ final class MiMoSpeechProvider: NSObject, SpeechProvider {
         let url = endpoint
         Task { [weak self] in
             guard let self else { return }
-            do {
-                let (data, response) = try await Self.requestAudio(body: request, apiKey: key, endpoint: url)
-                guard self.generation == gen else { return }   // 已被打断/静音：丢弃
-                guard let http = response as? HTTPURLResponse else { throw TTSFailure.invalidResponse }
-                guard http.statusCode == 200 else {
-                    throw TTSFailure.http(status: http.statusCode,
-                                          message: Self.errorMessage(from: data, fallback: "HTTP \(http.statusCode)"))
-                }
-                guard let audio = Self.extractAudio(from: data) else {
-                    throw TTSFailure.noAudio
-                }
-                guard self.generation == gen else { return }   // 解析期间再次校验
-                // B-1：队列操作全部主线程（后台 Task 与主线程 stop 并发 = 数据竞争）
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.pendingRequests -= 1
+            // 合成 + 失败重试 1 次（用户优先级：宁可慢也要克隆声——服务端 voiceclone 无流式、
+            // 免费期推理慢/波动常见，不因单次超时直接降级）。
+            var lastError: Error?
+            for attempt in 1...2 {
+                do {
+                    let (data, response) = try await Self.requestAudio(body: request, apiKey: key, endpoint: url)
+                    guard self.generation == gen else { return }   // 已被打断/静音：丢弃
+                    guard let http = response as? HTTPURLResponse else { throw TTSFailure.invalidResponse }
+                    guard http.statusCode == 200 else {
+                        throw TTSFailure.http(status: http.statusCode,
+                                              message: Self.errorMessage(from: data, fallback: "HTTP \(http.statusCode)"))
+                    }
+                    guard let audio = Self.extractAudio(from: data) else {
+                        throw TTSFailure.noAudio
+                    }
+                    guard self.generation == gen else { return }   // 解析期间再次校验
+                    // B-1：队列操作全部主线程（后台 Task 与主线程 stop 并发 = 数据竞争）
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.pendingRequests -= 1
+                        guard self.generation == gen else { return }
+                        LogManager.shared.info("MiMo TTS 合成成功（第 \(attempt) 次尝试）：\(audio.count) 字节，\(text.prefix(30))…")
+                        self.enqueue(audio)
+                    }
+                    return
+                } catch {
                     guard self.generation == gen else { return }
-                    LogManager.shared.info("MiMo TTS 合成成功：\(audio.count) 字节，\(text.prefix(30))…")
-                    self.enqueue(audio)
+                    lastError = error
+                    if attempt < 2 {
+                        LogManager.shared.warn("MiMo TTS 第 \(attempt) 次失败，2s 后重试：\(error)")
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        guard self.generation == gen else { return }   // 等待期间可能被打断
+                    }
                 }
-            } catch {
-                guard self.generation == gen else { return }
-                // B-1：降级/计数在主线程（失败路径可能在后台网络上下文）
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.generation == gen else { return }
-                    self.pendingRequests -= 1
-                    LogManager.shared.warn("MiMo TTS 失败，回退系统语音：\(error)")
-                    // D3 运行期降级：网络/接口失败回退系统语音（B-2：统一走链上实例，可被 stop）
-                    SpeechOutputManager.fallbackSpeak(text, from: "MiMo语音",
-                                                      reason: String(String(describing: error).prefix(30)))
-                }
+            }
+            // 重试耗尽 → 链式降级（MiMo✗ → 豆包 → Edge → 系统；不再直接跳系统语音）
+            let err = lastError
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == gen else { return }
+                self.pendingRequests -= 1
+                LogManager.shared.warn("MiMo TTS 重试仍失败，沿播报链降级：\(String(describing: err))")
+                SpeechOutputManager.fallbackSpeak(text, after: "mimo", from: "MiMo语音",
+                                                  reason: String(String(describing: err).prefix(30)))
             }
         }
         return true

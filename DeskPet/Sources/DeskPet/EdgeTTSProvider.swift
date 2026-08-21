@@ -217,9 +217,9 @@ final class EdgeTTSProvider: NSObject, SpeechProvider {
                     LogManager.shared.info("Edge 语音：合成成功 \(url.lastPathComponent)")
                     self.enqueue(url)
                 case .failure(let error):
-                    // D3 运行期降级：合成失败 → 系统语音（B-2：统一走链上实例，可被 stop）
-                    LogManager.shared.warn("Edge 语音合成失败，回退系统语音：\(error)")
-                    SpeechOutputManager.fallbackSpeak(spoken)
+                    // D3 运行期降级：合成失败 → 沿链继续（Edge✗→系统；链上 Edge 已是末段云服务）
+                    LogManager.shared.warn("Edge 语音合成失败，沿播报链降级：\(error)")
+                    SpeechOutputManager.fallbackSpeak(spoken, after: "edge")
                 }
             }
         }

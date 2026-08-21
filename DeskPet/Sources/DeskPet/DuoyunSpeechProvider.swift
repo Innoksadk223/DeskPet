@@ -151,9 +151,9 @@ final class DuoyunSpeechProvider: NSObject, SpeechProvider {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.generation == gen else { return }
                     self.pendingRequests -= 1
-                    LogManager.shared.warn("豆包 TTS 失败，回退系统语音：\(error)")
-                    // D3 运行期降级：网络/接口失败时回退系统语音（B-2：统一走链上实例）
-                    SpeechOutputManager.fallbackSpeak(text, from: "豆包语音", reason: String(String(describing: error).prefix(30)))
+                    LogManager.shared.warn("豆包 TTS 失败，沿播报链降级：\(error)")
+                    // D3 运行期降级：沿链继续（豆包✗→Edge→系统；不再直接跳系统语音）
+                    SpeechOutputManager.fallbackSpeak(text, after: "duoyun", from: "豆包语音", reason: String(String(describing: error).prefix(30)))
                 }
             }
         }

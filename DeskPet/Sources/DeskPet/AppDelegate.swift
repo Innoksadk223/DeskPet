@@ -1539,7 +1539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if id == "design", cfgAfter.mimoVoiceDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             note = "；⚠️ 设计音色描述未填写——点「设计音色描述…」填写后才能发声"
         } else if id == "clone", !cloneSampleReadable(cfgAfter.mimoVoiceClonePath) {
-            note = "；⚠️ 样本未选择——点「选择克隆样本…」选一个 10-20s 干净人声 MP3"
+            note = "；⚠️ 样本未选择——点「选择克隆样本…」选一个 3-10s 干净人声 MP3"
         }
         feedback("✅ 已切换 MiMo 声线模式：\(name)（立即生效）\(note)")
     }
@@ -1617,7 +1617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [UTType.mp3]
-        panel.message = "选择克隆样本（10-20s 干净人声 MP3）——选中后立即生效"
+        panel.message = "选择克隆样本（3-10s 干净人声 MP3）——选中后立即生效"
         panel.prompt = "采用此样本"
         guard panel.runModal() == .OK, let sample = panel.url else {
             LogManager.shared.info("克隆样本选择已取消")

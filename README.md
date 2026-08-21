@@ -65,7 +65,7 @@
 2. **填 Key**：右键桌宠 → 设置 ▸ 语音 ▸ **MiMo 语音设置…** → 粘贴 Key → 点「测试发声」，能听到说话就通了
 3. **选音色**：面板里直接选预置音色（茉莉、苏打、白桦…）；自定义两种进阶玩法——
    - **设计音色**：改配置文件 `DeskPet/history/config/deskpet-config.json`，设 `"mimoTTSMode": "design"`，`"mimoVoiceDesignPrompt"` 填一句描述（如「沉稳的男声，像纪录片旁白」）
-   - **克隆音色**：安静环境录一段 10-20 秒 mp3，`"mimoTTSMode": "clone"`，`"mimoVoiceClonePath"` 填样本文件路径
+   - **克隆音色**：安静环境录一段 3-10 秒 mp3，`"mimoTTSMode": "clone"`，`"mimoVoiceClonePath"` 填样本文件路径
 4. **切换播报**：设置 ▸ 语音 ▸ 播报方式 → **MiMo 语音**（想连"听你说话"也用 MiMo：设置 ▸ 语音 ▸ 识别 → MiMo 识别；说完停 2 秒后上传，多等 1-3 秒属正常）
 
 📎 完整教程（含常见报错）：MiMo 见 [DeskPet/MiMo音色指南.md](DeskPet/MiMo音色指南.md)；豆包（火山引擎，流式识别更快）见 [DeskPet/豆包语音指南.md](DeskPet/豆包语音指南.md)——豆包同样 4 步：申请 Key（火山控制台，`ark-` 开头）→ 豆包语音设置里粘贴测试 → 挑声线（8 个内置/自定义）→ 播报方式切「豆包语音」

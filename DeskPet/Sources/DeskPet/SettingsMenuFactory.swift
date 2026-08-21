@@ -238,7 +238,7 @@ enum SettingsMenuFactory {
             let modes: [(id: String, name: String, tip: String)] = [
                 ("preset", "预置音色", "MiMo 官方预置音色清单"),
                 ("design", "设计音色", "用文字描述生成专属音色（来源见 MiMo音色指南.md）"),
-                ("clone", "克隆音色", "用 10-20s 干净人声样本克隆音色（来源见 MiMo音色指南.md）"),
+                ("clone", "克隆音色", "用 3-10s 干净人声样本克隆音色（来源见 MiMo音色指南.md）"),
             ]
             for m in modes {
                 let item = NSMenuItem(title: m.name, action: actions.mimoMode, keyEquivalent: "")
@@ -264,7 +264,7 @@ enum SettingsMenuFactory {
                 let cloneItem = NSMenuItem(title: "选择克隆样本…", action: actions.mimoClonePath, keyEquivalent: "")
                 cloneItem.target = target
                 cloneItem.toolTip = path.isEmpty
-                    ? "未配置——点击选择 10-20s 干净人声 mp3，选中即生效"
+                    ? "未配置——点击选择 3-10s 干净人声 mp3，选中即生效"
                     : "当前样本：\(path)"
                 mvMenu.addItem(cloneItem)
             } else {

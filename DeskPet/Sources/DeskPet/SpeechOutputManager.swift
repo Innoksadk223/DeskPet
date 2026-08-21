@@ -305,20 +305,36 @@ final class SpeechOutputManager {
         lowQueue.removeAll()
     }
 
-    /// B-2：降级统一走链上 systemProvider 实例（Edge/Duoyun 合成失败时调用）——
-    /// 可被 stop() 控制（打断/静音/新播报），不与链上 system 双声重叠。
+    /// B-2：运行期降级——沿播报链从 failedProviderID 之后继续找可用 provider
+    /// （MiMo✗→豆包→Edge→系统；不再直接跳系统语音，声线跳变最小化）。
+    /// failedProviderID 不在链上/为 nil → 原行为回退 systemProvider。
     /// 线程收口：provider 失败路径可能在后台网络上下文调用——统一派发主线程再动共享状态。
-    static func fallbackSpeak(_ text: String, from provider: String = "system", reason: String? = nil) {
+    static func fallbackSpeak(_ text: String, after failedProviderID: String? = nil,
+                              from provider: String = "system", reason: String? = nil) {
         let work: () -> Void = {
             guard !text.isEmpty else { return }
-            shared.systemProvider.speak(text)
-            shared.activeProvider = shared.systemProvider
+            // 从失败 provider 之后沿链找第一个能接手的（speak 返回 true = 已接受异步合成）
+            var started = false
+            if let failed = failedProviderID,
+               let idx = shared.providerChain.firstIndex(where: { $0.id == failed }) {
+                for p in shared.providerChain[(idx + 1)...] where p.speak(text) {
+                    shared.activeProvider = p
+                    started = true
+                    LogManager.shared.info("降级播报：\(failed) 失败 → \(p.id) 接手")
+                    break
+                }
+            }
+            if !started {
+                guard shared.systemProvider.speak(text) else { return }
+                shared.activeProvider = shared.systemProvider
+            }
             shared.notifySpeaking(true)   // P0-2：降级播报同样通知（回声防护）
             // 降级可见化：5 分钟冷却防刷屏（同一 provider 连续失败只提示一次）
             guard provider != "system" else { return }
             if Date().timeIntervalSince(shared.lastFallbackNoticeAt) > 300 {
                 shared.lastFallbackNoticeAt = Date()
-                let msg = reason.map { "\(provider)不可用（\($0)），已改用系统语音" } ?? "\(provider)不可用，已改用系统语音"
+                let landed = started ? (shared.activeProvider.map(fallbackName(for:)) ?? "系统语音") : "系统语音"
+                let msg = reason.map { "\(provider)不可用（\($0)），已改用\(landed)" } ?? "\(provider)不可用，已改用\(landed)"
                 shared.onFallbackNotice?(msg)
             }
         }
@@ -326,6 +342,16 @@ final class SpeechOutputManager {
             work()
         } else {
             DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    /// provider id → 中文名（降级提示文案用）。
+    private static func fallbackName(for id: SpeechProvider) -> String {
+        switch id.id {
+        case "duoyun": return "豆包语音"
+        case "mimo": return "MiMo 语音"
+        case "edge": return "Edge 语音"
+        default: return "系统语音"
         }
     }
 
