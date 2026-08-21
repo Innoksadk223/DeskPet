@@ -1,7 +1,7 @@
 # DeskPet 下一版本更新计划与交接
 
-> 更新时间：2026-08-20
-> 当前产品版本：**0.7.0**
+> 更新时间：2026-08-21
+> 当前产品版本：**0.7.8**（build 47，已发布 GitHub Release）
 > 下一版本：**暂定 0.8.0，版本号待用户最终确认**
 >
 > 新对话接手顺序：先读 `ARCHITECTURE.md`，再读本文件。本文记录当前已交付状态、下一版本目标、依赖关系和不可直接假设的决策。
@@ -13,13 +13,11 @@
 ### 1.1 GitHub 与安装包
 
 - 仓库：`Innoksadk223/DeskPet`
-- 当前分支：`release/0.7.0`
-- 当前提交：`6b46655 release: prepare DeskPet 0.7.0`
-- 远程分支：`origin/release/0.7.0`
-- GitHub Release：<https://github.com/Innoksadk223/DeskPet/releases/tag/v0.7.0>
-- DMG：`DeskPet-0.7.0.dmg`
-- DMG 直链：<https://github.com/Innoksadk223/DeskPet/releases/download/v0.7.0/DeskPet-0.7.0.dmg>
-- Bundle 版本：`0.7.0`，Build `42`
+- 默认分支 `main` 已合并 0.7.8（`9b4c265 merge: DeskPet 0.7.8 合并进 main`）；开发在 `release/0.7.x` 系列分支进行
+- 本地工作区当前检出 `main`，与 origin 同步、无未提交改动
+- GitHub Release：<https://github.com/Innoksadk223/DeskPet/releases/tag/v0.7.8>
+- DMG：`DeskPet-0.7.8.dmg`
+- Bundle 版本：`0.7.8`，Build `47`
 - 架构：Apple Silicon `arm64`
 - 打包时已检查 bundle 内 `duoyunApiKey`、`asrApiKey`、`mimoApiKey` 均为空
 
@@ -40,15 +38,15 @@
 - `DeskPet/Sources/DeskPet/PetView.swift`
 - `DeskPet/Sources/DeskPet/StatusItemController.swift`
 
-### 1.3 当前 Hermes 自动匹配能力（已有，不等于本计划完成）
+### 1.3 当前 Hermes 自动匹配能力（0.7.5 已交付 HermesDiscovery 增强）
 
-当前实现已经能在**本机当前用户**环境中探测 Hermes 可执行文件，候选包括：
+当前实现已经能在**本机当前用户**环境中探测 Hermes 可执行文件（`HermesDiscovery.swift`）：
 
-- `~/.hermes/hermes-agent/venv/bin/hermes`
-- `~/.local/bin/hermes`
-- `/usr/local/bin/hermes`
-- `/opt/homebrew/bin/hermes`
-- 当前进程 `PATH` 中的 `hermes`
+- 候选探测：已保存路径 → PATH → 用户/包管理器常见路径 → `~/.hermes` → 系统路径（软链接去重）
+- 有界 async 版本探测 `probeVersion`（2s 超时、取消感知、失败仅诊断不误判）
+- 纯函数决策 `adaptationDecision`：未安装 / 唯一 autouse / 多选首个+可另选 / 全失败+修复入口四分支
+- 设置菜单展示 Hermes 状态（版本/未找到原因/多安装提示）；启动引导指向真实菜单入口
+- 离线自测：`--self-test-hermes-discovery` 全绿
 
 连接后还会校验：
 
@@ -67,12 +65,10 @@
 ### 1.4 当前工作区注意事项
 
 以下文件目前只在本地，未上传 GitHub，不要在后续提交中误加入：
+ 
+- `backups/DeskPet-0.5.0.app.zip`、`backups/DeskPet-0.6.0.app.zip`
 
-- `backups/DeskPet-0.5.0.app.zip`
-- `鲸鱼娘-hatch-pet-生图提示词.html`
-- `鲸鱼娘-hatch-pet-生图提示词.md`
-
-`DeskPet-0.7.0.dmg` 是本地发布产物，已上传 Release；不要把包含用户密钥的本地运行配置加入提交。
+根目录的 `DeskPet-*.dmg`（0.4.0～0.7.8）是本地发布产物，均已上传 Release；不要把包含用户密钥的本地运行配置加入提交。
 
 ---
 
@@ -132,7 +128,7 @@ DeskPet 启动
 
 ---
 
-### P1：编写小白可用的操作说明
+### P1：编写小白可用的操作说明 ✅ 已交付（根目录 USER-GUIDE.md，随 0.7.5 发布；README 有导航入口）
 
 ### 目标
 
@@ -169,7 +165,7 @@ DeskPet 启动
 
 ---
 
-### P0/P1：增强本机 Hermes 自适应匹配
+### P0/P1：增强本机 Hermes 自适应匹配 ✅ 已交付（HermesDiscovery.swift，随 0.7.5 发布；详见 §1.3）
 
 ### 目标边界
 
@@ -217,7 +213,7 @@ DeskPet 启动
 
 ---
 
-### P0/P1：活人感与情绪价值
+### P0/P1：活人感与情绪价值 ✅ MVP 已交付（seed 陪伴准则 + feedback 情绪收尾；主动关怀/跨应用感知仍为后续能力）
 
 ### 产品愿景
 
