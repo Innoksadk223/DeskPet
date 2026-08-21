@@ -199,7 +199,8 @@ final class SpeechOutputManager {
     /// tag（P4-1）：任务实例标识——low 条目打 tag，新任务派发后旧任务条目被跳过丢弃。
     func speak(_ text: String, priority: Priority = .high, clearsQueue: Bool = true, tag: String? = nil) {
         guard !isMuted, Self.hasReadableContent(text) else { return }
-        let sentences = Self.sentenceChunks(text)
+        // 纯 emoji/标点句无可合成内容（实测「🎨🌸」单独成句被合成为怪声）——切句后直接滤除
+        let sentences = Self.sentenceChunks(text).filter { Self.hasReadableContent($0) }
         if priority == .low {
             // 任务完成/进度：入队（不卡断当前对话）；当前无播报则立即播
             lowQueue.append(contentsOf: sentences.map { LowItem(text: $0, tag: tag) })
@@ -440,6 +441,10 @@ final class SpeechOutputManager {
     /// 策略：去代码围栏/行首标记/行内符号/链接 URL/表格线，压缩空行；emoji 与常见标点保留。
     static func cleanForSpeech(_ text: String) -> String {
         var t = text
+        // 括号动作/神态/舞台指示（（歪着头想了想）/(笑着挥手)）——念出来是旁白噪音，
+        // persona 表演文本混入 spoken 时由此处兜底剥离（2026-08-21 用户实测听不懂根因）
+        t = t.replacingOccurrences(of: #"（[^（）]*）"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\([^()]*\)"#, with: "", options: .regularExpression)
         // 代码围栏符号
         t = t.replacingOccurrences(of: "```", with: "")
         // 行首标记：# 标题、*/- 列表、> 引用
@@ -496,7 +501,12 @@ final class SpeechOutputManager {
         check("无标点整段", c2.count == 1 && c2.first == "这是一段没有标点的长文本")
         // 空文本与纯表情
         check("无可朗读内容", sentenceChunks("").isEmpty && !hasReadableContent("😼🎵…"))
-        print("[tts] 分句自测：\(passed)/5")
-        return passed == 5 ? 0 : 1
+        // 2026-08-21：括号动作剥离 + 纯 emoji 句过滤（用户实测听不懂根因）
+        let cleaned = cleanForSpeech("（抱着画板眨眨眼）主人问起这个，我超开心哒！(笑着挥手)呼~")
+        check("剥括号动作旁白", cleaned == "主人问起这个，我超开心哒！呼~")
+        let emojiFiltered = sentenceChunks("🎨🌸").filter { hasReadableContent($0) }
+        check("纯 emoji 句被过滤", emojiFiltered.isEmpty)
+        print("[tts] 分句自测：\(passed)/7")
+        return passed == 7 ? 0 : 1
     }
 }

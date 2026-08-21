@@ -73,6 +73,9 @@ final class ServeManager {
 
     /// 重启 serve：杀旧进程 → 等端口释放 → 拉起新 serve（token 不变——state.db 持久化，
     /// 会话 resume 无损）→ 等握手就绪。HermesClient 自动重连循环负责恢复连接。
+    /// @MainActor（audit 2026-08-21）：内部同步调用 MainActor 隔离的 onTaskRunningCheck
+    /// （bridge.isTaskBusy）——标注后编译器保证调用点 hop 主线程，消除理论绕行风险。
+    @MainActor
     func restartServe(reason: String) async {
         // 防抖：1 分钟内不重复重启
         guard Date().timeIntervalSince(lastRestartAt) > 60 else {

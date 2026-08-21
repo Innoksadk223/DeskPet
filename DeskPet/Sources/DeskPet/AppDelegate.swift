@@ -488,9 +488,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.showBubble(cleanedFormal.isEmpty ? msg.spoken : msg.formal)
                 // R-2026-08-13：只念 spoken（口语轨）——formal 仅气泡展示，绝不生成语音。
-                let finalSpeak = cleanedSpoken.count > 200
-                    ? String(cleanedSpoken.prefix(200)) + "，更多内容请看气泡"
-                    : cleanedSpoken
+                // 2026-08-21：播报前过 cleanForSpeech——剥括号动作旁白/markdown 符号
+                // （persona 表演文本混入 spoken 时念出来听不懂，用户实测根因）。
+                let speakBase = SpeechOutputManager.cleanForSpeech(cleanedSpoken)
+                let finalSpeak = speakBase.count > 200
+                    ? String(speakBase.prefix(200)) + "，更多内容请看气泡"
+                    : speakBase
                 SpeechOutputManager.shared.speak(finalSpeak)
             }
         }
