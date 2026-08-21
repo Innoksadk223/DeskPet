@@ -24,6 +24,8 @@ if args.contains("--self-test-mimo") {
     exit(MiMoSelfTest.run())
 }
 if args.contains("--self-test-markers") {
+    // runMarkersSelfTest/runStateSyncSelfTest 触碰 @MainActor bridge（thread-affinity-fix）；
+    // main.swift 顶层即 @MainActor（SE-0343），同隔离域同步调用。
     exit(HermesBridgeSelfTest.runMarkersSelfTest())
 }
 if args.contains("--self-test-companion") {

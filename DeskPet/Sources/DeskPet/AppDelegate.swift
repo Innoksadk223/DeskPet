@@ -2,6 +2,10 @@ import AppKit
 import AVFoundation   // AVSpeechSynthesisVoice（系统声线枚举）
 
 /// 应用组装器：素材加载 → 桌宠窗口 → 菜单栏 → 输入面板。
+/// @MainActor（thread-affinity-fix）：AppKit 生命周期本就主线程；标注后内嵌 Task 继承
+/// 主线程隔离——await 恢复后的 self.bridge/retryBusy/bridgeInitialized 写入不再漂移到
+/// 后台线程（与 bridge 的 @MainActor 收口配套）。
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sprite: PetSprite?
     private var petPanel: PetPanel?
@@ -39,13 +43,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// U5：连接失败统一文案——气泡纯文本无按钮，给真实菜单路径（设置▸系统▸重新连接助手服务）
     private static let connectFailureText = "⚠️ 连不上助手服务——设置菜单「系统▸重新连接助手服务」可重试"
     /// 真实菜单入口（U5：文案只指向真实存在的条目，避免误导）——选择与重连两个入口。
-    private static let hermesSelectEntry = "设置▸系统▸选择 Hermes 可执行文件…"
-    private static let hermesRetryEntry = "设置▸系统▸重新连接助手服务"
+    private nonisolated static let hermesSelectEntry = "设置▸系统▸选择 Hermes 可执行文件…"
+    private nonisolated static let hermesRetryEntry = "设置▸系统▸重新连接助手服务"
 
     /// P1：启动适配引导（纯函数，可离线断言）。把 HermesDiscovery 的适配决策转成
     /// 「新用户可见引导」文案：只对「未安装/全失败」给可行动文案——说清原因 + 指向真实菜单
     /// 条目（选择 Hermes 可执行文件… / 重新连接助手服务）；正常（已找到/多安装自动接管）返回 nil 不打扰。
-    static func adaptationGuidanceText(for decision: HermesAdaptationDecision) -> String? {
+    nonisolated static func adaptationGuidanceText(for decision: HermesAdaptationDecision) -> String? {
         switch decision.mode {
         case .notInstalled:
             return "🚫 检测到 Hermes 未安装（未找到任何本机安装）。请先安装 Hermes 后重启桌宠，或在（\(hermesSelectEntry)）手动指定路径；完成后到（\(hermesRetryEntry)）重试。"
@@ -98,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 离屏保护：屏幕配置变化时把窗口拉回可见区
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            self?.clampPetWindowToScreen()
+            MainActor.assumeIsolated { self?.clampPetWindowToScreen() }
         }
 
         guard let sprite = PetSprite.load(petID: resolvePetID()) else {
@@ -318,7 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.lastWakeFailure = (Date(), reason)
             self.feedback("⚠️ 唤醒不可用：\(reason)")
         }
-        Task { try? await wake.start() }
+        wake.start()
 
         // P1：聆听协调者接线（wake 已创建）+ 启动恢复持续聆听（config 持久化）——
         // 授权后才真正启动引擎（L-1 修复：未授权启动 = 假聆听）
@@ -583,7 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        bridge.onTaskComplete = { [weak self] title in
+        bridge.onTaskComplete = { title in
             LogManager.shared.info("任务完成：\(title)")
             DispatchQueue.main.async {
                 // R3-1：任务完成 → 执行延迟的 serve 重启（若任务运行中曾触发）
@@ -1862,11 +1866,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task {
                 speechAuthorized = await speechInput.requestAuthorization()
                 if speechAuthorized {
-                    await MainActor.run { startVoiceCapture() }
+                    startVoiceCapture()
                 } else {
-                    await MainActor.run {
-                        alert("语音不可用", "请在 系统设置 → 隐私与安全性 中允许麦克风和语音识别权限").runModal()
-                    }
+                    alert("语音不可用", "请在 系统设置 → 隐私与安全性 中允许麦克风和语音识别权限").runModal()
                 }
             }
             return

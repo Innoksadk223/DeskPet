@@ -232,11 +232,11 @@ final class HermesClient {
             hasConnectedOnce = true
         }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("[frame] 解析失败: \(String(data: data, encoding: .utf8) ?? "?")")
+            LogManager.shared.warn("[frame] 解析失败: \(String(data: data, encoding: .utf8) ?? "?")")
             return
         }
         if ProcessInfo.processInfo.environment["DESKPET_DEBUG_FRAME"] == "1" {
-            print("[frame] \(String(data: data, encoding: .utf8)?.prefix(120) ?? "?")")
+            LogManager.shared.log(.debug, "[frame] \(String(data: data, encoding: .utf8)?.prefix(120) ?? "?")")
         }
         if let id = obj["id"] as? Int, !(obj["method"] as? String == "event") {
             // 响应帧

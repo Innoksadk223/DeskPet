@@ -1,7 +1,7 @@
 import AppKit
 import QuartzCore
 
-protocol PetViewDelegate: AnyObject {
+@MainActor protocol PetViewDelegate: AnyObject {
     func petViewRequestedInput(_ view: PetView)
     func petViewRequestedVoice(_ view: PetView)
     // #22：常用功能（输入/语音下方）

@@ -16,23 +16,30 @@ import Foundation
 /// PetState 另包含 running-right/running-left 两个可显式切换的方向态；标准素材契约为 9 行，
 /// 事件状态机不自动驱动方向态。
 /// 任务完成判定：message.complete → 下一主线程调度机会完成处理（v4：不再固定 1.5s 静默窗口）。
+///
+/// 线程模型（thread-affinity-fix）：整个类 @MainActor——此前 async 方法（chat/flushChatQueue/
+/// archiveTaskResult 内嵌 Task/handleServeReconnected/runTaskNow…）在 await 恢复后于任意
+/// 后台线程写 pendingChatQueue/turnTracker/mainTurnActive 等共享状态，与固定主线程的
+/// handleEvent（HermesClient 已 main.async 派发）存在数据竞争（数组并发读写可损坏内存）。
+/// 标注后编译器强制所有状态修改收口主线程；纯函数/常量标 nonisolated 供离线自测直调。
+@MainActor
 final class HermesBridge {
-    // MARK: - 标记协议（预置进两个会话的系统提示词）
-    static let dispatchOpen = "<dispatch>"
-    static let dispatchClose = "</dispatch>"
-    static let spokenOpen = "<spoken>"
-    static let spokenClose = "</spoken>"
-    static let formalOpen = "<formal>"
-    static let formalClose = "</formal>"
-    static let steerOpen = "<steer>"
-    static let steerClose = "</steer>"
+    // MARK: - 标记协议（预置进两个会话的系统提示词；nonisolated：纯常量，离线自测/非隔离上下文可直读）
+    nonisolated static let dispatchOpen = "<dispatch>"
+    nonisolated static let dispatchClose = "</dispatch>"
+    nonisolated static let spokenOpen = "<spoken>"
+    nonisolated static let spokenClose = "</spoken>"
+    nonisolated static let formalOpen = "<formal>"
+    nonisolated static let formalClose = "</formal>"
+    nonisolated static let steerOpen = "<steer>"
+    nonisolated static let steerClose = "</steer>"
     // MARK: - 任务协作标记（主 Agent 掌控任务 Agent：用户决策 2026-08-14）
-    static let taskOpen = "<task>"
-    static let taskClose = "</task>"
-    static let taskStatusTag = "<task_status/>"
-    static let taskSteerOpen = "<task_steer>"
-    static let taskSteerClose = "</task_steer>"
-    static let taskCancelTag = "<task_cancel/>"
+    nonisolated static let taskOpen = "<task>"
+    nonisolated static let taskClose = "</task>"
+    nonisolated static let taskStatusTag = "<task_status/>"
+    nonisolated static let taskSteerOpen = "<task_steer>"
+    nonisolated static let taskSteerClose = "</task_steer>"
+    nonisolated static let taskCancelTag = "<task_cancel/>"
 
     struct MainMessage {
         let spoken: String
@@ -96,7 +103,7 @@ final class HermesBridge {
     /// （delta/tool/complete/error），判定事件流丢失（serve 事件丢失/会话静默失效）——
     /// 以可见失败收口并释放任务槽、继续队列，防 activeTask/taskSlotOccupied/宠物状态永久卡住。
     /// 任何该任务事件到达即重排（真实长任务不误杀）；任务正常收口路径显式取消。
-    private static let taskWatchdogTimeout: TimeInterval = 600   // 10 分钟零事件判定失联
+    private nonisolated static let taskWatchdogTimeout: TimeInterval = 600   // 10 分钟零事件判定失联
     private var taskWatchdogItem: DispatchWorkItem?
     private var idleTimer: DispatchWorkItem?   // 防抖：状态回 idle
     /// 任务事件到达 → 重排看门狗（真实长任务持续有事件不误杀）。
@@ -130,12 +137,12 @@ final class HermesBridge {
 
     /// 任务提交后无首个有效活动（delta/tool）的等待窗口：8s 后显示一次过渡气泡
     /// （中断收尾约 60s 的服务端 drain 期间用户可见仍在等待，不伪称 queued/失败/重启）
-    static let taskStartPendingDelay: TimeInterval = 8
+    nonisolated static let taskStartPendingDelay: TimeInterval = 8
     private var taskStartPendingWorkItem: DispatchWorkItem?
 
-    /// 启动等待反馈触发判定（纯函数，可离线单测）：同一任务、turn 未关、未完成、
+    /// 纯函数，可离线单测：同一任务、turn 未关、未完成、
     /// 且尚无首个有效活动（delta/tool）时才显示。
-    static func shouldShowTaskStartPending(sameTask: Bool, turnOpen: Bool, complete: Bool, streamStarted: Bool) -> Bool {
+    nonisolated static func shouldShowTaskStartPending(sameTask: Bool, turnOpen: Bool, complete: Bool, streamStarted: Bool) -> Bool {
         sameTask && turnOpen && !complete && !streamStarted
     }
 
@@ -212,7 +219,7 @@ final class HermesBridge {
     /// 任务槽生命周期相位：free=空闲；running=活动任务；starting=启动中（activeTask 未创建）；
     /// ghost=槽残留（无活动任务且无启动中——需自愈释放，否则新任务被幽灵槽误排队）。
     enum TaskSlotPhase: Equatable { case free, running, starting, ghost }
-    static func taskSlotPhase(occupied: Bool, hasActive: Bool, hasStarting: Bool) -> TaskSlotPhase {
+    nonisolated static func taskSlotPhase(occupied: Bool, hasActive: Bool, hasStarting: Bool) -> TaskSlotPhase {
         if !occupied { return .free }
         if hasActive { return .running }
         if hasStarting { return .starting }
@@ -221,17 +228,17 @@ final class HermesBridge {
 
     /// 启动生命周期归属判定：starting 记录仍是本次启动（token 匹配）才允许创建 activeTask；
     /// 已被取消/被新任务替换（token 失效）则拦截迟到创建。
-    static func startTransitionShouldProceed(currentToken: UUID?, expectedToken: UUID) -> Bool {
+    nonisolated static func startTransitionShouldProceed(currentToken: UUID?, expectedToken: UUID) -> Bool {
         currentToken == expectedToken
     }
 
     /// 中断分支判定：仅 starting 相位走「启动中取消」（不打断 activeTask，也无幽灵可释放）。
-    static func interruptShouldCancelStarting(phase: TaskSlotPhase) -> Bool {
+    nonisolated static func interruptShouldCancelStarting(phase: TaskSlotPhase) -> Bool {
         phase == .starting
     }
 
     /// 排队文案相位：前置是启动中任务（而非执行中）时文案如实说明「正在启动」。
-    static func queuedBehindText(starting: Bool) -> String {
+    nonisolated static func queuedBehindText(starting: Bool) -> String {
         starting ? "前一任务正在启动" : "当前任务还在执行"
     }
 
@@ -321,12 +328,15 @@ final class HermesBridge {
 
     init(client: HermesClient) {
         self.client = client
+        // HermesClient 已保证事件在主线程派发（handleFrame → DispatchQueue.main.async）；
+        // 闭包本身非隔离，用 assumeIsolated 同步进入本类隔离域——保持既有调用时序
+        // （同步回调，不引入额外 hop；自测的 fire→断言同步链路不变）。
         client.onEvent = { [weak self] event in
-            self?.handleEvent(event)
+            MainActor.assumeIsolated { self?.handleEvent(event) }
         }
         // C4：serve 重启后重连成功 → 重新 resume 主会话（断链死循环根因钩子）
         client.onReconnected = { [weak self] in
-            self?.handleServeReconnected()
+            MainActor.assumeIsolated { self?.handleServeReconnected() }
         }
     }
 
@@ -452,11 +462,11 @@ final class HermesBridge {
     /// 回退，任务 Agent 默认文件操作会落到用户项目目录）。以最小版本门槛让升级后**不 resume 旧 cwd
     /// 当前会话**：旧当前由 setMain 自动归档（历史保留可查看/删除，不迁移正文），新建绑定
     /// ~/.deskpet/hermes/workspace 的主会话；后续 restart seed 版本一致 → 正常 resume 新会话。
-    static let mainSeedVersion = 4
+    nonisolated static let mainSeedVersion = 4
 
     /// v12：主会话 resume 门槛（纯函数，可离线自测）——seed 版本一致 且 有 profile 才 resume。
     /// 版本不一致（旧协议 / 旧 cwd 未绑定会话）或 legacy（无 profile）→ 不 resume（归档后新建）。
-    static func shouldResumeMainSession(savedSeedVersion: Int, currentSeedVersion: Int, savedProfile: String?) -> Bool {
+    nonisolated static func shouldResumeMainSession(savedSeedVersion: Int, currentSeedVersion: Int, savedProfile: String?) -> Bool {
         savedSeedVersion == currentSeedVersion && savedProfile != nil
     }
 
@@ -541,8 +551,8 @@ final class HermesBridge {
     /// 绝不静默降级默认 DB（serve 端 _response_profile_name 在 profile 解析失败时会回退
     /// launch profile 名——正是静默降级点，必须在此拦截）。
     /// 当前已验证门槛：serve DESKTOP_BACKEND_CONTRACT = 6（tui_gateway/server.py）。
-    static let minDesktopContract = 6
-    static func validateBackendContract(_ info: HermesClient.SessionInfo, requestedProfile: String) throws {
+    nonisolated static let minDesktopContract = 6
+    nonisolated static func validateBackendContract(_ info: HermesClient.SessionInfo, requestedProfile: String) throws {
         if info.profileName != requestedProfile {
             throw DeskPetHermesProfile.ProfileError.backendIncompatible(
                 "会话创建回报 profile_name=\(info.profileName ?? "（缺失）")，期望 \(requestedProfile)——后端未启用 named profile，拒绝静默写入默认 Hermes")
@@ -768,8 +778,8 @@ final class HermesBridge {
     /// 显式在途证据：主 turn 活跃 / 主 tracker 在途（含服务端 queued 记录，见 R3）/ 主侧刚完成
     /// 窗口（nilSidMainRecentWindow）——任一为真 → 归主（不丢主回复）；仅当任务 turn 未关且
     /// 主侧无任何在途证据时归任务（真实任务完成不错归主侧）。
-    static let nilSidMainRecentWindow: TimeInterval = 3.0
-    static func nilSidCompleteBelongsToTask(taskTurnOpen: Bool, mainTurnActive: Bool,
+    nonisolated static let nilSidMainRecentWindow: TimeInterval = 3.0
+    nonisolated static func nilSidCompleteBelongsToTask(taskTurnOpen: Bool, mainTurnActive: Bool,
                                             mainTrackerPending: Bool, mainRecentlyCompleted: Bool) -> Bool {
         guard taskTurnOpen else { return false }
         guard !mainTurnActive, !mainTrackerPending else { return false }
@@ -807,12 +817,14 @@ final class HermesBridge {
             return .cancelledDuringStart
         }
         // 无活动任务：幽灵槽自愈（残留 taskSlotOccupied）——取消意图优先清队列
+        // （withLock 闭包形式：区间内无 await，且消除 async 上下文手写 lock/unlock 的 Swift 6 迁移警告）
         if phase != .running {
-            taskLifecycleLock.lock()
-            let hadQueue = !pendingTasks.isEmpty
-            pendingTasks.removeAll()
-            taskSlotOccupied = false
-            taskLifecycleLock.unlock()
+            let hadQueue: Bool = taskLifecycleLock.withLock {
+                let had = !pendingTasks.isEmpty
+                pendingTasks.removeAll()
+                taskSlotOccupied = false
+                return had
+            }
             if phase == .ghost {
                 LogManager.shared.warn("中断任务：无活动任务，幽灵任务槽已自愈释放\(hadQueue ? "（队列已清空）" : "")")
             } else {
@@ -1581,7 +1593,7 @@ final class HermesBridge {
 
     /// U9：任务标题整词截断——超长时回退到最近中英文断点（空格/标点），
     /// 避免在词中间硬切（实测「音乐」断成「音…」）；无断点则按字符截断兜底。
-    static func taskTitle(_ text: String, maxChars: Int = 24) -> String {
+    nonisolated static func taskTitle(_ text: String, maxChars: Int = 24) -> String {
         guard text.count > maxChars else { return text }
         let head = String(text.prefix(maxChars))
         let boundaries = CharacterSet(charactersIn: " 　，。！？、；：,.!?;:/-—…·")
@@ -1594,7 +1606,7 @@ final class HermesBridge {
         return head + "…"
     }
 
-    static func parseDualTrack(_ text: String) -> (spoken: String, formal: String) {
+    nonisolated static func parseDualTrack(_ text: String) -> (spoken: String, formal: String) {
         func extract(_ open: String, _ close: String) -> String? {
             guard let s = text.range(of: open), let e = text.range(of: close, range: s.upperBound..<text.endIndex) else { return nil }
             return String(text[s.upperBound..<e.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1680,7 +1692,7 @@ final class HermesBridge {
     // MARK: - 任务协作标记解析（主 Agent 掌控任务 Agent）
 
     /// v3：剥归档确认 <ok/>（宽松：大小写/空格/无斜杠/全角尖括号）——非用户轮回复专用。
-    static func stripOkAck(_ text: String) -> String {
+    nonisolated static func stripOkAck(_ text: String) -> String {
         var t = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
         guard let re = regex("(?i)<ok\\s*/?>"),
               let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
@@ -1693,7 +1705,7 @@ final class HermesBridge {
     /// 全角尖括号）。返回 (剩余文本, feedback 文案)；无标记返回 (原文本, nil)。
     /// feedback 承载主 Agent 以 persona 口吻生成的情绪收尾（祝贺/安慰的一句话），
     /// 不用于转述任务结果（结果全文由任务 Agent 直报，端侧只对 feedback 做气泡+短播报）。
-    static func stripFeedback(_ text: String) -> (text: String, feedback: String?) {
+    nonisolated static func stripFeedback(_ text: String) -> (text: String, feedback: String?) {
         var t = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
         guard let re = regex("(?i)<feedback\\b[^>]*>"),
               let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
@@ -1720,7 +1732,9 @@ final class HermesBridge {
         let records = sessionIndex.taskRecords()
         let queuedCount = queuedTaskCount()
         if let latest = records.max(by: { $0.createdAt < $1.createdAt }) {
-            let running = activeTask != nil && !(activeTask?.isComplete ?? true) ? "进行中" : "已完成"
+            // 无活动任务时按索引记录的结束标记回答「已结束」——失败收口同样标 completed，
+            // 不再一律谎报「已完成」（如实反馈）。
+            let running = activeTask != nil && !(activeTask?.isComplete ?? true) ? "进行中" : "已结束"
             let queued = queuedCount > 0 ? "；另有 \(queuedCount) 个任务排队" : ""
             return "最近任务：\(latest.title)（\(running)）\(queued)"
         } else if queuedCount > 0 {
@@ -1779,13 +1793,13 @@ final class HermesBridge {
         return text
     }
 
-    private static func regex(_ pattern: String) -> NSRegularExpression? {
+    private nonisolated static func regex(_ pattern: String) -> NSRegularExpression? {
         try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators])
     }
 
     /// 提取 <open>…</close>（close 缺失容错到文本尾）。返回 nil 未命中。
     private struct MarkedRange { let before: Range<String.Index>; let content: Range<String.Index>; let after: Range<String.Index> }
-    private static func extractMarked(_ text: String, open: String, close: String) -> MarkedRange? {
+    private nonisolated static func extractMarked(_ text: String, open: String, close: String) -> MarkedRange? {
         guard let openRe = regex(open),
               let o = openRe.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
               let openRange = Range(o.range, in: text) else { return nil }
@@ -1852,7 +1866,7 @@ final class HermesBridge {
     /// 协议减法：只教 task/task_steer + spoken/formal 双轨 + 归档 ack（<ok/>）。
     /// 状态查询/取消由本地路由即时处理（不教模型）；task_cancel 解析仅作防御。
     /// 人设取当前 petID（切换人设走 applyPersonaChange 单次注入，或新开对话重建 seed）。
-    static func mainSessionSeed() -> String {
+    nonisolated static func mainSessionSeed() -> String {
         let voice = DeskPetConfig.loadVoicePrompts()   // todo #16：语音提示词（可配置）
         let cfg = DeskPetConfig.load()
         let persona = cfg.persona(for: cfg.petID)
@@ -1916,7 +1930,7 @@ final class HermesBridge {
     /// 陪伴伙伴（活人感 MVP）seed 断言：验证「角色表现准则」四要素、「朋友式陪伴与边界」
     /// 及既有双轨/任务协作标记/硬性规则 1-8/voice 注入原样保留。纯字符串匹配，
     /// 不连 serve、不依赖模型（DeskPetConfig 读盘有容错 fallback，离线安全）。
-    static func runCompanionSeedSelfTest() -> Int32 {
+    nonisolated static func runCompanionSeedSelfTest() -> Int32 {
         var passed = 0
         var failed = 0
         func check(_ name: String, _ ok: Bool) {
@@ -1975,7 +1989,7 @@ final class HermesBridge {
     /// 任务会话种子：执行者 + 双轨协议。
     /// v12：注入工作目录——本会话绑定专属工作区（cwd 已由 session.create 下发），
     /// 文件/终端操作默认在该目录进行（不落到用户项目目录）。
-    static func taskSessionSeed() -> String {
+    nonisolated static func taskSessionSeed() -> String {
         let workspacePath = DeskPetHermesProfile.workspace.path
         return """
         你是任务执行 Agent，专注高效完成任务。可以使用全部工具（文件、终端、搜索等）。

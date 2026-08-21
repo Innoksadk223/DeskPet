@@ -149,7 +149,8 @@ enum HermesSelfTest {
     /// companion（活人感 MVP）纯离线自测（--self-test-companion）：不连 serve、不依赖模型。
     /// 覆盖：feedback 解析 / <ok/>+<feedback> 混合 / emitMainMessage 归档轮端到端携带 /
     /// 主中断后迟到 ok+feedback 抑制 / 向后兼容（无 feedback 时与现状完全一致）。
-    static func runCompanionSelfTest() -> Int32 {
+    /// @MainActor：emitMainMessage 端到段段注入 bridge 隔离状态（thread-affinity-fix）。
+    @MainActor static func runCompanionSelfTest() -> Int32 {
         // 首领收口：串联 seed 角色准则断言（task-seed 内置），失败即退出非零。
         if HermesBridge.runCompanionSeedSelfTest() != 0 {
             print("[companion] seed 角色表现准则断言失败")
@@ -339,7 +340,7 @@ enum HermesSelfTest {
         return failed == 0 ? 0 : 1
     }
 
-    static func run(token: String, port: Int) async -> Int32 {
+    @MainActor static func run(token: String, port: Int) async -> Int32 {
         let client = HermesClient(port: port, token: token)
         var sawMessageDelta = false
         var sawMessageComplete = false

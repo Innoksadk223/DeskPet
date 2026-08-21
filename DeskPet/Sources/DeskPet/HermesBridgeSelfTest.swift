@@ -5,7 +5,8 @@ import Foundation
 enum HermesBridgeSelfTest {
     /// 标记协议解析单元自测（--self-test-markers，不连 serve——纯解析验证）。
     /// 四类标记正反用例：标准/变体/无标记/剥离核查。
-    static func runMarkersSelfTest() -> Int32 {
+    /// @MainActor：parseTaskMarkers/MarkersProbe 触碰 bridge 隔离状态（thread-affinity-fix 后 bridge 为 @MainActor）。
+    @MainActor static func runMarkersSelfTest() -> Int32 {
         var passed = 0
         var failed = 0
         func check(_ name: String, _ input: String, expectContains: String, expectNotContains: [String] = []) {
@@ -276,7 +277,7 @@ enum HermesBridgeSelfTest {
     /// 限制（如实报告）：activeTask/taskSlotOccupied 仅能经网络路径（startTask→createSession）
     /// 建立（HermesClient 为 final 不可替换、无离线建任务通路），防抖 guard 的「任务运行中/
     /// 队列衔接」两个忙态分支与任务侧缺 sid 消歧无法离线注入——不建大型 mock，仅验证等价 guard。
-    static func runStateSyncSelfTest() -> Int32 {
+    @MainActor static func runStateSyncSelfTest() -> Int32 {
         var passed = 0
         var failed = 0
         func check(_ name: String, _ ok: Bool, _ detail: String = "") {
@@ -384,14 +385,14 @@ enum HermesBridgeSelfTest {
     }
 
     /// 标记动作探测（自测用）：记录 bridge 收到的动作调用。
-    private final class MarkersProbe {
+    @MainActor private final class MarkersProbe {
         let bridge = HermesBridge(client: HermesClient(token: "markers-test"))
         init() {
             bridge.overrideMainSessionForTesting(HermesClient.SessionInfo(sessionID: "test", storedSessionID: "test", model: nil))
         }
     }
 
-    static func run(token: String, port: Int) async -> Int32 {
+    @MainActor static func run(token: String, port: Int) async -> Int32 {
         let client = HermesClient(port: port, token: token)
         let bridge = HermesBridge(client: client)
         var states: [PetState] = []

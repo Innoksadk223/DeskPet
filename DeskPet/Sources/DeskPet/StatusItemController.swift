@@ -2,7 +2,9 @@ import AppKit
 
 /// 菜单栏常驻图标 + 菜单（当前状态 / 输入文字 / 下一状态 / 关于 / 退出）。
 /// 图标为 SF Symbol 模板图（pawprint，回退 hare）。
-final class StatusItemController: NSObject {
+/// 菜单栏控制器：纯 UI（NSStatusItem/NSMenu），与 AppDelegate 同为主线程隔离域
+/// （thread-affinity-fix：buildMenu 读取 AppDelegate 的 @MainActor 忙态/唤醒状态）。
+@MainActor final class StatusItemController: NSObject {
     private let statusItem: NSStatusItem
     private weak var app: AppDelegate?
 
