@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation   // AVSpeechSynthesisVoice（系统声线枚举）
+import UniformTypeIdentifiers   // NSOpenPanel mp3 类型过滤（macOS 11+）
 
 /// 应用组装器：素材加载 → 桌宠窗口 → 菜单栏 → 输入面板。
 /// @MainActor（thread-affinity-fix）：AppKit 生命周期本就主线程；标注后内嵌 Task 继承
@@ -1538,7 +1539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if id == "design", cfgAfter.mimoVoiceDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             note = "；⚠️ 设计音色描述未填写——点「设计音色描述…」填写后才能发声"
         } else if id == "clone", !cloneSampleReadable(cfgAfter.mimoVoiceClonePath) {
-            note = "；⚠️ 样本未就绪（文件夹里还没有 mp3）——点「克隆样本文件夹…」打开文件夹放入 10-20s 干净人声"
+            note = "；⚠️ 样本未选择——点「选择克隆样本…」选一个 10-20s 干净人声 MP3"
         }
         feedback("✅ 已切换 MiMo 声线模式：\(name)（立即生效）\(note)")
     }
@@ -1604,23 +1605,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return base.appendingPathComponent("DeskPet/mimo-samples", isDirectory: true)
     }
 
-    /// 克隆样本编辑（clone 模式入口）：打开固定样本文件夹，用户把 mp3 复制进去即可。
-    /// 目录内已有 mp3 → 自动采用最新一个并保存生效；无 → 提示放好后再次点击。
+    /// 克隆样本编辑（clone 模式入口）：弹文件选择器（默认定位固定样本文件夹），
+    /// 选中 mp3 立即写入配置并重建播报链——一步到位，无需「放入后再点一次」。
+    /// （旧两段式：打开 Finder + 扫描目录自动采用——样本放入后不重新点击不生效，实测困惑，已废弃）
     @objc func menuEditMiMoClonePath() {
         let dir = mimoSamplesDir()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(dir)   // Finder 打开样本文件夹
-        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        let mp3s = files
-            .filter { $0.pathExtension.lowercased() == "mp3" }
-            .sorted { lhs, rhs in
-                let lt = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let rt = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return lt > rt
-            }
-        guard let sample = mp3s.first else {
-            LogManager.shared.info("克隆样本文件夹已打开（空）：\(dir.path)")
-            feedback("📂 已打开样本文件夹：\(dir.path)\n请把 10-20s 干净人声 mp3 复制进去，放好后再次点击「克隆样本文件夹…」")
+        let panel = NSOpenPanel()
+        panel.directoryURL = dir
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [UTType.mp3]
+        panel.message = "选择克隆样本（10-20s 干净人声 MP3）——选中后立即生效"
+        panel.prompt = "采用此样本"
+        guard panel.runModal() == .OK, let sample = panel.url else {
+            LogManager.shared.info("克隆样本选择已取消")
             return
         }
         var newCfg = DeskPetConfig.load()

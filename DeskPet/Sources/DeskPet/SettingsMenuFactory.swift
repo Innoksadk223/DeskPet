@@ -261,10 +261,10 @@ enum SettingsMenuFactory {
                 mvMenu.addItem(designItem)
             } else if data.mimoMode == "clone" {
                 let path = data.mimoClonePath.trimmingCharacters(in: .whitespacesAndNewlines)
-                let cloneItem = NSMenuItem(title: "克隆样本文件夹…", action: actions.mimoClonePath, keyEquivalent: "")
+                let cloneItem = NSMenuItem(title: "选择克隆样本…", action: actions.mimoClonePath, keyEquivalent: "")
                 cloneItem.target = target
                 cloneItem.toolTip = path.isEmpty
-                    ? "未配置——点击打开样本文件夹，把 10-20s 干净人声 mp3 复制进去即可"
+                    ? "未配置——点击选择 10-20s 干净人声 mp3，选中即生效"
                     : "当前样本：\(path)"
                 mvMenu.addItem(cloneItem)
             } else {
