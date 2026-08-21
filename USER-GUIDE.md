@@ -237,4 +237,4 @@ DeskPet 启动时会按优先级自动寻找本机 Hermes：
    - `~/.deskpet/hermes/`（会话、工作区、SOUL）
    - 如用源码版：项目目录下的 `DeskPet/history/`
 
-> 版本说明：本指南对应 **DeskPet 0.7.5**。「Hermes 自动适配（第 4 节）」为该版本新增特性。
+> 版本说明：本指南对应 **DeskPet 0.7.8**。「Hermes 自动适配（第 4 节）」为该版本新增特性。

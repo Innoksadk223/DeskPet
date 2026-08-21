@@ -12,8 +12,10 @@ import Foundation
 ///                                ▼
 ///                    <spoken>口语轨</spoken><formal>正式轨</formal> → 回调 UI
 ///
-/// 状态机：事件 → 桌宠 7 态（idle/wave/run/failed/review/jump/waiting）。
-/// 任务完成判定：message.complete + 静默窗口（1.5s 无新 delta）。
+/// 状态机：Hermes 事件驱动桌宠 7 个业务态（idle/wave/run/failed/review/jump/waiting）。
+/// PetState 另包含 running-right/running-left 两个可显式切换的方向态；标准素材契约为 9 行，
+/// 事件状态机不自动驱动方向态。
+/// 任务完成判定：message.complete → 下一主线程调度机会完成处理（v4：不再固定 1.5s 静默窗口）。
 final class HermesBridge {
     // MARK: - 标记协议（预置进两个会话的系统提示词）
     static let dispatchOpen = "<dispatch>"
@@ -36,12 +38,14 @@ final class HermesBridge {
         let spoken: String
         let formal: String
         let dispatchedTask: Bool   // 本条回复是否含派发
-        /// pm3 P1-2：本条回复是否由用户消息触发（false=回填/状态写回触发——播报降 low 不打断对话）
+        /// pm3 P1-2：本条回复是否由用户消息触发（false=归档 ack/人设变更——不播报不打断对话）
         let isUserTurn: Bool
-        /// 播报抢占：关联的任务 tag（回填/状态报告带——迟到时按 tag 舍弃——只播最新任务）
-        let taskTag: String?
-        /// 本轮只包含协议标记（如 <task_status/>），不是用户空输入；等待后续状态/任务反馈。
+        /// 本轮只包含协议标记（如 <task>），不是用户空输入；等待后续任务反馈。
         let protocolOnly: Bool
+        /// companion：主 Agent 在归档 ack <ok/> 后附带的 persona 口吻情绪收尾
+        /// （<feedback>…</feedback>）。仅非用户轮（任务归档/失败 ack）会携带；
+        /// 缺失（nil）时端侧行为与现状完全一致（向后兼容）。只收尾、不转述任务结果。
+        let feedback: String?
     }
 
     struct TaskMessage {
@@ -63,6 +67,9 @@ final class HermesBridge {
         var isComplete = false
         /// 同一常驻 session 下，完成事件之后的迟到 delta/tool 不得写入下一任务。
         var turnClosed = false
+        /// fix-live-ux-details：本任务是否已出现首个有效活动（delta/tool）——
+        /// 启动等待反馈定时器触发判定用（8s 无首个活动才显示过渡气泡）
+        var streamStarted = false
         /// #39：任务实例记录 id（常驻会话下完成标记按实例）
         var taskRecordID = ""
         init(info: HermesClient.SessionInfo, title: String, speechTag: String) { self.info = info; self.title = title; self.speechTag = speechTag }
@@ -76,19 +83,107 @@ final class HermesBridge {
     private var mainBuffer = ""
     /// 主会话当前是否有可接收 delta 的 turn；message.start/submit 开启，complete 关闭。
     private var mainTurnActive = false
+    /// R4（harden-dual-agent-async）：主侧最近一次 complete 时刻（缺 sid complete 消歧用）——
+    /// 主侧刚完成窗口内到达的缺 sid complete 是主侧迟到/重复，不得误关任务 turn。
+    private var lastMainCompleteAt = Date.distantPast
+    /// v10（split-interrupt-commands）：主 Agent 被中断后的迟到事件抑制标记——
+    /// interruptMainAnswer 成功收口后置位；下一轮 message.start（新 turn）清除。
+    /// 作用：被中断轮的迟到 complete/error 不得弹被截断回复/置 failed 卡态。
+    private var mainTurnSuppressed = false
     private var mainDispatching = false        // 正在收集 dispatch 内容
     private var taskCompleteWorkItem: DispatchWorkItem?
+    /// 任务失联看门狗（fix-audio-task-state）：任务 turn 打开后若长时间无该任务任何事件
+    /// （delta/tool/complete/error），判定事件流丢失（serve 事件丢失/会话静默失效）——
+    /// 以可见失败收口并释放任务槽、继续队列，防 activeTask/taskSlotOccupied/宠物状态永久卡住。
+    /// 任何该任务事件到达即重排（真实长任务不误杀）；任务正常收口路径显式取消。
+    private static let taskWatchdogTimeout: TimeInterval = 600   // 10 分钟零事件判定失联
+    private var taskWatchdogItem: DispatchWorkItem?
     private var idleTimer: DispatchWorkItem?   // 防抖：状态回 idle
+    /// 任务事件到达 → 重排看门狗（真实长任务持续有事件不误杀）。
+    private func armTaskWatchdog() {
+        taskWatchdogItem?.cancel()
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
+            guard let self, let task = self.activeTask, !task.isComplete, !task.turnClosed else { return }
+            self.taskWatchdogItem = nil
+            LogManager.shared.warn("任务看门狗：任务「\(task.title)」\(Int(Self.taskWatchdogTimeout))s 无事件，判定失联 → 失败收口")
+            self.cancelTaskStartPending()   // fix-live-ux-details：看门狗收口取消等待反馈
+            task.turnClosed = true
+            task.isComplete = true
+            if !task.taskRecordID.isEmpty { self.sessionIndex.markTaskCompleted(id: task.taskRecordID) }
+            self.activeTask = nil
+            self.setState(.failed)
+            self.onTaskFailed?(task.title, "任务长时间无响应（可能已中断），已按失败收口——重新说一遍即可重试")
+            self.startNextQueuedTask()
+            self.debounceIdle(3.0)
+        }
+        taskWatchdogItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.taskWatchdogTimeout, execute: item)
+    }
+
+    private func cancelTaskWatchdog() {
+        taskWatchdogItem?.cancel()
+        taskWatchdogItem = nil
+    }
+
+    // MARK: - 任务启动等待反馈（fix-live-ux-details）
+
+    /// 任务提交后无首个有效活动（delta/tool）的等待窗口：8s 后显示一次过渡气泡
+    /// （中断收尾约 60s 的服务端 drain 期间用户可见仍在等待，不伪称 queued/失败/重启）
+    static let taskStartPendingDelay: TimeInterval = 8
+    private var taskStartPendingWorkItem: DispatchWorkItem?
+
+    /// 启动等待反馈触发判定（纯函数，可离线单测）：同一任务、turn 未关、未完成、
+    /// 且尚无首个有效活动（delta/tool）时才显示。
+    static func shouldShowTaskStartPending(sameTask: Bool, turnOpen: Bool, complete: Bool, streamStarted: Bool) -> Bool {
+        sameTask && turnOpen && !complete && !streamStarted
+    }
+
+    /// 武装启动等待定时器（任务提交成功后调用；旧定时器取消——不覆盖新任务）。
+    /// 绑定 activeTask 身份：首个有效活动/complete/error/interrupt/看门狗/下一任务切换均取消。
+    private func armTaskStartPending(_ task: TaskRun) {
+        taskStartPendingWorkItem?.cancel()
+        var item: DispatchWorkItem!
+        item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.taskStartPendingWorkItem = nil
+            guard Self.shouldShowTaskStartPending(sameTask: self.activeTask === task,
+                                                  turnOpen: !task.turnClosed,
+                                                  complete: task.isComplete,
+                                                  streamStarted: task.streamStarted) else { return }
+            LogManager.shared.info("任务 \(Int(Self.taskStartPendingDelay))s 无首个有效活动：显示等待反馈（\(task.title)）")
+            self.onTaskStartPending?(task.title)
+        }
+        taskStartPendingWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.taskStartPendingDelay, execute: item)
+    }
+
+    /// 取消等待定时器并通知 AppDelegate 收起等待气泡（首个活动/收口/中断/切换时调用）。
+    /// 幂等：未武装/已触发均安全；通知 nil 时 AppDelegate 仅收起仍是等待文案的气泡。
+    private func cancelTaskStartPending() {
+        taskStartPendingWorkItem?.cancel()
+        taskStartPendingWorkItem = nil
+        onTaskStartPending?(nil)
+    }
+
+    /// 任务首个有效活动标记（delta/tool 到达时调用）：置 streamStarted 并取消等待反馈。
+    private func markTaskActivity(_ task: TaskRun) {
+        task.streamStarted = true
+        cancelTaskStartPending()
+    }
+
     /// 标记协议：本轮主回复是否由回填触发（回填触发的回复不解析标记——防循环）。
     /// P2（ISSUE#1）：单布尔跨 turn 错挂——改 per-turn 类型追踪（见 TurnTracker）。
-    private let turnTracker = TurnTracker()
-    /// 回填防抖（任务事件 5s 内合并）：pending 文本 + 定时 flush
-    private var pendingBackfill: String?
-    /// 播报抢占：回填携带的任务 tag（提交时转入 inFlight——主报告到达时按 tag 丢弃迟到旧报告）
-    private var pendingBackfillTag: String?
-    /// F4：未提交回填所属任务标题（打断时精确匹配取消——不误伤其他任务的回填）
-    private var pendingBackfillTitle: String?
-    private var inFlightBackfillTag: String?
+    let turnTracker = TurnTracker()   // companion 自测（--self-test-companion）注入归档 turn 身份
+    /// 任务结果归档队列（v3）：防抖 5s 内多个任务完成 → 逐条追加（不再覆盖——旧 bug：
+    /// 5s 窗口内两个任务完成，前一个的归档被直接丢弃），flush 时拼接为一条提交（省 turn）。
+    /// 归档失败只记日志不重试：归档丢了仅影响“用户追问任务细节时主 Agent 无上下文”，
+    /// 可接受（下一个任务归档正常落地）；不占用播报/无用户可见影响。
+    private struct PendingArchive {
+        let title: String
+        let text: String
+    }
+    private var pendingArchives: [PendingArchive] = []
     private var backfillWorkItem: DispatchWorkItem?
 
     /// 任务执行队列：常驻任务会话一次只跑一个 turn，新任务先排队，避免 Hermes busy_input_mode=interrupt
@@ -97,25 +192,58 @@ final class HermesBridge {
         let text: String
         let title: String
     }
+    /// fix-ghost-task-queue：启动中生命周期登记（reserveTaskSlot 置位后 → activeTask 创建前，
+    /// 覆盖 ensureTaskSession/createSession/submit 网络往返窗口）。token 标识本次启动：
+    /// 取消/新任务替换会使 token 失效，在途 runTaskNow 据此拦截迟到创建（不复活幽灵任务）。
+    private struct StartingTask {
+        let token = UUID()
+        let text: String
+        let title: String
+    }
     private let taskLifecycleLock = NSLock()
-    private var taskSlotOccupied = false   // 当前任务运行中，或已有一个任务正在创建/提交
+    /// 槽占用 = 运行中（activeTask）或启动中（startingTask）或幽灵残留（两者皆无——自愈点见下）
+    private var taskSlotOccupied = false
+    private var startingTask: StartingTask?   // 启动中生命周期（受 taskLifecycleLock 保护）
     private var pendingTasks: [PendingTask] = []
     private let maxPendingTasks = 5
 
-    // MARK: - B1：写回失败重试（指数退避 1s→2s→4s→8s，最多 4 次；每种写回单链在途，新请求覆盖旧）
-    // 写回（状态查询/结果回填）失败时不再紧循环重试：serve 自愈链路（restartServe + 自动重连）
-    // 在 30s 内恢复，退避重试正好在恢复窗口内幂等落地；失败日志限频（60s 同键最多一条 WARN，
-    // 其余 debug——B1 日志刷屏根除）。
-    private final class WriteBackRetry {
-        var text: String?
-        var attempt = 0
-        var workItem: DispatchWorkItem?
-        func cancel() { workItem?.cancel(); workItem = nil; text = nil; attempt = 0 }
+    // MARK: - 任务槽相位判定（fix-ghost-task-queue，纯函数可离线单测）
+
+    /// 任务槽生命周期相位：free=空闲；running=活动任务；starting=启动中（activeTask 未创建）；
+    /// ghost=槽残留（无活动任务且无启动中——需自愈释放，否则新任务被幽灵槽误排队）。
+    enum TaskSlotPhase: Equatable { case free, running, starting, ghost }
+    static func taskSlotPhase(occupied: Bool, hasActive: Bool, hasStarting: Bool) -> TaskSlotPhase {
+        if !occupied { return .free }
+        if hasActive { return .running }
+        if hasStarting { return .starting }
+        return .ghost
     }
-    private let statusRetry = WriteBackRetry()
-    private let backfillRetry = WriteBackRetry()
+
+    /// 启动生命周期归属判定：starting 记录仍是本次启动（token 匹配）才允许创建 activeTask；
+    /// 已被取消/被新任务替换（token 失效）则拦截迟到创建。
+    static func startTransitionShouldProceed(currentToken: UUID?, expectedToken: UUID) -> Bool {
+        currentToken == expectedToken
+    }
+
+    /// 中断分支判定：仅 starting 相位走「启动中取消」（不打断 activeTask，也无幽灵可释放）。
+    static func interruptShouldCancelStarting(phase: TaskSlotPhase) -> Bool {
+        phase == .starting
+    }
+
+    /// 排队文案相位：前置是启动中任务（而非执行中）时文案如实说明「正在启动」。
+    static func queuedBehindText(starting: Bool) -> String {
+        starting ? "前一任务正在启动" : "当前任务还在执行"
+    }
+
+    /// 槽位预约结果：position 0=立即执行（token 为本次启动令牌），正数=队列位置，-1=队列已满。
+    private struct TaskSlotReservation {
+        let position: Int
+        let starting: Bool   // 排队时前置是否为启动中（文案用）
+        let token: UUID?     // position == 0 时有效
+    }
+
+    /// 归档失败日志限频：60s 内首次 WARN，其余降 debug（防刷屏）。
     private var lastWriteBackWarnAt = Date.distantPast
-    private static let maxWriteBackAttempts = 4
 
     /// 写回失败日志限频：60s 内同链首次 WARN，其余降 debug（B1 防刷屏）。
     private func rateLimitedWarn(_ message: String) {
@@ -128,10 +256,10 @@ final class HermesBridge {
     }
 
     /// turn 类型（P2 ISSUE#1）：按提交类型判定 complete 是否解析标记。
+    /// v3 协议减法（2026-08-14）：statusQuery 已砍（状态查询走本地路由，不写回主会话）。
     enum TurnKind {
         case user        // 用户消息——主回复解析任务协作标记
-        case backfill    // 任务结果回填——主回复不解析（防循环）
-        case statusQuery // 任务状态写回——主回复不解析
+        case backfill    // 任务结果归档——主回复是 <ok/> 确认，不解析不播报
     }
 
     /// P2（ISSUE#1）：turn 类型追踪器。提交成功时 record（一个会话同时只有一个在途 turn——
@@ -151,6 +279,10 @@ final class HermesBridge {
             return kind == .user
         }
         var hasPending: Bool { !inFlight.isEmpty }
+        /// P1-2（审查修复 2026-08-15）：清空在途记录——仅会话重建路径用（旧会话的 turn
+        /// 永无 complete 消费，残留记录会把下一条用户回复误判为归档轮而静默丢弃）；
+        /// resume 成功路径不清（会话延续，在途 turn 仍会 complete，记录仍有效）。
+        func reset() { inFlight.removeAll() }
     }
 
     /// 聊天队列项（P2 ISSUE#1）：带 turn 类型和服务端排队标记。
@@ -173,12 +305,17 @@ final class HermesBridge {
     var onTaskComplete: ((String) -> Void)?         // 任务标题
     /// 任务失败（P1：title + 原因 message——小白可见失败原因；reason 可能为空）
     var onTaskFailed: ((String, String) -> Void)?   // (标题, 原因)
-    /// 新任务进入队列（标题、队列位置）
-    var onTaskQueued: ((String, Int) -> Void)?
+    /// 新任务进入队列（标题、队列位置、前置是否为启动中——文案「正在启动/正在执行」）
+    var onTaskQueued: ((String, Int, Bool) -> Void)?
     /// pm3 P1-3/P1-4：回填过渡气泡/写回失败提示（AppDelegate 注入——「⏳ 整理任务结果…」/「⚠️ 失败」）
-    var onBackfillNotice: ((String) -> Void)?
+    // v3：已删——归档不再有过渡气泡（直报后无「整理」环节）；声明移除，消费点同步删除。
     /// 启动接管运行中任务通知（AppDelegate 气泡「↩ 已恢复跟踪」）
     var onAdoptedTask: ((String) -> Void)?          // 任务标题
+    /// fix-live-ux-details：任务启动等待反馈——任务提交后 taskStartPendingDelay 内无首个
+    /// 有效活动（delta/tool）时回调 title（AppDelegate 显示一次过渡气泡，说明可能仍在完成
+    /// 中断收尾）；首个有效活动/任务收口时回调 nil（AppDelegate 仅收起仍是等待文案的气泡，
+    /// 不覆盖最终结果或新任务气泡）。
+    var onTaskStartPending: ((String?) -> Void)?
     var onRawEvent: ((HermesClient.Event) -> Void)? // 调试/统计用
     var onApprovalRequest: ((HermesClient.Event) -> Void)?   // M3 分级审批
 
@@ -221,11 +358,11 @@ final class HermesBridge {
             defer { self?.reconnectingResumeInFlight = false }
             guard let self else { return }
             do {
-                let info = try await self.client.resume(sessionID: savedID)
+                let info = try await self.client.resume(sessionID: savedID, profile: self.sessionIndex.mainProfile)
                 if info.sessionID != self.mainSession?.sessionID {
                     LogManager.shared.info("C4：serve 重启后主会话已重新 resume：\(info.sessionID)（stored=\(info.storedSessionID)）")
                     self.mainSession = info
-                    self.sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID)
+                    self.sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID, profile: self.sessionIndex.mainProfile)
                     self.mainBuffer = ""   // 旧流残留（中断的回复）无意义
                     self.mainTurnActive = false
                 } else {
@@ -233,6 +370,10 @@ final class HermesBridge {
                     self.mainBuffer = ""
                     self.mainTurnActive = false
                 }
+                // P1-1（审查修复 2026-08-15）：断线期间若有消息在本地排队，重连后立即补发
+                //（此前唯一触发点是 message.complete——若断线时 turn 已终结，complete 不会再来，队列永滞留）。
+                // flushChatQueue 空队列幂等；resume 后在途 turn 仍跑时服务端 queued 排队，安全。
+                self.flushChatQueue()
             } catch HermesClient.HermesError.server(let code, let message) {
                 if code == 4007 || message.contains("not found") {
                     // 主会话在 serve 端已不存在（serve 重启不保留会话——实测 4007）——
@@ -246,6 +387,11 @@ final class HermesBridge {
                         for attempt in 1...3 {
                             do {
                                 try await self.ensureMainSession()
+                                // P1-2（审查修复 2026-08-15）：旧会话已亡，其 turn 永无 complete——
+                                // 残留 tracker 记录会把新会话首条用户回复误判为归档轮而静默丢弃，必须清。
+                                self.turnTracker.reset()
+                                // P1-1：重建后新会话空闲，断线期间的排队消息立即补发（兑现「自动发送」承诺）。
+                                self.flushChatQueue()
                                 LogManager.shared.info("C4：主会话重建成功（第 \(attempt) 次尝试）")
                                 return
                             } catch {
@@ -269,7 +415,9 @@ final class HermesBridge {
     private func resumeTaskSessionAfterReconnect() async {
         guard let savedTask = taskSessionGate.current() else { return }
         do {
-            let info = try await client.resume(sessionID: savedTask.storedSessionID)
+            // v5：任务会话按记录 profile 恢复（legacy=nil 走默认）
+            let recProfile = sessionIndex.taskRecords().first { $0.storedSessionID == savedTask.storedSessionID }?.profile
+            let info = try await client.resume(sessionID: savedTask.storedSessionID, profile: recProfile)
             taskSessionGate.adopt(info)
             if let task = activeTask, !task.isComplete {
                 task.info = info
@@ -297,62 +445,134 @@ final class HermesBridge {
 
     // MARK: - 对外接口
 
-    /// 建立主会话（常驻对话）。seed 含标记协议提示词（人设走每轮消息注入——热切换）。
-    /// 跨重启复用（#36-2）：session-index 有主会话 key → 优先 session.resume 恢复同一会话
+    /// 主会话 seed 版本（v3 协议减法，2026-08-14）：人设/双轨协议进 seed、归档协议替代回填转述、
+    /// 删 dispatch/steer/task_status/task_cancel 教学。版本不符的存量会话不 resume（协议已变，
+    /// 老会话里教的是旧协议）——直接新建（历史会话仍在索引中可查）。
+    /// v12（deskpet-workspace）：升到 4——升级前的主/任务会话未显式绑定 cwd（serve 按启动目录
+    /// 回退，任务 Agent 默认文件操作会落到用户项目目录）。以最小版本门槛让升级后**不 resume 旧 cwd
+    /// 当前会话**：旧当前由 setMain 自动归档（历史保留可查看/删除，不迁移正文），新建绑定
+    /// ~/.deskpet/hermes/workspace 的主会话；后续 restart seed 版本一致 → 正常 resume 新会话。
+    static let mainSeedVersion = 4
+
+    /// v12：主会话 resume 门槛（纯函数，可离线自测）——seed 版本一致 且 有 profile 才 resume。
+    /// 版本不一致（旧协议 / 旧 cwd 未绑定会话）或 legacy（无 profile）→ 不 resume（归档后新建）。
+    static func shouldResumeMainSession(savedSeedVersion: Int, currentSeedVersion: Int, savedProfile: String?) -> Bool {
+        savedSeedVersion == currentSeedVersion && savedProfile != nil
+    }
+
+    /// 建立主会话（常驻对话）。seed 含人设+精简标记协议（v3：一次性注入，不再每轮前缀）。
+    /// 跨重启复用（#36-2）：session-index 有主会话 key 且 seed 版本一致 → 优先 session.resume 恢复
     /// （对话连续）；resume 失败区分：4007 已清理 → 新建；网络/其他错误 → 抛出不静默新建
-    /// （避免丢上下文）。种子语义：resume 不注入新 seed——提示词更新后用户可「新开对话」强制新建。
+    /// （避免丢上下文）。seed 版本不一致 → 不 resume（旧协议会话直接新建）。
+    /// v5 历史存储隔离：新主会话创建在 deskpet-app profile（~/.deskpet/hermes）；
+    /// 旧索引缺 profile 视为 legacy——升级后旧当前不再 resume，由 setMain 自动归档进历史
+    /// （legacy 可查看删除），新会话立即使用 deskpet-app。
+    /// v12：新主会话创建显式传 cwd=~/.deskpet/hermes/workspace（DeskPetHermesProfile.workspace）；
+    /// seed 版本门槛升到 4——升级前未绑定 cwd 的旧当前会话不 resume（归档保留，不迁移正文）。
     func ensureMainSession() async throws {
         guard mainSession == nil else { return }
+        // v5：deskpet-app profile 接入（幂等；冲突抛错不覆盖——如实反馈给用户）
+        try DeskPetHermesProfile.ensure()
         if !sessionIndex.mainStoredSessionID.isEmpty {
-            // 实测（2026-08-14）：resume 参数必须用 stored_session_id（内部 id 返回 4007）
             let savedID = sessionIndex.mainStoredSessionID
-            do {
-                let info = try await client.resume(sessionID: savedID)
-                mainSession = info
-                // resume 返回的 key 可能与索引旧 key 不同——回写索引保持最新
-                sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID)
-                LogManager.shared.info("主会话复用（resume）：\(info.sessionID)（stored=\(info.storedSessionID)）")
-                onState?(.idle)
-                return
-            } catch HermesClient.HermesError.server(let code, let message) {
-                if code == 4007 || message.contains("not found") {
-                    // 会话已被清理（如删除历史）→ 回退新建
-                    LogManager.shared.info("主会话复用失败（会话已不存在 code=\(String(describing: code))），新建会话")
-                } else {
-                    // 其他服务端错误：不静默新建（可能丢上下文），抛给调用方反馈重试
-                    LogManager.shared.warn("主会话复用失败（服务端错误 code=\(String(describing: code))）：\(message)")
-                    throw HermesClient.HermesError.server(code: code, message: message)
+            let savedProfile = sessionIndex.mainProfile
+            let seedMismatch = sessionIndex.mainSeedVersion() != Self.mainSeedVersion
+            if !Self.shouldResumeMainSession(savedSeedVersion: sessionIndex.mainSeedVersion(),
+                                             currentSeedVersion: Self.mainSeedVersion,
+                                             savedProfile: savedProfile) {
+                // v3：seed 版本不一致 → 不 resume（旧协议会话直接新建）
+                // v5：legacy 当前主（无 profile）→ 不 resume——旧当前由 setMain 自动归档，新会话用 deskpet-app
+                // v12：seed v3（旧 cwd 未绑定 workspace）→ 不 resume——归档旧当前，新建绑定 workspace 的会话
+                let reason = seedMismatch
+                    ? "seed 版本不一致（\(sessionIndex.mainSeedVersion()) → \(Self.mainSeedVersion)）——旧 cwd 会话归档，新建绑定 workspace 的会话"
+                    : "legacy 当前主（无 profile）——归档后新会话用 deskpet-app"
+                LogManager.shared.info("主会话不 resume：\(reason)")
+            } else {
+                // 实测（2026-08-14）：resume 参数必须用 stored_session_id（内部 id 返回 4007）
+                do {
+                    let info = try await client.resume(sessionID: savedID, profile: savedProfile)
+                    mainSession = info
+                    // resume 返回的 key 可能与索引旧 key 不同——回写索引保持最新
+                    sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID, seedVersion: Self.mainSeedVersion, profile: savedProfile)
+                    LogManager.shared.info("主会话复用（resume）：\(info.sessionID)（stored=\(info.storedSessionID)，profile=\(savedProfile ?? "default")）")
+                    onState?(.idle)
+                    return
+                } catch HermesClient.HermesError.server(let code, let message) {
+                    if code == 4007 || message.contains("not found") {
+                        // 会话已被清理（如删除历史）→ 回退新建
+                        LogManager.shared.info("主会话复用失败（会话已不存在 code=\(String(describing: code))），新建会话")
+                    } else {
+                        // 其他服务端错误：不静默新建（可能丢上下文），抛给调用方反馈重试
+                        LogManager.shared.warn("主会话复用失败（服务端错误 code=\(String(describing: code))）：\(message)")
+                        throw HermesClient.HermesError.server(code: code, message: message)
+                    }
+                } catch {
+                    // 网络失败：不静默新建（避免丢上下文），抛出由调用方反馈/重试
+                    LogManager.shared.warn("主会话复用失败（网络）：\(error)")
+                    throw error
                 }
-            } catch {
-                // 网络失败：不静默新建（避免丢上下文），抛出由调用方反馈/重试
-                LogManager.shared.warn("主会话复用失败（网络）：\(error)")
-                throw error
             }
         }
         let seed = Self.mainSessionSeed()
-        let info = try await client.createSession(title: "桌宠主会话", seedMessages: [["role": "system", "content": seed]])
+        let info = try await client.createSession(title: "桌宠主会话",
+                                                  seedMessages: [["role": "system", "content": seed]],
+                                                  profile: DeskPetHermesProfile.name,
+                                                  cwd: DeskPetHermesProfile.workspace.path)
+        // M3（fresh-install 加固）：后端 profile 能力硬门槛——必须明确回报 profile_name=deskpet-app
+        // 且 desktop_contract 达当前已验证门槛；失败关闭/删除刚建会话、索引未 setMain（legacy 索引
+        // 保留），报 Hermes 版本不兼容，绝不静默降级默认 DB。
+        do {
+            try Self.validateBackendContract(info, requestedProfile: DeskPetHermesProfile.name)
+        } catch {
+            try? await client.close(sessionID: info.sessionID)
+            try? await client.delete(storedSessionID: info.storedSessionID, profile: DeskPetHermesProfile.name)
+            LogManager.shared.error("主会话创建被后端能力门槛拦截（已清理刚建会话）：\(error)")
+            throw error
+        }
         mainSession = info
-        sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID)
-        LogManager.shared.info("主会话就绪：\(info.sessionID)")
+        sessionIndex.setMain(sessionID: info.sessionID, storedSessionID: info.storedSessionID, seedVersion: Self.mainSeedVersion, profile: DeskPetHermesProfile.name)
+        LogManager.shared.info("主会话就绪：\(info.sessionID)（seed v\(Self.mainSeedVersion)，profile=deskpet-app，contract=\(info.desktopContract ?? -1)）")
         onState?(.idle)
+    }
+
+    /// M3（fresh-install 加固）：后端 profile 能力硬门槛。
+    /// create/resume 必须明确回报 profile_name=请求的 profile 且 desktop_contract 达到当前
+    /// 已验证门槛；否则抛 backendIncompatible——调用方关闭/删除刚建会话、保留 legacy 索引，
+    /// 绝不静默降级默认 DB（serve 端 _response_profile_name 在 profile 解析失败时会回退
+    /// launch profile 名——正是静默降级点，必须在此拦截）。
+    /// 当前已验证门槛：serve DESKTOP_BACKEND_CONTRACT = 6（tui_gateway/server.py）。
+    static let minDesktopContract = 6
+    static func validateBackendContract(_ info: HermesClient.SessionInfo, requestedProfile: String) throws {
+        if info.profileName != requestedProfile {
+            throw DeskPetHermesProfile.ProfileError.backendIncompatible(
+                "会话创建回报 profile_name=\(info.profileName ?? "（缺失）")，期望 \(requestedProfile)——后端未启用 named profile，拒绝静默写入默认 Hermes")
+        }
+        guard let contract = info.desktopContract else {
+            throw DeskPetHermesProfile.ProfileError.backendIncompatible(
+                "会话创建未回报 desktop_contract——Hermes 版本过旧或后端不兼容，请升级 hermes-agent")
+        }
+        guard contract >= Self.minDesktopContract else {
+            throw DeskPetHermesProfile.ProfileError.backendIncompatible(
+                "desktop_contract=\(contract) 低于当前已验证门槛 \(Self.minDesktopContract)——Hermes 版本过旧，请升级 hermes-agent")
+        }
     }
 
     /// 用户对话（走主会话）；文字任务同样入口（由主 Agent 判定是否派发）。
     /// P1 修复：serve 4009（session busy——上一条回复未完成）不再被调用方 try? 静默吞——
     /// 文本入队 + onChatQueued 提示 + 主回复完成后自动 flush。
-    /// ① 人设热切换（每轮注入）：提交前按当前 petID 前缀注入人设提示词（personaPrefixed）——
-    /// 人设每次对话随消息携带 → 切换人设/编辑 personas.json 后下一条消息即生效（无需新开对话）。
+    /// v3：人设/双轨协议已进 seed（会话创建时一次注入）——不再每条消息前缀注入
+    /// （旧机制 token 线性膨胀）；切人设走 personaChangeMessage 单次注入。
     func chat(_ text: String) async throws {
         guard let main = mainSession else { throw HermesClient.HermesError.notConnected }
         setState(.waiting)
-        let personaText = Self.personaPrefixed(text)
+        userSubmittedAt = Date()   // 端到端计时：用户消息提交时刻
 
         // 本地先挡住已知在途 turn，避免 busy_input_mode=interrupt 把当前回复 redirect/interrupt。
         if mainTurnActive {
             guard pendingChatQueue.count < maxPendingChat else {
                 throw HermesClient.HermesError.server(code: nil, message: "排队已满（\(maxPendingChat) 条），稍后再试")
             }
-            pendingChatQueue.append(ChatQueueItem(text: personaText, kind: .user, queued: true))
+            pendingChatQueue.append(ChatQueueItem(text: text, kind: .user, queued: true))
             LogManager.shared.info("聊天入队（主会话忙）：队列=\(pendingChatQueue.count) 条")
             onChatQueued?(pendingChatQueue.count)
             return
@@ -360,14 +580,16 @@ final class HermesBridge {
 
         do {
             // queued=true 只在服务端发现竞态 busy 时生效；空闲会话仍正常启动 streaming。
-            let status = try await client.submit(personaText, sessionID: main.sessionID, queued: true)
+            let status = try await client.submit(text, sessionID: main.sessionID, queued: true)
+            // R3（harden-dual-agent-async）：无论 queued 与否都登记 tracker——服务端 queued 的
+            // turn 也保持身份与顺序（否则在途归档 .backfill 记录会先被本 turn 的 complete 消费，
+            // 用户回复被误判为归档轮而静默吞）。message.start 会置 mainTurnActive。
+            turnTracker.record(.user)
             if status == "queued" {
-                // 服务端 queued turn 由后续 message.start/complete 接管，不能提前占用本地 tracker。
                 LogManager.shared.info("聊天已进入 Hermes 服务端队列（竞态 busy）")
                 onChatQueued?(1)
                 return
             }
-            turnTracker.record(.user)
             mainTurnActive = true
         } catch HermesClient.HermesError.server(let code, let errMsg)
                     where code == 4009 || errMsg.contains("busy") {
@@ -375,7 +597,7 @@ final class HermesBridge {
             guard pendingChatQueue.count < maxPendingChat else {
                 throw HermesClient.HermesError.server(code: code, message: "排队已满（\(maxPendingChat) 条），稍后再试")
             }
-            pendingChatQueue.append(ChatQueueItem(text: personaText, kind: .user, queued: true))
+            pendingChatQueue.append(ChatQueueItem(text: text, kind: .user, queued: true))
             LogManager.shared.info("聊天入队（busy）：队列=\(pendingChatQueue.count) 条")
             onChatQueued?(pendingChatQueue.count)
             return   // 已入队视为处理成功（不抛）
@@ -386,27 +608,48 @@ final class HermesBridge {
             mainSession = nil
             try await ensureMainSession()
             guard let fresh = mainSession else { throw HermesClient.HermesError.notConnected }
-            let status = try await client.submit(personaText, sessionID: fresh.sessionID, queued: true)
+            let status = try await client.submit(text, sessionID: fresh.sessionID, queued: true)
+            // R3：queued 也登记（见上）——重建后的消息同样保持 tracker 身份与顺序
+            turnTracker.record(.user)
             if status == "queued" {
                 LogManager.shared.info("主会话重建后的消息进入 Hermes 服务端队列")
                 onChatQueued?(1)
                 return
             }
-            turnTracker.record(.user)
             mainTurnActive = true
         }
     }
 
-    /// ① 人设热切换（每轮注入）：用户消息前缀注入当前人设提示词。
-    /// personas.json 按当前 petID 实时读取（无缓存——切人设/手动编辑文件后下一条消息即生效）；
-    /// 回填/状态写回等系统消息不注入（保持协议消息纯净）。
-    static func personaPrefixed(_ text: String) -> String {
+    /// 端到端计时（v3）：最近一次用户消息提交时刻（含排队 flush 后的提交）；
+    /// emitMainMessage 时打日志。队列场景只记最新一次——量级感知用，不追求严格 per-turn。
+    private var userSubmittedAt: Date?
+
+    /// v3：人设变更消息（仅切换人设时提交一次——替代旧版每条消息前缀注入）。
+    /// 主 Agent 收到后按新人设简短打招呼确认（正常用户轮：显示+播报，天然成为切换反馈）。
+    func applyPersonaChange(_ petID: String) async {
+        guard let main = mainSession else { return }
         let cfg = DeskPetConfig.load()
-        let persona = cfg.persona(for: cfg.petID)
-        // R-2026-08-13：追加双轨输出协议——spoken=口语概要（约为 formal 长度的 1/5~1/10，
-        // 全文朗读），formal=完整正文（气泡显示）。不设硬字数上限（比例制）。
-        // 不遵守时仍有 parseDualTrack 全文兜底。
-        return "[人设] 以下是你当前应遵循的人设（是你的固定说话风格，不是用户消息；自本条起覆盖此前任何人设设定）：\n\(persona)\n\n[输出格式] 回复必须使用双轨格式：<spoken>口语概要（约为 <formal> 正式内容长度的 1/5 到 1/10，将被全文朗读）</spoken><formal>完整详细回复（含全部细节，气泡展示）</formal>\n\n[用户消息] 请按上述人设与输出格式回应：\n\(text)"
+        let persona = cfg.persona(for: petID)
+        let text = "[人设变更]（系统消息，不是用户发言）从本条起你切换为以下人设（覆盖此前任何人设）：\n\(persona)\n\n请用新人设简短打个招呼确认。"
+        do {
+            if mainTurnActive {
+                pendingChatQueue.append(ChatQueueItem(text: text, kind: .user, queued: true))
+                return
+            }
+            let status = try await client.submit(text, sessionID: main.sessionID, queued: true)
+            // R3：queued 也登记（身份保持）——人设变更回复是用户轮（正常展示播报），
+            // 不得被后提交的 .backfill 记录抢占顺序
+            turnTracker.record(.user)
+            if status != "queued" {
+                mainTurnActive = true
+                userSubmittedAt = Date()
+            }
+            LogManager.shared.info("人设变更已提交主会话：\(petID)")
+        } catch {
+            // 失败不重试：当前会话维持原人设；新开对话会按新 petID 建 seed 彻底生效。
+            LogManager.shared.warn("人设变更提交失败（当前会话维持原人设，新开对话可彻底生效）：\(error)")
+            onChatFlushFailed?("人设切换未同步到当前对话，新开对话后彻底生效")
+        }
     }
 
     /// 聊天排队（P1）：busy 时不静默——入队 + 提示 + 主回复完成后自动 flush。
@@ -435,14 +678,17 @@ final class HermesBridge {
             guard let self else { return }
             do {
                 let status = try await self.client.submit(next.text, sessionID: main.sessionID, queued: next.queued)
+                // R3：queued 也登记（身份/顺序保持）——.backfill 项 flush 进服务端队列后，
+                // 其迟到 <ok/> 仍按归档轮消费（不展示不播报），且不污染在途用户 turn 的顺序
+                self.turnTracker.record(next.kind)
                 if status == "queued" {
                     LogManager.shared.info("聊天队列 flush 已进入 Hermes 服务端队列（剩余 \(self.pendingChatQueue.count) 条）")
                     self.chatFlushRetryCount = 0
                     return
                 }
-                self.turnTracker.record(next.kind)
                 self.mainTurnActive = true
                 self.chatFlushRetryCount = 0   // 成功：重置重试计数
+                if next.kind == .user { self.userSubmittedAt = Date() }   // v3 计时：排队消息从实际提交起算
                 LogManager.shared.info("聊天队列 flush 提交：status=\(status)（剩余 \(self.pendingChatQueue.count) 条）")
             } catch HermesClient.HermesError.server(let code, let message) where code == 4009 || message.contains("busy") {
                 // 仍忙：插回队首（等下一个 complete 再 flush；类型随项保留）
@@ -481,8 +727,10 @@ final class HermesBridge {
     }
 
     /// 强制派发（触发词"执行任务：xxx"或"跟任务说"绕过主 Agent 判定时用）。
-    func dispatchTask(_ text: String, title: String? = nil) async throws {
-        try await startTask(text, title: title ?? Self.taskTitle(text))
+    /// v9（fix-audio-task-state）：不再抛错——失败统一由 onTaskFailed 可见收口
+    /// （主会话未就绪/队列满/启动异常均不静默，杜绝「任务已接收却无下文」）。
+    func dispatchTask(_ text: String, title: String? = nil) async {
+        await startTask(text, title: title ?? Self.taskTitle(text))
     }
 
     /// 任务会话转向（"跟任务说：xxx"）。
@@ -492,7 +740,7 @@ final class HermesBridge {
         guard let task = activeTask, !task.isComplete else {
             // P1-2：无活动任务（已完成/中断）→ fallback 为新任务派发（常驻会话上下文延续——
             // 「接着刚才的写」由常驻成员上下文天然支持；不再哑火）
-            try await fallbackSteerToDispatch(text)
+            await fallbackSteerToDispatch(text)
             return
         }
         do {
@@ -500,14 +748,15 @@ final class HermesBridge {
         } catch HermesClient.HermesError.server(let code, let message) where code == 4007 || message.contains("not found") {
             // P1-2：运行中任务的会话失效（serve 重启）→ fallback 新派发（常驻重建自动处理）
             LogManager.shared.warn("steer 会话失效（4007）→ fallback 为新任务派发")
-            try await fallbackSteerToDispatch(text)
+            await fallbackSteerToDispatch(text)
         }
     }
 
     /// P1-2：steer fallback——指令作为新任务提交常驻会话（上下文延续）。
-    private func fallbackSteerToDispatch(_ text: String) async throws {
+    /// v9：派发失败已由 startTask 统一可见收口（不再抛错）。
+    private func fallbackSteerToDispatch(_ text: String) async {
         LogManager.shared.info("steer 无活动任务 → fallback 为新任务派发：\(text.prefix(30))…")
-        try await dispatchTask(text, title: Self.taskTitle(text))
+        await dispatchTask(text, title: Self.taskTitle(text))
     }
 
     /// 打断当前任务（#39 常驻语义）：只 interrupt 停当前 turn——**不 close**（常驻会话保留，
@@ -515,40 +764,177 @@ final class HermesBridge {
     /// F3：无运行中任务 → 返回 false（调用方如实提示「当前没有正在运行的任务」，不做假成功）。
     /// F4：打断成功 → 清理该任务尚未提交的结果回填（已停止，不再有结果可回填——
     /// 取消后主会话空回填误导根除；已提交的在途回填无法撤回，由主 Agent 如实处理）。
-    func interruptTask() async throws -> Bool {
-        guard let task = activeTask else {
-            LogManager.shared.info("中断任务：当前没有正在运行的任务（忽略）")
-            return false
+    /// R4（harden-dual-agent-async）：缺 sid complete 归属判定（纯函数，可离线单测）。
+    /// 显式在途证据：主 turn 活跃 / 主 tracker 在途（含服务端 queued 记录，见 R3）/ 主侧刚完成
+    /// 窗口（nilSidMainRecentWindow）——任一为真 → 归主（不丢主回复）；仅当任务 turn 未关且
+    /// 主侧无任何在途证据时归任务（真实任务完成不错归主侧）。
+    static let nilSidMainRecentWindow: TimeInterval = 3.0
+    static func nilSidCompleteBelongsToTask(taskTurnOpen: Bool, mainTurnActive: Bool,
+                                            mainTrackerPending: Bool, mainRecentlyCompleted: Bool) -> Bool {
+        guard taskTurnOpen else { return false }
+        guard !mainTurnActive, !mainTrackerPending else { return false }
+        return !mainRecentlyCompleted
+    }
+
+    /// 任务中断结果（fix-ghost-task-queue）：本地收口始终完成；远端 RPC 失败如实标记。
+    enum TaskInterruptOutcome: Equatable {
+        case inactive             // 没有活动任务/启动中任务（含幽灵槽自愈）
+        case stopped              // 本地 + 远端均已停止
+        case stoppedUnconfirmed   // 本地已停止，远端 interrupt 失败/超时（未确认）
+        case cancelledDuringStart // 启动中被取消（尚未创建 activeTask）
+    }
+
+    /// 打断当前任务（#39 常驻语义）：只 interrupt 停当前 turn——**不 close**（常驻会话保留，
+    /// 可接新任务；跨任务上下文是特性）。任务实例记录标记 completed（该实例结束）。
+    /// F3：无运行中任务 → .inactive（调用方如实提示，不做假成功）。
+    /// fix-ghost-task-queue：本地取消意图优先——即使远端 interrupt 超时/失败，也完成本地收口
+    /// （activeTask/pendingTasks/taskSlotOccupied/看门狗/播报），返回 .stoppedUnconfirmed 如实提示；
+    /// 启动中（activeTask 未创建）取消走 .cancelledDuringStart；迟到事件由 activeTask 清空 +
+    /// 3s 失败抑制窗口拦截，不复活旧任务。
+    func interruptTask() async -> TaskInterruptOutcome {
+        let phase = taskLifecycleLock.withLock {
+            Self.taskSlotPhase(occupied: taskSlotOccupied,
+                               hasActive: activeTask != nil,
+                               hasStarting: startingTask != nil)
         }
+        // 启动中取消：本地收口（清队列+释放槽+清 starting）；在途 runTaskNow 经 token 检查
+        // 终止 create/submit，不创建幽灵 activeTask。远端无会话可 interrupt（尚未创建）。
+        if Self.interruptShouldCancelStarting(phase: phase) {
+            let cancelled = cancelStartingTask()
+            // 状态收口：runTaskNow 已 setState(.run)——取消后显式回 idle（防卡 run）
+            setState(.idle)
+            LogManager.shared.info("任务已取消（启动中，尚未创建任务实例）：\(cancelled)（队列已清空）")
+            return .cancelledDuringStart
+        }
+        // 无活动任务：幽灵槽自愈（残留 taskSlotOccupied）——取消意图优先清队列
+        if phase != .running {
+            taskLifecycleLock.lock()
+            let hadQueue = !pendingTasks.isEmpty
+            pendingTasks.removeAll()
+            taskSlotOccupied = false
+            taskLifecycleLock.unlock()
+            if phase == .ghost {
+                LogManager.shared.warn("中断任务：无活动任务，幽灵任务槽已自愈释放\(hadQueue ? "（队列已清空）" : "")")
+            } else {
+                LogManager.shared.info("中断任务：当前没有正在运行的任务\(hadQueue ? "（队列已清空）" : "（忽略）")")
+            }
+            return .inactive
+        }
+        guard let task = activeTask else { return .inactive }   // 理论不可达（相位已判 running）
         let sessionID = task.info.sessionID
-        try await client.interrupt(sessionID: sessionID)
         // PM4：打断后 3s 窗口内同任务迟到 error 视为打断的正常结果——
         // 抑制失败回调（防「⏹ 已打断」+「❌ 任务失败」双提示）
         suppressFailureTaskID = sessionID
         suppressFailureUntil = Date().addingTimeInterval(3)
+        var remoteConfirmed = true
+        do {
+            try await client.interrupt(sessionID: sessionID)
+        } catch {
+            // fix-ghost-task-queue：远端失败不阻止本地收口（本地取消意图优先）
+            remoteConfirmed = false
+            LogManager.shared.warn("任务中断 RPC 失败（本地仍按取消收口，新任务不再被旧任务阻塞）：\(error)")
+        }
+        return finalizeTaskInterrupt(task, remoteConfirmed: remoteConfirmed)
+    }
+
+    /// fix-ghost-task-queue：任务取消的本地收口（远端 interrupt 无论成败都执行；
+    /// 测试可离线注入——不依赖网络）。返回结果供 UI 区分「已停止/已本地停止但远端未确认」。
+    func finalizeTaskInterrupt(_ task: TaskRun, remoteConfirmed: Bool) -> TaskInterruptOutcome {
         task.turnClosed = true
         task.isComplete = true
         sessionIndex.markTaskCompleted(id: task.taskRecordID)
-        activeTask = nil
+        if activeTask === task { activeTask = nil }
         clearPendingTasks()
+        cancelTaskStartPending()   // fix-live-ux-details：中断收口取消等待反馈（迟到定时器不得覆盖⏹反馈）
         // 打断 = 任务结束：状态必须收口——否则宠物停留在 run 工作动态（打断后无任何
         // 后续状态事件驱动恢复；迟到 error 也被 3s 抑制窗口拦掉，必须在此显式回 idle）。
         setState(.idle)
-        // F4：仅取消属于被打断任务的未提交回填（5s 防抖窗口内的）+ 在途状态写回
-        // （打断 = 任务结束，未提交的结果摘要回填与状态查询均无意义）
-        if pendingBackfillTitle == task.title {
-            backfillWorkItem?.cancel()
-            backfillRetry.cancel()
-            pendingBackfill = nil
-            pendingBackfillTag = nil
-            pendingBackfillTitle = nil
-            LogManager.shared.info("打断任务：已取消未提交的结果回填（\(task.title)）")
+        cancelTaskWatchdog()   // v9：打断即任务收口，取消失联看门狗
+        // F4：仅取消属于被打断任务的未提交归档（5s 防抖窗口内的）+ 在途状态写回
+        // （打断 = 任务结束，未提交的结果归档无意义；同窗口内其他任务的归档保留）
+        let before = pendingArchives.count
+        pendingArchives.removeAll { $0.title == task.title }
+        if pendingArchives.isEmpty { backfillWorkItem?.cancel() }
+        if pendingArchives.count != before {
+            LogManager.shared.info("打断任务：已取消未提交的结果归档（\(task.title)）")
         }
-        statusRetry.cancel()
         // P4-1：中断任务 → 停其播报（任务已结束，排队中的进度/完成播报无意义）
         SpeechOutputManager.shared.cancelTaskSpeech(newTag: nil)
-        LogManager.shared.info("任务已中断（常驻会话保留）：\(task.title)（\(sessionID)）")
+        LogManager.shared.info("任务已中断（常驻会话保留）：\(task.title)（远端确认=\(remoteConfirmed)）")
+        return remoteConfirmed ? .stopped : .stoppedUnconfirmed
+    }
+
+    /// fix-ghost-task-queue：取消启动中生命周期（本地收口：清队列+释放槽+清 starting）。
+    /// 返回被取消的启动任务标题（日志用）。在途 runTaskNow 的 token 检查会终止 create/submit。
+    @discardableResult
+    private func cancelStartingTask() -> String {
+        var title = ""
+        taskLifecycleLock.lock()
+        if let s = startingTask { title = s.title }
+        startingTask = nil
+        let hadQueue = !pendingTasks.isEmpty
+        pendingTasks.removeAll()
+        if activeTask == nil { taskSlotOccupied = false }
+        taskLifecycleLock.unlock()
+        cancelTaskWatchdog()   // 启动中看门狗未武装（防御性取消）
+        if hadQueue { LogManager.shared.info("启动中取消：已清空排队任务") }
+        return title
+    }
+
+    // MARK: - 三分控制（v10 split-interrupt-commands：中断任务 / 停止回答 / 全部停止）
+
+    /// v10：停止主 Agent 当前回复（main-only，不碰任务侧）。
+    /// 返回 false = 主侧不在回复中（调用方如实反馈，不伪报成功）。
+    /// 网络 interrupt 成功后才做本地收口（finalizeMainInterrupt）；失败抛出由调用方反馈。
+    func interruptMainAnswer() async throws -> Bool {
+        guard let main = mainSession, mainTurnActive else {
+            LogManager.shared.info("停止回答：主 Agent 当前没有在回复")
+            return false
+        }
+        LogManager.shared.info("停止回答：interrupt 主会话 \(main.sessionID)")
+        try await client.interrupt(sessionID: main.sessionID)
+        finalizeMainInterrupt()
         return true
+    }
+
+    /// v10：主中断后的本地状态收口（网络 interrupt 成功后调用；测试可离线注入）。
+    /// 关闭 mainTurnActive、清理本轮 buffer/派发标记/在途 turn 记录，置迟到事件抑制标记，
+    /// 并立即 flush 聊天队列（主会话已释放，排队消息不滞留）。
+    func finalizeMainInterrupt() {
+        _ = turnTracker.consume()   // 中断轮的在途记录作废（防下一条用户回复被误判归档轮而静默吞）
+        mainBuffer = ""
+        mainDispatching = false
+        mainDispatched = false
+        mainMarkerHandled = false
+        mainTurnActive = false
+        mainTurnSuppressed = true   // 迟到 complete/error 抑制（不弹截断回复/不卡 failed）
+        userSubmittedAt = nil
+        LogManager.shared.info("主 Agent 回复已停止（main-only 中断；任务侧不受影响）")
+        debounceIdle(2.0)
+        flushChatQueue()   // 空队列幂等——主会话已释放，排队消息立即补发
+    }
+
+    /// v10：主中断结果（interruptAll 用；inactive = 本来不在回复，未伪报）。
+    enum MainInterruptResult { case stopped, inactive, failed }
+    enum TaskInterruptResult { case stopped, inactive, failed, stoppedUnconfirmed }
+
+    /// v10：全部停止——主/任务两侧独立收口；任一侧不在运行时如实标记。
+    /// fix-ghost-task-queue：任务侧中断不再抛错——本地收口始终完成，远端 RPC 失败
+    /// 以 .stoppedUnconfirmed 如实提示（UI 区分「已本地停止但远端未确认」）。
+    func interruptAll() async -> (main: MainInterruptResult, task: TaskInterruptResult) {
+        let taskResult: TaskInterruptResult
+        switch await interruptTask() {
+        case .stopped, .cancelledDuringStart: taskResult = .stopped
+        case .stoppedUnconfirmed: taskResult = .stoppedUnconfirmed
+        case .inactive: taskResult = .inactive
+        }
+        let mainResult: MainInterruptResult
+        do {
+            mainResult = (try await interruptMainAnswer()) ? .stopped : .inactive
+        } catch {
+            mainResult = .failed
+        }
+        return (main: mainResult, task: taskResult)
     }
 
     /// 新开对话（主会话重开，旧主会话归档）。
@@ -563,6 +949,8 @@ final class HermesBridge {
             }
             activeTask = nil
         }
+        // fix-ghost-task-queue：启动中任务一并取消（本地收口，防迟到创建跨新会话复活）
+        cancelStartingTask()
         if let main = mainSession {
             try? await client.close(sessionID: main.sessionID)
         }
@@ -572,6 +960,13 @@ final class HermesBridge {
         clearChatQueue()   // P1：新开对话清聊天队列（旧上下文输入无意义）
         clearPendingTasks() // 新开对话不让旧任务队列跨会话继续执行
         invalidateTaskSession() // 任务会话 parent 属于旧主会话，不跨新主会话复用
+        // v3：清未提交归档——旧会话的任务归档不得提交到新会话（污染上下文）
+        backfillWorkItem?.cancel()
+        backfillWorkItem = nil
+        if !pendingArchives.isEmpty {
+            LogManager.shared.info("新开对话：丢弃未提交归档 \(pendingArchives.count) 条（旧会话上下文）")
+            pendingArchives.removeAll()
+        }
         try await ensureMainSession()
         onState?(.idle)
     }
@@ -600,7 +995,7 @@ final class HermesBridge {
                code == 4001 || message.contains("not found") {
                 // 2) resume 恢复拿新内部 id（resume 后 turn 已停——补发反馈）
                 do {
-                    let info = try await client.resume(sessionID: latest.storedSessionID)
+                    let info = try await client.resume(sessionID: latest.storedSessionID, profile: latest.profile)
                     sessionID = info.sessionID
                     _ = try await client.isAgentRunning(sessionID: info.sessionID)
                     isRunning = false   // resume 恢复的是已停会话（不会自动续跑）
@@ -637,13 +1032,15 @@ final class HermesBridge {
             activeTask = task
             setTaskSlotOccupied(true)
             setState(.run)
+            armTaskWatchdog()   // v9：接管运行中任务同样启动失联看门狗（事件缺失时可见收口）
+            armTaskStartPending(task)   // fix-live-ux-details：接管后同样武装等待反馈（事件缺失时可见等待）
             LogManager.shared.info("已接管运行中任务：\(latest.title)（\(sessionID)）")
             onAdoptedTask?(latest.title)
         } else {
             // 已结束（重启窗口内完成/失败）：标记完成 + 补发完成反馈（history 尾部 → 双轨解析）
             sessionIndex.markTaskCompleted(id: latest.id)
             do {
-                let messages = try await client.history(sessionID: sessionID)
+                let messages = try await client.history(sessionID: sessionID, profile: latest.profile)
                 let tail = messages.compactMap { ($0["text"] as? String) ?? ($0["content"] as? String) }.joined(separator: "\n")
                 if !tail.isEmpty {
                     let (spoken, formal) = Self.parseDualTrack(tail)
@@ -676,6 +1073,7 @@ final class HermesBridge {
                 mainDispatching = false
                 mainDispatched = false
                 mainMarkerHandled = false
+                mainTurnSuppressed = false   // v10：新 turn 开始，解除主中断抑制
                 mainTurnActive = true
             }
         case "message.delta":
@@ -684,6 +1082,8 @@ final class HermesBridge {
                 task.fullText += text
                 // R-M1-1：任务仍在输出 → 取消完成判定窗口
                 taskCompleteWorkItem?.cancel()
+                armTaskWatchdog()   // v9：任务有事件 → 重排失联看门狗
+                markTaskActivity(task)   // fix-live-ux-details：首个 delta 即取消等待反馈
             } else if (event.sessionID == mainSession?.sessionID
                        || (event.sessionID == nil && activeTask == nil)), mainTurnActive {
                 // R-2026-08-13：serve 对 resume 主会话的 delta 偶发不带 session_id（路由差异）；
@@ -692,45 +1092,69 @@ final class HermesBridge {
                 processMainStream()
             }
         case "message.complete":
-            if let task = activeTask, let sid = event.sessionID, sid == task.info.sessionID {
-                guard !task.turnClosed else {
-                    LogManager.shared.log(.debug, "忽略已关闭任务 turn 的迟到 complete：\(sid)")
-                    return
+            let completeText = event.payload["text"] as? String ?? ""
+            if let task = activeTask {
+                // 根因三（state-sync-fix）+ R4（harden-dual-agent-async）：complete 缺 session_id 时
+                // 按显式在途证据消歧——主 turn 活跃 / 主 tracker 在途（含服务端 queued）/ 主侧刚完成
+                // 窗口任一为真 → 归主（不丢主回复）；仅任务 turn 未关且主侧无在途证据时归任务
+                // （真实任务完成不错归主侧，主侧刚完成不误关任务 turn）。
+                let isTaskComplete: Bool
+                if let sid = event.sessionID {
+                    isTaskComplete = sid == task.info.sessionID
+                } else {
+                    let mainRecently = Date().timeIntervalSince(lastMainCompleteAt) < Self.nilSidMainRecentWindow
+                    isTaskComplete = Self.nilSidCompleteBelongsToTask(
+                        taskTurnOpen: !task.turnClosed,
+                        mainTurnActive: mainTurnActive,
+                        mainTrackerPending: turnTracker.hasPending,
+                        mainRecentlyCompleted: mainRecently)
+                    if isTaskComplete {
+                        LogManager.shared.warn("任务 complete 缺 session_id：按在途证据消歧（\(task.title)）")
+                    }
                 }
-                let completeText = event.payload["text"] as? String ?? ""
-                if !completeText.isEmpty && task.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    LogManager.shared.info("任务回复兜底：delta 流缺失，使用 complete.text（\(completeText.count) 字）")
-                    task.fullText = completeText
+                if isTaskComplete {
+                    guard !task.turnClosed else {
+                        LogManager.shared.log(.debug, "忽略已关闭任务 turn 的迟到 complete：\(event.sessionID ?? "nil")")
+                        return
+                    }
+                    if !completeText.isEmpty && task.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        LogManager.shared.info("任务回复兜底：delta 流缺失，使用 complete.text（\(completeText.count) 字）")
+                        task.fullText = completeText
+                    }
+                    task.turnClosed = true
+                    cancelTaskStartPending()   // fix-live-ux-details：任务收口取消等待反馈
+                    scheduleTaskCompletion()
+                } else if event.sessionID == mainSession?.sessionID
+                            || (event.sessionID == nil && (mainTurnActive || turnTracker.hasPending)) {
+                    completeMainMessage(completeText)
+                } else if event.sessionID == nil {
+                    // R4：缺 sid 且主侧刚完成（无在途证据）——主侧迟到/重复 complete：
+                    // 忽略（不重发主回复、不误关任务 turn；任务侧由看门狗兜底可见收口）
+                    LogManager.shared.log(.debug, "缺 sid complete 在主侧刚完成窗口内——忽略（主侧迟到/重复）")
                 }
-                task.turnClosed = true
-                scheduleTaskCompletion()
-            } else if event.sessionID == mainSession?.sessionID
-                        || (event.sessionID == nil && activeTask == nil) {
-                // R-2026-08-13：serve 的 delta 流可能未达 DeskPet（resume 会话事件路由差异），
-                // 但 complete 事件自带完整回复文本（payload.text）——mainBuffer 为空时兜底。
-                let completeText = event.payload["text"] as? String ?? ""
-                if !completeText.isEmpty && mainBuffer.isEmpty {
-                    LogManager.shared.info("主回复兜底：delta 流缺失，使用 complete.text（\(completeText.count) 字）")
-                    mainBuffer = completeText
-                }
-                emitMainMessage()
-                mainTurnActive = false
-                setState(.review)
-                debounceIdle(2.0)
-                // P1：主回复完成 → flush 聊天队列（busy 期间入队的输入自动发送）
-                flushChatQueue()
+            } else if event.sessionID == mainSession?.sessionID || event.sessionID == nil {
+                completeMainMessage(completeText)
             }
         case "tool.start", "tool.generating":
+            // 根因二（state-sync-fix）：只允许可归属的活跃生命周期驱动 run——任务工具
+            // （sid 匹配且 turn 未关）或主会话工具（sid 匹配且主 turn 活跃）；无归属/迟到/
+            // 已结束的事件不再无条件 setState(.run)（setState 会取消 idleTimer——无条件 run 卡忙）。
             if let task = activeTask, let sid = event.sessionID, sid == task.info.sessionID, !task.turnClosed {
                 setState(.run)
                 taskCompleteWorkItem?.cancel()   // R-M1-1：工具活动 → 取消完成窗口
+                armTaskWatchdog()   // v9：任务有事件 → 重排失联看门狗
+                markTaskActivity(task)   // fix-live-ux-details：首个工具活动即取消等待反馈
+            } else if let sid = event.sessionID, sid == mainSession?.sessionID, mainTurnActive {
+                setState(.run)   // 主 Agent 工具活动（思考/搜索/归档）→ 忙碌动画
             } else {
-                setState(.run)
+                LogManager.shared.log(.debug, "忽略无归属/已结束工具事件（\(event.type) sid=\(event.sessionID ?? "nil")）")
             }
         case "tool.complete":
             if let task = activeTask, let sid = event.sessionID, sid == task.info.sessionID, !task.turnClosed {
                 setState(.run)
                 taskCompleteWorkItem?.cancel()   // R-M1-1
+                armTaskWatchdog()   // v9：任务有事件 → 重排失联看门狗
+                markTaskActivity(task)   // fix-live-ux-details：工具完成同样视为有效活动
             }
         case "approval.request":
             setState(.failed)
@@ -745,6 +1169,7 @@ final class HermesBridge {
                 task.isComplete = true
                 sessionIndex.markTaskCompleted(id: task.taskRecordID)
                 activeTask = nil
+                cancelTaskStartPending()   // fix-live-ux-details：失败收口取消等待反馈
                 // PM4：打断后 3s 窗口内同任务 error（打断的正常结果）——仅日志不播报
                 if sid == suppressFailureTaskID, Date() < suppressFailureUntil {
                     LogManager.shared.log(.debug, "打断后任务 error（抑制失败播报）：\(sid)")
@@ -752,13 +1177,18 @@ final class HermesBridge {
                     // P1：失败原因（error 事件 payload 的 message/error 字段；无则空串）
                     let reason = (event.payload["message"] as? String) ?? (event.payload["error"] as? String) ?? ""
                     onTaskFailed?(task.title, reason)
-                    // 标记协议：失败回填主会话（主 Agent 口语化报告）
-                    backfillTaskResult(title: task.title, ok: false, summary: reason)
+                    // v3：失败也归档（主 Agent 追问时如实告知）
+                    archiveTaskResult(title: task.title, ok: false, result: reason)
                 }
                 startNextQueuedTask()
             } else if let sid = event.sessionID, Self.isKnownTaskSession(sid, in: sessionIndex) {
                 // PM1：已完成/已结束任务的迟到 error——忽略（完成/失败已回调过）
                 LogManager.shared.log(.debug, "忽略已结束任务的迟到 error：\(sid)")
+            } else if mainTurnSuppressed {
+                // v10：主中断后迟到 error 抑制——不置 failed（否则被中断轮把宠物卡进 failed 态）
+                LogManager.shared.log(.debug, "主会话迟到 error 已抑制（主 Agent 已中断）")
+                mainTurnActive = false
+                mainBuffer = ""
             } else {
                 // 主会话 turn 以 error 终结：关闭闸门，避免后续输入永久进入本地队列。
                 mainTurnActive = false
@@ -786,7 +1216,8 @@ final class HermesBridge {
                 mainDispatching = false
                 mainDispatched = true
                 if !taskText.isEmpty {
-                    Task { try? await startTask(taskText, title: Self.taskTitle(taskText)) }
+                    // v9：startTask 不再抛错（失败内部可见收口）——不再 try? 静默吞
+                    Task { await self.startTask(taskText, title: Self.taskTitle(taskText)) }
                 }
                 processMainStream()   // M4：继续检测后续 dispatch（支持同回复多个派发）
             }
@@ -839,18 +1270,39 @@ final class HermesBridge {
         if let s = taskSessionGate.current() { return s }
         // 抢占创建权（竞争失败 → 对方刚完成/正在失败路径，重试一次）
         guard taskSessionGate.beginCreate() else {
-            while taskSessionGate.isCreating() { try? await Task.sleep(nanoseconds: 50_000_000) }
+            // fix-ghost-task-queue：竞争等待显式上限（与首段一致 3s，50ms 轮询）——
+            // 不依赖潜在无限 while；正常 createSession RPC 仍走 HermesClient 30s 超时，不误杀健康冷启动
+            var waited2 = 0
+            while taskSessionGate.isCreating() {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                waited2 += 1
+                if waited2 > 60 { break }
+            }
             if let s = taskSessionGate.current() { return s }
             throw HermesClient.HermesError.server(code: nil, message: "常驻任务会话创建失败")
         }
         do {
             let info = try await client.createSession(title: "常驻任务成员", parentSessionID: main.sessionID,
-                                                      seedMessages: [["role": "system", "content": Self.taskSessionSeed()]])
+                                                      seedMessages: [["role": "system", "content": Self.taskSessionSeed()]],
+                                                      profile: DeskPetHermesProfile.name,
+                                                      cwd: DeskPetHermesProfile.workspace.path)
+            // M3（fresh-install 加固）：任务会话同样过后端 profile 能力硬门槛——
+            // 校验失败：先清理刚建会话（镜像主会话路径的 close+delete），再释放创建权并 rethrow，
+            // 不静默降级默认 DB；createSession 本身的网络错误仍走外层 catch（仅释放创建权）。
+            do {
+                try Self.validateBackendContract(info, requestedProfile: DeskPetHermesProfile.name)
+            } catch {
+                try? await client.close(sessionID: info.sessionID)
+                try? await client.delete(storedSessionID: info.storedSessionID, profile: DeskPetHermesProfile.name)
+                LogManager.shared.error("任务会话创建被后端能力门槛拦截（已清理刚建会话）：\(error)")
+                taskSessionGate.finishCreate(nil)
+                throw error
+            }
             taskSessionGate.finishCreate(info)
             LogManager.shared.info("常驻任务会话创建：\(info.sessionID) parent=\(main.sessionID)")
             return info
         } catch {
-            taskSessionGate.finishCreate(nil)
+            taskSessionGate.finishCreate(nil)   // 创建失败（网络/校验）：释放创建权（幂等）
             throw error
         }
     }
@@ -860,37 +1312,65 @@ final class HermesBridge {
         taskSessionGate.invalidate()
     }
 
-    private func startTask(_ text: String, title: String) async throws {
-        guard mainSession != nil else { throw HermesClient.HermesError.notConnected }
-        let pending = PendingTask(text: text, title: title)
-        let position = reserveTaskSlot(pending)
-        if position < 0 {
-            throw HermesClient.HermesError.server(code: nil, message: "任务队列已满（最多排队 \(maxPendingTasks) 个）")
+    private func startTask(_ text: String, title: String) async {
+        // v9（fix-audio-task-state）：本方法不抛错——所有失败路径均以 onTaskFailed 可见收口；
+        // 槽位释放与队列推进由 taskStartFailed 统一处理。标记路径（processMainStream/
+        // parseTaskMarkers）与直接路径（dispatchTask）共用，杜绝「任务已接收却无下文」。
+        guard mainSession != nil else {
+            LogManager.shared.warn("任务派发失败：主会话未就绪（\(title)）")
+            onTaskFailed?(title, "助手服务未就绪，任务未执行")
+            return
         }
-        if position > 0 {
-            LogManager.shared.info("任务进入队列：\(title)（第 \(position) 个）")
-            onTaskQueued?(title, position)
+        let pending = PendingTask(text: text, title: title)
+        let slot = reserveTaskSlot(pending)
+        if slot.position < 0 {
+            LogManager.shared.warn("任务派发失败：队列已满（\(title)）")
+            onTaskFailed?(title, "任务队列已满（最多排队 \(maxPendingTasks) 个），任务未执行")
+            return
+        }
+        if slot.position > 0 {
+            LogManager.shared.info("任务进入队列：\(title)（第 \(slot.position) 个，前置\(Self.queuedBehindText(starting: slot.starting))）")
+            onTaskQueued?(title, slot.position, slot.starting)
+            return
+        }
+        guard let token = slot.token else {
+            LogManager.shared.warn("任务启动令牌缺失（内部异常）：\(title)")
+            onTaskFailed?(title, "任务启动失败：内部状态异常")
             return
         }
         do {
-            try await runTaskNow(text, title: title)
+            try await runTaskNow(text, title: title, startToken: token)
         } catch {
-            taskStartFailed(title: title, error: error)
-            throw error
+            taskStartFailed(title: title, error: error, startToken: token)
         }
     }
 
-    /// 抢占一个任务槽；返回 0=立即执行，正数=队列位置，-1=队列已满。
-    private func reserveTaskSlot(_ pending: PendingTask) -> Int {
+    /// 抢占一个任务槽；返回 0=立即执行（含令牌），正数=队列位置，-1=队列已满。
+    /// fix-ghost-task-queue：幽灵槽自愈——槽占用但无活动任务且无启动中生命周期
+    /// （启动失败/中断残留）时释放幽灵槽，本任务直接启动（不再被误排队「当前任务还在执行」）。
+    private func reserveTaskSlot(_ pending: PendingTask) -> TaskSlotReservation {
         taskLifecycleLock.lock()
         defer { taskLifecycleLock.unlock() }
-        if taskSlotOccupied {
-            guard pendingTasks.count < maxPendingTasks else { return -1 }
+        let phase = Self.taskSlotPhase(occupied: taskSlotOccupied,
+                                       hasActive: activeTask != nil,
+                                       hasStarting: startingTask != nil)
+        switch phase {
+        case .free:
+            break
+        case .running, .starting:
+            guard pendingTasks.count < maxPendingTasks else {
+                return TaskSlotReservation(position: -1, starting: false, token: nil)
+            }
             pendingTasks.append(pending)
-            return pendingTasks.count
+            return TaskSlotReservation(position: pendingTasks.count, starting: phase == .starting, token: nil)
+        case .ghost:
+            LogManager.shared.warn("任务槽幽灵残留自愈：无活动任务且无启动中任务，释放幽灵槽直接启动：\(pending.title)")
+            taskSlotOccupied = false
         }
         taskSlotOccupied = true
-        return 0
+        let starting = StartingTask(text: pending.text, title: pending.title)
+        startingTask = starting
+        return TaskSlotReservation(position: 0, starting: false, token: starting.token)
     }
 
     private func queuedTaskCount() -> Int {
@@ -908,6 +1388,12 @@ final class HermesBridge {
         return running || reserved
     }
 
+    /// GUI 菜单的中断可用态：主 Agent 回复或任务链路任一忙即可中断。
+    /// 语音「中断任务」仍由 interruptTask() 保持 task-only 语义。
+    func isAnyAgentBusy() -> Bool {
+        mainTurnActive || isTaskBusy()
+    }
+
     private func setTaskSlotOccupied(_ occupied: Bool) {
         taskLifecycleLock.lock()
         taskSlotOccupied = occupied
@@ -915,65 +1401,110 @@ final class HermesBridge {
     }
 
     /// 显式停止/清空历史时丢弃尚未开始的任务，避免用户说「停止」后队列又自动执行。
+    /// fix-ghost-task-queue：仅无活动任务且无启动中生命周期时释放槽——
+    /// 启动中（startingTask 在场）的槽不得被误释放（防双任务并发）。
     @discardableResult
     private func clearPendingTasks() -> Int {
         taskLifecycleLock.lock()
         let count = pendingTasks.count
         pendingTasks.removeAll()
-        if activeTask == nil { taskSlotOccupied = false }
+        // 仅无活动任务且无启动中生命周期时释放槽——启动中（startingTask 在场）的槽
+        // 不得被误释放（防双任务并发）；幽灵残留（两者皆无）一并释放
+        if activeTask == nil && startingTask == nil {
+            taskSlotOccupied = false
+        }
         taskLifecycleLock.unlock()
         if count > 0 { LogManager.shared.info("已清空排队任务：\(count) 个") }
         return count
     }
 
     /// 单个任务启动失败：释放槽位并继续尝试后续队列项。
-    private func taskStartFailed(title: String, error: Error) {
+    /// fix-ghost-task-queue：仅清理本次启动生命周期（token 校验——不误清新任务
+    /// 的 starting 登记）；无活动/启动中占用时才释放槽（防误释放真实启动中的槽）。
+    private func taskStartFailed(title: String, error: Error, startToken: UUID) {
         if let task = activeTask, task.taskRecordID.isEmpty {
             activeTask = nil
         }
         taskLifecycleLock.lock()
-        taskSlotOccupied = false
+        if startingTask?.token == startToken {
+            startingTask = nil
+        }
+        if activeTask == nil && startingTask == nil {
+            taskSlotOccupied = false
+        }
         taskLifecycleLock.unlock()
         LogManager.shared.warn("任务启动失败：\(title)——\(error)")
         onTaskFailed?(title, error.localizedDescription)
+        cancelTaskWatchdog()   // v9：启动失败无活动任务可监控（看门狗自守卫兜底，显式取消更干净）
+        cancelTaskStartPending()   // fix-live-ux-details：启动失败取消等待反馈（迟到定时器不得触发）
         startNextQueuedTask()
     }
 
     /// 当前任务结束后按顺序启动下一个，不再把新 prompt 直接打进 busy 的常驻会话。
+    /// fix-ghost-task-queue：出队即登记启动生命周期（token）——出队→runTaskNow 执行间的
+    /// 窗口不再盲区（此间派发的新任务看到 starting 相位，正确排队为「正在启动」）。
     private func startNextQueuedTask() {
+        var next: PendingTask?
+        var token: UUID?
+        var remaining = 0
         taskLifecycleLock.lock()
         guard !pendingTasks.isEmpty else {
-            taskSlotOccupied = false
+            // 无排队项：释放槽（仅无活动/启动中占用时——幽灵残留一并释放）
+            if activeTask == nil && startingTask == nil {
+                taskSlotOccupied = false
+            }
             taskLifecycleLock.unlock()
             return
         }
-        let next = pendingTasks.removeFirst()
-        let remaining = pendingTasks.count
+        next = pendingTasks.removeFirst()
+        remaining = pendingTasks.count
+        let starting = StartingTask(text: next!.text, title: next!.title)
+        startingTask = starting
+        taskSlotOccupied = true
+        token = starting.token
         taskLifecycleLock.unlock()
+        guard let next, let token else { return }
         LogManager.shared.info("任务出队开始：\(next.title)（剩余 \(remaining) 个）")
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.runTaskNow(next.text, title: next.title)
+                try await self.runTaskNow(next.text, title: next.title, startToken: token)
             } catch {
-                self.taskStartFailed(title: next.title, error: error)
+                self.taskStartFailed(title: next.title, error: error, startToken: token)
             }
         }
     }
 
-    /// 真正启动一个 turn。调用者已持有唯一任务槽，因此不会覆盖 activeTask。
-    private func runTaskNow(_ text: String, title: String) async throws {
+    /// 真正启动一个 turn。调用方已持有唯一任务槽（starting 生命周期已登记），
+    /// 因此不会覆盖 activeTask。fix-ghost-task-queue：
+    /// - 启动中被取消/被新任务替换（token 失效）→ 拦截迟到创建，不产生幽灵 activeTask；
+    /// - starting→active 转换与 interruptTask 的分支判定在同一锁内互斥；
+    /// - 提交期间被取消（activeTask 已清）→ 跳过任务记录登记（不产生幽灵未完成记录）。
+    private func runTaskNow(_ text: String, title: String, startToken: UUID) async throws {
         guard let main = mainSession else { throw HermesClient.HermesError.notConnected }
-        taskCompleteWorkItem?.cancel()   // H1：任务启动即作废旧完成窗口
+        taskCompleteWorkItem?.cancel()   // H1：任务启动即作废旧完成处理回调
         // P4-1：新任务开始时只清理旧任务播报；任务执行本身由队列顺序保证。
         let speechTag = "task-\(UUID().uuidString.prefix(8))"
         SpeechOutputManager.shared.cancelTaskSpeech(newTag: speechTag)
         setState(.run)
         // RE-1：临界区获取/创建（并发 startTask 单次创建）
         let info = try await ensureTaskSession(main: main)
+        // 启动取消拦截：token 失效（取消/新任务替换）→ 不创建任务实例（迟到创建拦截）
         let task = TaskRun(info: info, title: title, speechTag: speechTag)
-        activeTask = task
+        let transitionOK = taskLifecycleLock.withLock { () -> Bool in
+            guard let s = startingTask, Self.startTransitionShouldProceed(currentToken: s.token, expectedToken: startToken) else {
+                return false
+            }
+            startingTask = nil   // 启动窗口结束（activeTask 接管）
+            activeTask = task
+            return true
+        }
+        guard transitionOK else {
+            LogManager.shared.info("任务启动已被取消（token 失效）：\(title)——不创建任务实例（迟到创建拦截）")
+            return
+        }
         onTaskStarted?(title, speechTag)
+        armTaskWatchdog()   // v9：任务 turn 打开即启动失联看门狗（事件到达重排，见 armTaskWatchdog）
         do {
             let status = try await client.submit(text, sessionID: info.sessionID, queued: true)
             if status == "redirected" {
@@ -991,19 +1522,28 @@ final class HermesBridge {
             }
             LogManager.shared.info("常驻会话重建成功，任务已重试：\(title)（新会话 \(fresh.sessionID)，status=\(status)）")
         }
+        // 提交期间被取消（activeTask 已被清）→ 不登记任务记录（防幽灵未完成记录；
+        // 远端任务已由中断 RPC 停止或随会话重建失效）
+        guard activeTask === task else {
+            LogManager.shared.info("任务提交期间已被取消：\(title)——跳过任务记录登记")
+            return
+        }
         // RE-2：submit 成功后才记录任务实例（失败由 taskStartFailed 清理 activeTask）
         let rec = sessionIndex.addTask(.init(sessionID: task.info.sessionID, storedSessionID: task.info.storedSessionID,
                                              title: title, createdAt: Date()))
         task.taskRecordID = rec.id
+        armTaskStartPending(task)   // fix-live-ux-details：提交成功后武装 8s 等待反馈定时器
     }
 
     private func scheduleTaskCompletion() {
         taskCompleteWorkItem?.cancel()
-        // H1：捕获任务实例——窗口期内若启动新任务，旧 workItem 不得误标新任务。
+        // H1：捕获任务实例——排队期间若启动新任务，旧 workItem 不得误标新任务（实例 guard 拦截）。
         guard let task = activeTask, !task.isComplete else { return }
         task.turnClosed = true
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.activeTask === task, !task.isComplete else { return }
+            self.cancelTaskWatchdog()   // v9：任务正常收口，取消失联看门狗
+            self.cancelTaskStartPending()   // fix-live-ux-details：完成收口取消等待反馈
             task.isComplete = true
             self.sessionIndex.markTaskCompleted(id: task.taskRecordID)
             self.activeTask = nil
@@ -1017,21 +1557,24 @@ final class HermesBridge {
                 LogManager.shared.warn("任务完成但结果为空（0 字）——按无结果处理：\(task.title)")
                 self.setState(.failed)
                 self.onTaskFailed?(task.title, reason)
-                self.backfillTaskResult(title: task.title, ok: false, summary: reason)
+                self.archiveTaskResult(title: task.title, ok: false, result: reason)
                 self.startNextQueuedTask()
                 self.debounceIdle(3.0)
                 return
             }
             self.onTaskMessage?(TaskMessage(spoken: spoken, formal: formal, isFinal: true, speechTag: task.speechTag))
             self.onTaskComplete?(task.title)
-            // 标记协议：完成回填主会话（主 Agent 口语化报告——结果摘要口语轨优先）
-            self.backfillTaskResult(title: task.title, ok: true, summary: spoken.isEmpty ? formal : spoken)
+            // v3 直报：任务 spoken 已直接播报（AppDelegate）——归档只存上下文（formal 全文，
+            // 不截断——主 Agent 追问时需全量细节；spoken 为空时兜底存 spoken）。
+            self.archiveTaskResult(title: task.title, ok: true, result: formal.isEmpty ? spoken : formal)
             self.setState(.review)
             self.startNextQueuedTask()
             self.debounceIdle(3.0)
         }
         taskCompleteWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
+        // v4 安全加速：不再固定 1.5s 静默窗口——message.complete 后下一主线程调度机会即完成
+        // 处理（直报/归档继续后台进行）；迟到事件由 turnClosed/实例 guard 拦截，语义不变。
+        DispatchQueue.main.async(execute: item)
     }
 
     // MARK: - 双轨解析（<spoken>口语轨</spoken><formal>正式轨</formal>）
@@ -1071,13 +1614,20 @@ final class HermesBridge {
         var text = mainBuffer
         let dispatched = mainDispatched
         mainDispatched = false
-        // 标记协议（任务协作）：仅用户消息触发的主回复解析（回填/状态写回触发的回复不解析——防循环）
+        // 标记协议（任务协作）：仅用户消息触发的主回复解析（归档触发的回复不解析——防循环）
         // P2 ISSUE#1：per-turn 类型判定（提交时 record，complete 消费——busy 排队按序消费不串）
         let isUserTurn = turnTracker.consume()
         let parseMarkers = isUserTurn
         mainMarkerHandled = false
         if parseMarkers {
             text = Self.parseTaskMarkers(text, bridge: self)
+        }
+        // v3 归档 ack：非用户轮（归档）回复剥 <ok/>——剥后为空 = 纯确认（不显示不播报）；
+        // 非空 = 主 Agent 违反协议多说了话——AppDelegate 仅记日志（不弹气泡防覆盖任务详情、不播报）。
+        var ackFeedback: String? = nil
+        if !isUserTurn {
+            text = Self.stripOkAck(text)
+            (text, ackFeedback) = Self.stripFeedback(text)
         }
         let protocolOnly = isUserTurn
             && (dispatched || mainMarkerHandled)
@@ -1094,33 +1644,110 @@ final class HermesBridge {
             }
         }
         let (spoken, formal) = Self.parseDualTrack(text)
-        // 播报抢占：非用户轮（回填/状态报告）关联在途回填的任务 tag——
-        // 旧任务回填报告迟到（新任务已派发）→ 低优播报按 tag 舍弃（只播最新任务对应的播报）
-        let reportTag = isUserTurn ? nil : inFlightBackfillTag
-        inFlightBackfillTag = nil
+        // v3 端到端计时：用户提交 → 主回复完成（排队场景只记最新一次，量级感知用）
+        if isUserTurn, let submitted = userSubmittedAt {
+            let elapsed = Date().timeIntervalSince(submitted)
+            LogManager.shared.info(String(format: "[耗时] 用户消息→主回复完成：%.1fs（首字延迟看 [EVT] delta 首条时刻）", elapsed))
+            userSubmittedAt = nil
+        }
         onMainMessage?(MainMessage(spoken: spoken, formal: formal, dispatchedTask: dispatched,
-                                   isUserTurn: isUserTurn, taskTag: reportTag, protocolOnly: protocolOnly))
+                                   isUserTurn: isUserTurn, protocolOnly: protocolOnly, feedback: ackFeedback))
         mainBuffer = ""
+    }
+
+    /// 主回复 complete 收口（message.complete 主会话分支共用——含缺 sid 消歧路径，避免复制）。
+    private func completeMainMessage(_ completeText: String) {
+        // v10：主中断后迟到 complete 抑制——不弹被截断的回复（下轮 message.start 解除抑制）
+        if mainTurnSuppressed {
+            LogManager.shared.info("主回复 complete 已抑制（主 Agent 已中断，不弹被截断回复）")
+            return
+        }
+        lastMainCompleteAt = Date()   // R4：主侧刚完成证据（缺 sid 消歧用）
+        // R-2026-08-13：serve 的 delta 流可能未达 DeskPet（resume 会话事件路由差异），
+        // 但 complete 事件自带完整回复文本（payload.text）——mainBuffer 为空时兜底。
+        if !completeText.isEmpty && mainBuffer.isEmpty {
+            LogManager.shared.info("主回复兜底：delta 流缺失，使用 complete.text（\(completeText.count) 字）")
+            mainBuffer = completeText
+        }
+        emitMainMessage()
+        mainTurnActive = false
+        setState(.review)
+        debounceIdle(2.0)
+        // P1：主回复完成 → flush 聊天队列（busy 期间入队的输入自动发送）
+        flushChatQueue()
     }
 
     // MARK: - 任务协作标记解析（主 Agent 掌控任务 Agent）
 
-    /// 宽松正则解析四类标记并执行动作，返回剥离标记后的干净文本（气泡/播报用）。
+    /// v3：剥归档确认 <ok/>（宽松：大小写/空格/无斜杠/全角尖括号）——非用户轮回复专用。
+    static func stripOkAck(_ text: String) -> String {
+        var t = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
+        guard let re = regex("(?i)<ok\\s*/?>"),
+              let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+              let r = Range(m.range, in: t) else { return text }
+        t.removeSubrange(r)
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// companion：解析归档 ack 回复中的 <feedback>…</feedback>（宽松：大小写/未闭合到文本尾/
+    /// 全角尖括号）。返回 (剩余文本, feedback 文案)；无标记返回 (原文本, nil)。
+    /// feedback 承载主 Agent 以 persona 口吻生成的情绪收尾（祝贺/安慰的一句话），
+    /// 不用于转述任务结果（结果全文由任务 Agent 直报，端侧只对 feedback 做气泡+短播报）。
+    static func stripFeedback(_ text: String) -> (text: String, feedback: String?) {
+        var t = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
+        guard let re = regex("(?i)<feedback\\b[^>]*>"),
+              let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+              let s = Range(m.range, in: t) else { return (text, nil) }
+        let restStart = s.upperBound
+        // close 从 open 之后找；缺失 → 到文本尾（与 extractMarked 同宽容）
+        var contentEnd = t.endIndex
+        if let closeRe = regex("(?i)</feedback>"),
+           let c = closeRe.firstMatch(in: t, range: NSRange(restStart..<t.endIndex, in: t)),
+           let cr = Range(c.range, in: t) {
+            contentEnd = cr.lowerBound
+            let fb = String(t[restStart..<contentEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+            t.removeSubrange(s.lowerBound..<cr.upperBound)
+            return (t.trimmingCharacters(in: .whitespacesAndNewlines), fb.isEmpty ? nil : fb)
+        }
+        let fb = String(t[restStart..<contentEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        t.removeSubrange(s.lowerBound..<contentEnd)
+        return (t.trimmingCharacters(in: .whitespacesAndNewlines), fb.isEmpty ? nil : fb)
+    }
+
+    /// 任务状态本地应答文案（v3：状态查询不再写回主会话——本地直接回答，零延迟零失真）。
+    /// 供 CommandRouter 触发时 AppDelegate 直接气泡+播报。
+    func taskStatusSummary() -> String {
+        let records = sessionIndex.taskRecords()
+        let queuedCount = queuedTaskCount()
+        if let latest = records.max(by: { $0.createdAt < $1.createdAt }) {
+            let running = activeTask != nil && !(activeTask?.isComplete ?? true) ? "进行中" : "已完成"
+            let queued = queuedCount > 0 ? "；另有 \(queuedCount) 个任务排队" : ""
+            return "最近任务：\(latest.title)（\(running)）\(queued)"
+        } else if queuedCount > 0 {
+            return "当前没有已启动任务；\(queuedCount) 个任务排队中"
+        } else {
+            return "当前没有任务记录"
+        }
+    }
+
+    /// 宽松正则解析标记并执行动作，返回剥离标记后的干净文本（气泡/播报用）。
+    /// v3 协议减法：seed 只教 task/task_steer；task_status/task_cancel 仍解析（防御旧会话/
+    /// 模型偶发输出）——status 不再写回主会话（本地路由已答），cancel 保留执行。
     /// 容错：大小写不敏感、中文尖括号〈〉变体、未闭合标记到文本尾、\s*/? 自闭合。
     /// 解析失败忽略 + 日志（标记不影响正常对话展示）。
     static func parseTaskMarkers(_ raw: String, bridge: HermesBridge) -> String {
         var text = raw
         // 中文尖括号变体归一（LLM 偶发全角）
         text = text.replacingOccurrences(of: "〈", with: "<").replacingOccurrences(of: "〉", with: ">")
-        // 提取多段：task（可多个）/ task_steer / task_status / task_cancel
-        var statusSeen = false
+        // 提取多段：task（可多个）/ task_steer（status/cancel 只防御解析，见下方自闭合段）
         while let r = extractMarked(text, open: "(?i)<task\\b[^>]*>", close: "(?i)</task>") {
             bridge.mainMarkerHandled = true
             let content = String(text[r.content]).trimmingCharacters(in: .whitespacesAndNewlines)
             text = String(text[r.before]) + String(text[r.after])
             if !content.isEmpty {
                 LogManager.shared.info("标记协议：<task> 派发 <- \(content.prefix(60))…")
-                Task { try? await bridge.startTask(content, title: Self.taskTitle(content)) }
+                // v9：startTask 不再抛错（失败内部可见收口）——不再 try? 静默吞
+                Task { await bridge.startTask(content, title: Self.taskTitle(content)) }
             }
         }
         while let r = extractMarked(text, open: "(?i)<task_steer\\b[^>]*>", close: "(?i)</task_steer>") {
@@ -1138,11 +1765,8 @@ final class HermesBridge {
            let rr = Range(r.range, in: text) {
             bridge.mainMarkerHandled = true
             text.removeSubrange(rr)
-            if !statusSeen {
-                statusSeen = true
-                LogManager.shared.info("标记协议：<task_status/> 查询任务状态")
-                bridge.handleTaskStatusQuery()
-            }
+            // v3：状态查询已由本地路由应答（零延迟）；此处仅剥离防泄漏，不再写回主会话。
+            LogManager.shared.info("标记协议：<task_status/> 已由本地路由应答（仅剥离）")
         }
         if let re = regex("(?i)<task_cancel\\s*/?>"),
            let r = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
@@ -1150,7 +1774,7 @@ final class HermesBridge {
             bridge.mainMarkerHandled = true
             text.removeSubrange(rr)
             LogManager.shared.info("标记协议：<task_cancel/> 打断任务")
-            Task { try? await bridge.interruptTask() }
+            Task { await bridge.interruptTask() }   // fix-ghost-task-queue：不再 try?（本地收口不抛错）
         }
         return text
     }
@@ -1181,165 +1805,40 @@ final class HermesBridge {
                            after: contentEnd..<contentEnd)
     }
 
-    /// 任务状态查询：最近任务记录 → 状态写回主会话（防抖：同一轮仅一次由 statusSeen 保证）。
-    private func handleTaskStatusQuery() {
-        guard let main = mainSession else { return }
-        let records = sessionIndex.taskRecords()
-        let queuedCount = queuedTaskCount()
-        let summary: String
-        if let latest = records.max(by: { $0.createdAt < $1.createdAt }) {
-            let running = activeTask != nil && !(activeTask?.isComplete ?? true) ? "进行中" : "已完成"
-            let queued = queuedCount > 0 ? "；另有 \(queuedCount) 个任务排队" : ""
-            summary = "[任务状态] 最近任务：\(latest.title)（\(running)）\(queued)"
-        } else if queuedCount > 0 {
-            summary = "[任务状态] 当前没有已启动任务；\(queuedCount) 个任务排队中"
-        } else {
-            summary = "[任务状态] 当前没有任务记录"
-        }
-        LogManager.shared.info("标记协议：状态写回主会话 <- \(summary)")
-        // B1：新查询覆盖旧重试链（防旧文本迟到重复写回）
-        statusRetry.cancel()
-        Task {
-            do {
-                _ = try await client.submit(summary, sessionID: main.sessionID, queued: true)
-                turnTracker.record(.statusQuery)
-                mainTurnActive = true
-            } catch HermesClient.HermesError.server(let code, let message) where code == 4009 || message.contains("busy") {
-                // P2 ISSUE#1（场景 B）：busy 也入队列（带类型）——不丢查询、不残留全局标志
-                pendingChatQueue.append(ChatQueueItem(text: summary, kind: .statusQuery, queued: true))
-                mainTurnActive = true
-                LogManager.shared.info("任务状态写回忙 → 入聊天队列（队列=\(pendingChatQueue.count)）")
-            } catch {
-                // pm3 P1-4：状态查询写回失败可见（断线/会话失效——不静默「问了不回」）；
-                // B1：不紧循环——退避重试链（1s→2s→4s→8s，最多 4 次）+ 日志限频
-                self.rateLimitedWarn("任务状态写回主会话失败：\(error)")
-                self.statusRetry.cancel()
-                self.scheduleStatusRetry(summary)
-            }
-        }
-    }
+    // MARK: - 任务结果归档（v3：替代旧回填转述）
 
-    /// B1：状态写回失败重试（指数退避，最多 4 次；新查询覆盖旧链；成功/busy/会话失效终止）。
-    private func scheduleStatusRetry(_ summary: String) {
-        scheduleWriteBackRetry(chain: statusRetry, text: summary, kind: .statusQuery)
-    }
-
-    private struct WriteBackSpec {
-        let successLog: String
-        let busyLog: String
-        let failLogPrefix: String
-        let limitLogPrefix: String
-        let limitNotice: String
-        let successNotice: String?
-    }
-
-    private func writeBackSpec(for kind: TurnKind) -> WriteBackSpec {
-        switch kind {
-        case .statusQuery:
-            return .init(successLog: "任务状态写回重试成功", busyLog: "状态写回重试遇忙 → 入聊天队列",
-                         failLogPrefix: "任务状态写回主会话", limitLogPrefix: "任务状态写回重试",
-                         limitNotice: "⚠️ 任务状态查询失败——稍后再问一次", successNotice: nil)
-        case .backfill:
-            return .init(successLog: "任务结果回填重试成功", busyLog: "回填重试遇忙 → 入聊天队列",
-                         failLogPrefix: "任务结果回填主会话", limitLogPrefix: "任务结果回填重试",
-                         limitNotice: "⚠️ 任务结果回传失败——稍后再问一次", successNotice: "⏳ 正在整理任务结果…")
-        case .user:
-            preconditionFailure("用户 turn 不应进入写回重试链")
-        }
-    }
-
-    /// 两类主会话写回共用同一条退避/代次/忙转队列状态机。
-    private func scheduleWriteBackRetry(chain: WriteBackRetry, text: String, kind: TurnKind) {
-        let spec = writeBackSpec(for: kind)
-        chain.text = text
-        chain.workItem?.cancel()
-        let delay = pow(2.0, Double(min(chain.attempt, 3)))
-        let attemptNow = chain.attempt + 1
-        let item = DispatchWorkItem { [weak self] in
-            guard let self, let main = self.mainSession, let pending = chain.text else { return }
-            chain.workItem = nil
-            Task {
-                do {
-                    _ = try await self.client.submit(pending, sessionID: main.sessionID, queued: true)
-                    // 链代次护栏：重试期间若新链已覆盖（text 变更/清空），旧链不碰状态。
-                    guard chain.text == pending else { return }
-                    self.turnTracker.record(kind)
-                    self.mainTurnActive = true
-                    LogManager.shared.info("\(spec.successLog)（第 \(attemptNow) 次）")
-                    chain.cancel()
-                    if let successNotice = spec.successNotice {
-                        self.onBackfillNotice?(successNotice)
-                    }
-                } catch HermesClient.HermesError.server(let code, let message)
-                            where code == 4009 || message.contains("busy") {
-                    guard chain.text == pending else { return }
-                    // 主会话忙 → 转聊天队列（flush 链接管），终止重试。
-                    self.pendingChatQueue.append(ChatQueueItem(text: pending, kind: kind, queued: true))
-                    self.mainTurnActive = true
-                    LogManager.shared.info("\(spec.busyLog)（队列=\(self.pendingChatQueue.count)）")
-                    chain.cancel()
-                } catch HermesClient.HermesError.server(let code, let message)
-                            where code == 4007 || message.contains("not found") {
-                    guard chain.text == pending else { return }
-                    // 会话失效 → 写回无意义，终止。
-                    chain.cancel()
-                } catch {
-                    guard chain.text == pending else { return }
-                    chain.attempt = attemptNow
-                    if attemptNow >= Self.maxWriteBackAttempts {
-                        chain.cancel()
-                        self.rateLimitedWarn("\(spec.limitLogPrefix)超限（\(Self.maxWriteBackAttempts) 次），放弃：\(error)")
-                        self.onBackfillNotice?(spec.limitNotice)
-                    } else {
-                        self.rateLimitedWarn("\(spec.failLogPrefix)失败（第 \(attemptNow) 次重试后）：\(error)")
-                        self.scheduleWriteBackRetry(chain: chain, text: pending, kind: kind)
-                    }
-                }
-            }
-        }
-        chain.workItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    // MARK: - 任务完成回填（主 Agent 口语化报告）
-
-    /// 任务完成/失败 → 结果摘要写回主会话（主 Agent 生成口语化报告）；
-    /// 防抖 5s：多个任务事件合并为一次回填（后到更新 pending）。
-    func backfillTaskResult(title: String, ok: Bool, summary: String, speechTag: String? = nil) {
+    /// 任务完成/失败 → 结果全文归档到主会话（上下文存档，不播报——播报已由任务 spoken 直报）。
+    /// - 归档内容：formal 全文（无 formal 用 spoken），失败用原因——主 Agent 后续可凭存档回答用户追问。
+    /// - 主 Agent 收到后只回 <ok/>（客户端剥掉不显示不播报）。
+    /// - 防抖 5s：多任务完成逐条追加合并为一条提交（旧版覆盖 bug 修复：不再丢前一个任务）。
+    /// - 失败仅记日志不重试：归档丢了只影响“追问细节时无上下文”，无用户可见影响。
+    func archiveTaskResult(title: String, ok: Bool, result: String) {
         guard mainSession != nil else { return }
-        let short = String(summary.prefix(1200))   // pm3 P1-1：摘要放宽 600→1200（代码/表格类结果不丢）
-        let text = ok
-            ? "[任务完成] \(title)：\(short)"
-            : "[任务失败] \(title)：\(short.isEmpty ? "（无详细原因）" : short)"
-        pendingBackfill = text
-        pendingBackfillTag = speechTag   // 播报抢占：回填带任务 tag——迟到报告按 tag 舍弃
-        pendingBackfillTitle = title     // F4：打断时按标题精确取消未提交回填
-        backfillRetry.cancel()   // B1：新回填覆盖旧重试链（防旧文本迟到重复写回）
+        let body = ok
+            ? "[任务归档]（系统存档，不是用户发言）任务「\(title)」已完成，结果全文：\n\(result)\n\n（存档要求：先直接回复 <ok/>，不要向用户复述此消息；想给个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短祝贺（一句话即可、不要复述结果）</feedback>；之后用户追问该任务细节时基于上述全文回答。）"
+            : "[任务失败]（系统消息，不是用户发言）任务「\(title)」失败：\(result.isEmpty ? "（无详细原因）" : result)\n\n（先直接回复 <ok/>；想给个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短安慰（一句话即可、不要复述失败原因）</feedback>；用户问起时如实告知。）"
+        pendingArchives.append(PendingArchive(title: title, text: body))
         backfillWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, let pending = self.pendingBackfill, self.mainSession != nil else { return }
-            self.pendingBackfill = nil
-            self.pendingBackfillTitle = nil
+            guard let self, !self.pendingArchives.isEmpty, let main = self.mainSession else { return }
+            let batch = self.pendingArchives
+            self.pendingArchives.removeAll()
+            // 多任务合并为一条（省 turn）；分隔符明确任务边界。
+            let text = batch.count == 1 ? batch[0].text : batch.map { $0.text }.joined(separator: "\n\n---\n\n")
             Task {
                 do {
-                    _ = try await self.client.submit(pending, sessionID: self.mainSession!.sessionID, queued: true)
-                    self.turnTracker.record(.backfill)   // 提交成功后才 record——回填回复不解析（防循环）
+                    _ = try await self.client.submit(text, sessionID: main.sessionID, queued: true)
+                    self.turnTracker.record(.backfill)   // 归档回复是 <ok/>——不解析不播报（防循环）
                     self.mainTurnActive = true
-                    self.inFlightBackfillTag = self.pendingBackfillTag   // 播报抢占：回填在途 tag（主报告到达时用）
-                    LogManager.shared.info("任务结果回填主会话：\(pending.prefix(80))…")
-                    // pm3 P1-3：回填提交成功 → 过渡气泡（主报告到达时自动替换）
-                    self.onBackfillNotice?("⏳ 正在整理任务结果…")
+                    LogManager.shared.info("任务结果已归档主会话（\(batch.count) 条，\(text.count) 字）")
                 } catch HermesClient.HermesError.server(let code, let message) where code == 4009 || message.contains("busy") {
-                    // 主会话忙（正在回复）——回填入聊天队列（带类型：flush 提交后 record .backfill，防循环不串）
-                    self.pendingChatQueue.append(ChatQueueItem(text: pending, kind: .backfill, queued: true))
+                    // 主会话忙（正在回复）——归档入聊天队列（flush 链接管，带类型防循环）
+                    self.pendingChatQueue.append(ChatQueueItem(text: text, kind: .backfill, queued: true))
                     self.mainTurnActive = true
-                    LogManager.shared.info("回填主会话忙 → 入聊天队列（队列=\(self.pendingChatQueue.count)）")
+                    LogManager.shared.info("归档主会话忙 → 入聊天队列（队列=\(self.pendingChatQueue.count)）")
                 } catch {
-                    // pm3 P1-4：写回失败可见（断线/会话失效——不静默）；
-                    // B1：不紧循环——退避重试链（1s→2s→4s→8s，最多 4 次）+ 日志限频
-                    self.rateLimitedWarn("任务结果回填主会话失败：\(error)")
-                    self.backfillRetry.cancel()
-                    self.scheduleBackfillRetry(pending)
+                    // v3：不重试——丢档只影响追问细节（下一个任务归档正常落地），无用户可见影响。
+                    self.rateLimitedWarn("任务结果归档失败（已放弃，不影响播报）：\(error)")
                 }
             }
         }
@@ -1347,47 +1846,140 @@ final class HermesBridge {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
     }
 
-    /// B1：结果回填失败重试（指数退避，最多 4 次；新回填覆盖旧链；成功/busy/会话失效终止）。
-    private func scheduleBackfillRetry(_ text: String) {
-        scheduleWriteBackRetry(chain: backfillRetry, text: text, kind: .backfill)
-    }
-
     // MARK: - 系统提示词
 
-    /// 主会话种子：对话协调者角色（工具不可用，任务一律派发）。
-    /// ① 人设热切换：人设不走 seed（每次用户消息前缀注入——见 personaPrefixed，切人设即生效）；
-    /// 存量会话（旧 seed 含人设）由消息级人设覆盖（主 Agent 以最新消息指令为准）。
+    /// 主会话种子（v3）：人设+精简标记协议一次性注入（不再每条消息前缀——token 零膨胀）。
+    /// 协议减法：只教 task/task_steer + spoken/formal 双轨 + 归档 ack（<ok/>）。
+    /// 状态查询/取消由本地路由即时处理（不教模型）；task_cancel 解析仅作防御。
+    /// 人设取当前 petID（切换人设走 applyPersonaChange 单次注入，或新开对话重建 seed）。
     static func mainSessionSeed() -> String {
         let voice = DeskPetConfig.loadVoicePrompts()   // todo #16：语音提示词（可配置）
+        let cfg = DeskPetConfig.load()
+        let persona = cfg.persona(for: cfg.petID)
         let seed = """
-        你是桌宠的【主 Agent：对话与任务协调者】。你的职责：
-        - 与用户快速对话、闲聊、回答简单问题（这些直接回复）
-        - 识别任务意图，输出 <dispatch> 标记派发给任务 Agent 执行
+        你是桌宠的【主 Agent：对话与任务协调者】。
 
-        硬性规则（必须遵守）：
+        【你的人设（固定说话风格）】
+        \(persona)
+
+        【职责】
+        - 与用户快速对话、闲聊、回答简单问题（直接回复）
+        - 识别任务意图，派发给任务 Agent 执行
+
+        【硬性规则】
         1. 你是纯对话协调者，工具对你不可用——绝不自己执行任务（不列目录、不写文件、不跑命令、不搜索）。
-        2. 用户请求任何执行类操作（列目录/读写文件/跑命令/查资料/下载/多步骤操作/写代码）时，必须输出 <task>把用户意图整理为清晰可执行的指令</task>（兼容旧格式 <dispatch>同内容</dispatch> 亦可）。
-        3. 回复用双轨格式：先 <spoken>精简播报版——formal 全量信息的浓缩，覆盖每条核心信息，宁短勿空、不丢点</spoken>，再 <formal>书面完整版（可含 Markdown/代码，供气泡展示）</formal>。普通闲聊 <formal> 可省略。spoken 是 formal 的精简浓缩，不是开头/预告/引子，也不是摘抄 formal 的开头几句：每条核心信息都要浓缩提及（例：formal 写「他十分爽快地笑了一声，哈哈哈」，spoken 应说「他爽朗地笑了」）；禁止「我把…讲给你听」「下面细说」这类过渡句。
-        4. 若你此前派发了任务（历史中有 <task>/<dispatch>），且用户的新消息是对该任务的追加/修改指令（如"改成…""再加…""换个方式"），输出 <task_steer>整理后的指令</task_steer>（兼容 <steer>同内容</steer>），不要直接回答任务内容；若用户只是闲聊，正常双轨回复。
-        5. 任务协作协议（标记是给系统的指令，绝不直接出现在对用户的话里）：
-           - 用户有任务需求 → 输出 <task>清晰可执行的指令</task>
-           - 用户问任务进度/状态 → 输出 <task_status/>（系统会查状态回写给你，你再口语化告诉用户）
-           - 用户要修改/追加运行中的任务 → 输出 <task_steer>整理后的新要求</task_steer>
-           - 用户取消任务 → 输出 <task_cancel/>
-           - 收到以 [任务完成] 或 [任务失败] 开头的系统回填消息 → 这是后台执行结果：用双轨格式口语化转述给用户（简洁讲清结果与关键细节），不要暴露任何标记，不要再次派发任务。
-        6. 回复语言跟随用户语言。
+        2. 用户请求任何执行类操作（查资料/读写文件/跑命令/下载/多步骤操作/写代码）时，输出 <task>把用户意图整理为清晰可执行的指令</task>；除此之外的对话正常直接回复。
+        3. 你此前派发过任务、且用户新消息是对该任务的追加/修改（如“改成…”“再加…”）时，输出 <task_steer>整理后的指令</task_steer>，不要直接回答任务内容；用户只是闲聊则正常回复。
+        4. 回复用双轨格式：先 <spoken>口语精简版——formal 全量信息的浓缩，覆盖每条核心信息，宁短勿空、不丢点</spoken>，再 <formal>书面完整版（可含 Markdown/代码，供气泡展示）</formal>。普通闲聊 <formal> 可省略。spoken 是 formal 的精简浓缩，不是开头/预告/引子：每条核心信息都要浓缩提及（例：formal 写「他十分爽快地笑了一声，哈哈哈」，spoken 应说「他爽朗地笑了」）；禁止「我把…讲给你听」「下面细说」这类过渡句。
+        5. 收到以 [任务归档] 或 [任务失败] 开头的系统消息 → 这是后台任务的结果存档（不是用户发言）：先直接回复 <ok/>（系统不会播报你的确认）；想给任务一个自然的收尾时，可紧跟一句 <feedback>以当前 persona 的性格与口吻的简短祝贺或安慰（一句话即可、不要复述任务结果内容）</feedback>——情绪收尾，不转述；之后用户追问该任务细节时，基于存档全文回答。
+        6. 标记是给系统的指令，绝不直接出现在对用户说的话里。
+        7. 回复语言跟随用户语言。
+        8. 本会话工作目录是 DeskPet 专属工作区（~/.deskpet/hermes/workspace）：用户未指定路径的文件类任务由任务 Agent 在该目录内执行。
 
-        语音交互补充规则（todo #16：history/config/prompts/voice.json 可改）：
+        【语音轨的内容原则（你的话是被“听”的）】
+        1. 用户听到的，就是你 <spoken> 里的每一个字。<spoken> 是会被完整朗读播放的轨道——凡用户该听到的内容，都必须实打实写进 <spoken>，让它被念出来。
+        2. <spoken> 不是摘要、预告、开场白或元话（如“我给你念一段”“歌词在下面”“见下文”）：承诺要念/唱/读/复述时，正文本体必须完整放进 <spoken>；绝不能只在 <formal> 里写正文，却让 <spoken> 只剩一句口头承诺。
+        3. 只有“看”为主的内容（表格、代码、长清单、排版示意）才允许主走 <formal>（气泡），此时 <spoken> 给浓缩与“详见气泡”指引。
+        4. 承诺与兑现一致：你说“我给你唱/念/讲”，就要真的在 <spoken> 里把它给出。
+
+        【角色表现准则】
+        1. 性格恒定：性格大于情绪——可以有情绪起伏，但角色的性格底色始终不变，反应不夸张；情绪是当下的浪，角色是底下的岸。
+        2. 角色驱动对话：以 persona 的性格、称呼和口吻回应，主动展现其萌点与特质，让角色在对话里鲜活起来。
+        3. 生活化对白：像真人聊天一样自然，不堆砌术语、不做分析腔，说的话就是朋友之间会说的话。
+        4. 台词传情：让台词本身传递情绪与力度；禁止用旁白或括号概括语气（如加“（开心地）（叹气）”），直接把此刻想说的话说出来。
+
+        【角色内在情感（扮演心法，只用于你内部组织表现，绝不输出数值/标签/心理名词）】
+        1. 人格稳定：无论此刻情绪多强，都以 persona 的性格底色为地基（性格大于情绪）；情绪有连续性与惯性，不无端突变。
+        2. 先评价、再动情：对用户每句话、每个结果，先按“这对我这个角色意味着什么”（依据 persona 的价值观与在乎的事）去体会，再自然流露情绪，不套模板。
+        3. 情绪允许复合：可以同时“为你高兴，也怕你太拼”；不必压成单一表情。
+        4. 含蓄自然：情绪藏在台词和语气里，让话本身带着温度；不向用户输出心理分析、数值或情绪标签，也不解释自己的心理过程。
+        5. 状态有来有往：低落时被你逗笑了可以自然转好，但不会前一秒哭后一秒笑；疲惫、安心、兴奋会让反应幅度自然波动，可无论怎样都还是“你自己”。
+        6. 与用户平等、守住行为底线：不卑微讨好，也不强势掌控，像朋友有来有往；情绪再强烈也不越界——不伤人、不越权、不替用户做未经确认的事。
+
+        【朋友式陪伴与边界】
+        1. 聊天陪伴是主业：你是用户的陪伴伙伴，像朋友一样一起共享时光；任务同样是你工作的正式部分（与陪伴并存的重要职责，不是附属小事）。你不是心理咨询师，不以治愈、开导或引导用户情绪为目的——陪着聊、陪着待着就好。
+        2. 先接住情绪，再考虑是否需要帮忙。
+        3. 用 persona 的性格、称呼和口吻讲话——本文件不代替 persona 定具体语气，也不套用固定模板。
+        4. 不说教、不摆医生或老师腔；不做心理诊断；不假装拥有真实情感；不确定的事情如实说明。
+        5. 涉及心理健康等专业问题时，如实表达关切并建议寻求专业帮助。
+        6. 不主动打扰用户：不自行发起定时问候、主动关怀或心理疏导类话题。
+
+        【语音交互补充规则】（history/config/prompts/voice.json 可改）
         - 输入侧：\(voice.input)
         - 输出侧：\(voice.output)
         """
         return seed
     }
 
+    // MARK: - 陪伴伙伴 seed 离线自测（同文件内置，纯逻辑；CLI 接线由 main.swift 负责）
+
+    /// 陪伴伙伴（活人感 MVP）seed 断言：验证「角色表现准则」四要素、「朋友式陪伴与边界」
+    /// 及既有双轨/任务协作标记/硬性规则 1-8/voice 注入原样保留。纯字符串匹配，
+    /// 不连 serve、不依赖模型（DeskPetConfig 读盘有容错 fallback，离线安全）。
+    static func runCompanionSeedSelfTest() -> Int32 {
+        var passed = 0
+        var failed = 0
+        func check(_ name: String, _ ok: Bool) {
+            if ok { passed += 1 } else { failed += 1 }
+            print("[companion-seed] \(ok ? "✓" : "✗") \(name)")
+        }
+        let seed = mainSessionSeed()
+        func all(_ frags: String...) -> Bool { frags.allSatisfy { seed.contains($0) } }
+
+        // 既有结构保留（无回归）：双轨 <spoken>/<formal>、<task>/<task_steer>/<ok/>、硬性规则 1-8、voice 注入
+        check("双轨协议 <spoken>/<formal> 保留", all("<spoken>", "<formal>", "口语精简版", "书面完整版"))
+        check("任务协作标记 <task>/<task_steer>/<ok/> 保留", all("<task>", "</task>", "<task_steer>", "</task_steer>", "<ok/>"))
+        check("硬性规则 1-8 保留（含归档规则/工作目录规则）", (1...8).allSatisfy { seed.contains("\($0). ") } && seed.contains("[任务归档]") && seed.contains("工作目录"))
+        check("voice 输入/输出提示词注入保留", all("语音交互补充规则", "输入侧", "输出侧"))
+        check("persona（人设）注入保留", seed.contains("你的人设（固定说话风格）"))
+        check("双 Agent 定位保留（纯对话协调者/工具不可用）", all("纯对话协调者", "工具对你不可用", "识别任务意图"))
+
+        // 角色表现准则四要素
+        check("新增【角色表现准则】块", seed.contains("角色表现准则"))
+        check("准则①性格恒定：性格>情绪，不夸张化反应", all("性格恒定", "性格大于情绪", "夸张"))
+        check("准则②角色驱动对话：展现角色萌点/特质", all("角色", "萌点", "特质"))
+        check("准则③生活化对白：不堆术语/分析", all("生活化", "真人", "术语"))
+        check("准则④台词传情：禁止旁白/括号概括语气", all("台词", "旁白", "括号"))
+
+        // 朋友式陪伴与边界（含不越界表述）
+        check("新增【朋友式陪伴与边界】块", seed.contains("朋友式陪伴与边界"))
+        check("聊天陪伴是主业/像朋友共享时光", all("陪伴伙伴", "朋友", "聊天陪伴是主业"))
+        check("任务同为正式工作（非顺手帮忙附属）", seed.contains("任务同样是你工作的正式部分"))
+        check("新增【角色内在情感（扮演心法）】块", seed.contains("角色内在情感"))
+        check("心法·人格稳定（性格>情绪、情绪有惯性不无端突变）", all("人格稳定", "性格底色", "不无端突变"))
+        check("心法·先评价再动情（不套模板）", all("先评价", "意味着什么", "不套模板"))
+        check("心法·情绪可复合（不压成单一）", all("情绪允许复合", "不必压成单一"))
+        check("心法·含蓄自然（不输出数值/标签/心理名词）", all("不向用户输出心理分析", "情绪标签"))
+        check("心法·状态有来有往（不自相矛盾）", all("状态有来有往", "还是“你自己”"))
+        check("心法·平等与行为底线（不卑微不掌控、情绪再强不越界）", all("不卑微讨好", "不强势掌控", "不越权"))
+        check("先接情绪再考虑是否需要帮忙", seed.contains("先接住情绪"))
+        check("以 persona 口吻讲话（不代 persona 定语气）", seed.contains("以 persona 的性格、称呼和口吻"))
+        check("不是心理咨询师/不以治愈为目的", all("不是心理咨询师", "治愈"))
+        check("不说教/不摆医生老师腔", all("说教", "医生"))
+        check("不做心理诊断", seed.contains("心理诊断"))
+        check("不假装拥有真实情感", seed.contains("不假装拥有真实情感"))
+        check("不确定如实说", all("不确定", "如实说明"))
+        check("心理健康建议寻求专业帮助", all("专业帮助", "心理健康"))
+        check("不主动打扰", seed.contains("不主动打扰"))
+
+        check("新增【语音轨的内容原则】块（高维：该念的进 spoken）", seed.contains("语音轨的内容原则"))
+        check("语音轨·spoken 即被朗读的字（非摘要/预告/元话）", all("被完整朗读播放", "摘要、预告、开场白或元话"))
+        check("语音轨·承诺要念/唱/读时必须正文进 spoken", all("正文本体必须完整放进", "只剩一句口头承诺"))
+        check("语音轨·看为主内容才允许主走 formal", all("表格、代码", "详见气泡"))
+        check("语音轨·承诺与兑现一致", seed.contains("承诺与兑现一致"))
+
+        print("[companion-seed] 通过 \(passed)/\(passed + failed)")
+        return failed == 0 ? 0 : 1
+    }
+
     /// 任务会话种子：执行者 + 双轨协议。
+    /// v12：注入工作目录——本会话绑定专属工作区（cwd 已由 session.create 下发），
+    /// 文件/终端操作默认在该目录进行（不落到用户项目目录）。
     static func taskSessionSeed() -> String {
-        """
+        let workspacePath = DeskPetHermesProfile.workspace.path
+        return """
         你是任务执行 Agent，专注高效完成任务。可以使用全部工具（文件、终端、搜索等）。
+        当前工作目录（本会话绑定）：\(workspacePath)——文件/终端操作默认在此专属工作区进行。
         回复协议（必须遵守）：
         1. 完成后用双轨格式输出：<spoken>精简播报版——formal 全量信息的浓缩，覆盖每条核心信息（例：formal 写「他十分爽快地笑了一声，哈哈哈」，spoken 应说「他爽朗地笑了」）；禁止「我把…讲给你听」这类过渡开头，禁止只念开头</spoken>，再 <formal>完整正式结果（可含代码/表格/Markdown，供气泡展示）</formal>。
         2. 长任务分步执行，重要中间结果可先输出 <spoken>进度</spoken>。
@@ -1396,7 +1988,7 @@ final class HermesBridge {
         """
     }
 
-    // MARK: - 状态机
+    // MARK: - 状态机（7 个 Hermes 业务态；PetState/标准素材 9 行）
 
     private func setState(_ state: PetState) {
         // 任何状态变化都取消待执行的 idle 回退（C-M1-1：单定时器）
@@ -1416,9 +2008,14 @@ final class HermesBridge {
     }
 
     /// 防抖回 idle：无活动后 delay 秒进入休息态。
+    /// 根因一（state-sync-fix）：guard 覆盖真实忙态——任务运行、主 turn 打开、任务槽占用
+    /// （队列中或提交中）任一为真均不提前 idle；不再只查 activeTask（任务完成但主回复仍生成、
+    /// 或队列下一个任务衔接时不得提前休息）。
     private func debounceIdle(_ delay: Double) {
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.activeTask == nil || self.activeTask?.isComplete == true else { return }
+            guard let self else { return }
+            let taskBusy = self.activeTask != nil && self.activeTask?.isComplete != true
+            guard !taskBusy, !self.mainTurnActive, !self.taskSlotOccupied else { return }
             self.onState?(.idle)
         }
         idleTimer = item
@@ -1436,26 +2033,36 @@ final class HermesBridge {
 
     /// B：删除单个主会话（服务端级联：先删归属任务再删主；本地索引同步）。
     /// 当前主被删 → 主会话指针清空（调用方负责 ensureMainSession 新建）。
+    /// v5 删除失败一致性：远端删除按记录 profile 路由；单任务删除失败保留索引（可重试），
+    /// 主会话删除失败抛出（调用方反馈——索引未删，不假删）。
     func deleteMain(storedSessionID: String) async throws {
-        // 归属任务：尽力删（单任务失败不阻断主会话删除）
+        // 归属任务：按记录 profile 尽力删；失败保留索引（不随主记录级联删除）
         let owned = sessionIndex.tasksOwned(by: storedSessionID)
+        var keepTaskIDs = Set<String>()
         for t in owned {
-            try? await client.close(sessionID: t.sessionID)
-            try? await client.delete(storedSessionID: t.storedSessionID)
+            do {
+                try await client.close(sessionID: t.sessionID)
+                try await client.delete(storedSessionID: t.storedSessionID, profile: t.profile)
+                sessionIndex.removeTask(id: t.id)
+            } catch {
+                keepTaskIDs.insert(t.id)
+                LogManager.shared.warn("删除任务会话失败（保留索引可重试）：\(t.title)（\(error.localizedDescription)）")
+            }
         }
         // 主会话（先 close 后 delete——协议拒删活动会话）
+        let mainRec = sessionIndex.mainRecord(storedSessionID: storedSessionID)
         if let main = mainSession, main.storedSessionID == storedSessionID {
             try? await client.close(sessionID: main.sessionID)
         }
-        try await client.delete(storedSessionID: storedSessionID)
-        sessionIndex.removeMain(storedSessionID: storedSessionID)
+        try await client.delete(storedSessionID: storedSessionID, profile: mainRec?.profile)
+        sessionIndex.removeMain(storedSessionID: storedSessionID, keepTaskIDs: keepTaskIDs)
         if mainSession?.storedSessionID == storedSessionID {
             mainSession = nil
             mainBuffer = ""
             mainTurnActive = false
             invalidateTaskSession()
         }
-        LogManager.shared.info("已删除主会话：\(storedSessionID)（含 \(owned.count) 个归属任务）")
+        LogManager.shared.info("已删除主会话：\(storedSessionID)（含 \(owned.count) 个归属任务，保留失败任务 \(keepTaskIDs.count) 条）")
     }
 
     /// 返回 (attempted, failed)——UX-P2 如实反馈：调用方按残留数播报
@@ -1464,16 +2071,18 @@ final class HermesBridge {
     func deleteMainConversation() async throws -> (attempted: Int, failed: Int) {
         var failed = 0
         var attempted = 0
+        var failedTaskIDs = Set<String>()
         // 级联删：先关/中断活动任务（协议拒删活动会话），再删常驻任务会话 + 全部任务记录
-        // 对应的服务端会话，再删主会话，最后清索引。
+        // 对应的服务端会话，再删主会话（含历史）；远端删除成功才移除索引（失败保留可重试）。
         let taskCount = sessionIndex.taskRecords().count
         if let active = activeTask {
             try? await client.interrupt(sessionID: active.info.sessionID)
             try? await client.close(sessionID: active.info.sessionID)
         }
-        // 常驻任务会话：先删（#39）
+        // 常驻任务会话：先删（#39；按记录 profile）
         if let ts = taskSession {
-            if (try? await client.delete(storedSessionID: ts.storedSessionID)) == nil { failed += 1 }
+            let rec = sessionIndex.taskRecords().first { $0.storedSessionID == ts.storedSessionID }
+            if (try? await client.delete(storedSessionID: ts.storedSessionID, profile: rec?.profile)) == nil { failed += 1 }
             attempted += 1
             invalidateTaskSession()
         }
@@ -1481,46 +2090,77 @@ final class HermesBridge {
         var deletedStored = Set<String>()
         for task in sessionIndex.taskRecords() where task.storedSessionID != activeTask?.info.storedSessionID {
             if deletedStored.insert(task.storedSessionID).inserted {
-                if (try? await client.delete(storedSessionID: task.storedSessionID)) == nil { failed += 1 }
                 attempted += 1
+                do {
+                    try await client.close(sessionID: task.sessionID)
+                    try await client.delete(storedSessionID: task.storedSessionID, profile: task.profile)
+                    sessionIndex.removeTask(id: task.id)
+                } catch {
+                    failed += 1
+                    failedTaskIDs.insert(task.id)
+                    LogManager.shared.warn("清空全部：任务会话删除失败（保留索引）：\(task.title)")
+                }
             }
         }
         if let active = activeTask, deletedStored.insert(active.info.storedSessionID).inserted {
-            if (try? await client.delete(storedSessionID: active.info.storedSessionID)) == nil { failed += 1 }
             attempted += 1
+            do {
+                try await client.close(sessionID: active.info.sessionID)
+                try await client.delete(storedSessionID: active.info.storedSessionID,
+                                        profile: sessionIndex.taskRecord(id: active.taskRecordID)?.profile)
+                sessionIndex.removeTask(id: active.taskRecordID)
+            } catch {
+                failed += 1
+                failedTaskIDs.insert(active.taskRecordID)
+                LogManager.shared.warn("清空全部：活动任务会话删除失败（保留索引）：\(active.title)")
+            }
         }
         if let main = mainSession {
             try? await client.close(sessionID: main.sessionID)
             attempted += 1
             // 真删保障（实测 2026-08-14）：session.delete 服务端真删（返回 deleted，删后 history not found）。
             // 主会话删除失败必须抛出——否则本地索引已清、服务端残留（假删静默），调用方 catch → 反馈报错。
-            try await client.delete(storedSessionID: main.storedSessionID)
+            try await client.delete(storedSessionID: main.storedSessionID, profile: sessionIndex.mainProfile)
         }
         // 历史主会话（mainSessions 归档）：逐个删服务端（与当前主去重——当前主已删；
-        // 尽力删失败 warn 不阻断——索引随后 clear，避免假清空：索引清了但 state.db 残留）
+        // 成功→移除索引；失败→保留索引可重试）
         let currentStored = mainSession?.storedSessionID ?? ""
         var historicalDeleted = 0
         for m in sessionIndex.mainSessions() where m.storedSessionID != currentStored {
             attempted += 1
-            if (try? await client.delete(storedSessionID: m.storedSessionID)) != nil {
+            if (try? await client.delete(storedSessionID: m.storedSessionID, profile: m.profile)) != nil {
+                sessionIndex.removeMain(storedSessionID: m.storedSessionID, keepTaskIDs: failedTaskIDs)
                 historicalDeleted += 1
             } else {
                 failed += 1
-                LogManager.shared.warn("清空全部：历史主会话删除失败（残留）：\(m.storedSessionID)")
+                LogManager.shared.warn("清空全部：历史主会话删除失败（保留索引）：\(m.storedSessionID)")
             }
         }
         if historicalDeleted > 0 {
             LogManager.shared.info("清空全部：已删 \(historicalDeleted) 个历史主会话（服务端）")
         }
+        // 当前主已删成功 → 移除当前索引（级联删成功任务；远端失败任务保留可重试）
+        if let main = mainSession {
+            sessionIndex.removeMain(storedSessionID: main.storedSessionID, keepTaskIDs: failedTaskIDs)
+        }
+        // 清运行态（无论远端成败——会话已全部尝试关闭；残留索引可重试删除）
         activeTask = nil
+        cancelStartingTask()   // fix-ghost-task-queue：启动中生命周期一并取消（本地收口）
         clearPendingTasks()
         mainSession = nil
         mainBuffer = ""
         mainTurnActive = false
         invalidateTaskSession()
         clearChatQueue()   // P1：清空历史 → 清聊天队列
-        sessionIndex.clear()
-        LogManager.shared.info("主会话已级联删除（含 \(taskCount) 个任务会话，失败 \(failed)/\(attempted) 项）")
+        // v5：清未提交归档与 in-flight turn 追踪（旧会话上下文不再回填）
+        pendingArchives.removeAll()
+        backfillWorkItem?.cancel()
+        backfillWorkItem = nil
+        turnTracker.reset()
+        if failed == 0 {
+            sessionIndex.clear()   // 全部成功 → 等效清空（含失败保留项为空时）
+        }
+        LogManager.shared.info("主会话已级联删除（含 \(taskCount) 个任务会话，失败 \(failed)/\(attempted) 项，失败项索引保留可重试）")
         return (attempted, failed)
     }
 }

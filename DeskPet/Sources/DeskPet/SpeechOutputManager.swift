@@ -69,11 +69,12 @@ extension SystemSpeechProvider: AVSpeechSynthesizerDelegate {
 }
 
 /// 播报管理器：provider 链 + 流式分句（按句边界切分，逐句播报，可打断）。
-/// P1-4：优先级队列——high（用户对话/主回复）立即打断；low（任务完成/进度）入队，
+/// P1-4：优先级队列——high（用户对话/主回复）立即打断；low（任务完成）入队，
 /// 当前播报结束（provider 完成回调，禁轮询）后才播。
-/// P3-1（队列语义修订，pm 前瞻走查）：stop/打断**不再清空**低优队列——
-/// 说话打断只停当前播报，任务结果语音保留排队（2s 后空闲自动推进）；
-/// 新 high 播报仍清队列（新内容优先）。
+/// 播报策略（2026-08-16 用户决策「最新优先」）：stop/打断**清空**低优队列——
+/// 用户开口或任何新 high 播报即代表最新意图，旧任务播报不再回头续播（细节看气泡/历史）；
+/// 轻确认「收到」（clearsQueue=false）仍不打断不吞队列。
+/// 原 P3-1「stop 保留队列 2s 后续播」语义废弃——实测旧内容回头续播造成话题穿插、听感混乱。
 final class SpeechOutputManager {
     enum Priority { case high, low }
 
@@ -81,6 +82,8 @@ final class SpeechOutputManager {
 
     private let systemProvider = SystemSpeechProvider()
     private let duoyunProvider = DuoyunSpeechProvider()
+    /// MiMo（小米）TTS（2026-08-16）：播报链第三档——preset/design/clone 三模式（见 MiMoSpeechProvider）
+    private let mimoProvider = MiMoSpeechProvider()
     private let edgeProvider = EdgeTTSProvider()
     private var providerChain: [SpeechProvider] = []
     private var activeProvider: SpeechProvider?
@@ -90,8 +93,8 @@ final class SpeechOutputManager {
         let text: String
         let tag: String?   // 任务实例 tag（nil = 非任务播报）
     }
-    /// 低优队列（任务完成/进度播报）；high speak 清空（新内容优先，clearsQueue=false 除外），
-    /// stop 不清（P3-1）；新任务派发时旧任务条目被清除（P4-1）
+    /// 低优队列（任务完成结果/开始确认）；high speak 清空（新内容优先，clearsQueue=false 除外），
+    /// stop（用户开口/打断）清空（2026-08-16 最新优先）；静音/链重建只停当前不清队列；新任务派发时旧任务条目被清除（P4-1）
     private var lowQueue: [LowItem] = []
     /// R-2026-08-13：高优多句剩余队列——speak(.high) 逐句串行（当前句播完才合成下一句），
     /// 防多句并发合成完成顺序乱（实测交叉/乱序）；打断（stop）时清空。
@@ -123,9 +126,10 @@ final class SpeechOutputManager {
         buildChain()
     }
 
-    /// 播报链重建（渠道切换后调用；保持静音状态）。
+    /// 播报链重建（渠道切换后调用；保持静音状态）。只停当前播报**不清队列**——
+    /// 切声线/渠道不代表放弃排队中的任务结果，新链上继续播。
     func rebuild() {
-        stop()
+        stopPlayback()
         buildChain()
     }
 
@@ -145,6 +149,11 @@ final class SpeechOutputManager {
                 // ISSUE-1：链重建前刷新豆包配置缓存（音色/key 切换后正式播报立即生效）
                 duoyunProvider.refreshConfig()
                 if duoyunProvider.isAvailable() { chain.append(duoyunProvider) }
+            case "mimo":
+                // 2026-08-16（ISSUE-1 同款）：链重建前刷新 MiMo 配置缓存（Key/模式/音色/克隆样本
+                // 切换后正式播报立即生效——含克隆样本路径变化重读）
+                mimoProvider.refreshConfig()
+                if mimoProvider.isAvailable() { chain.append(mimoProvider) }
             case "thirdparty", "hermes":
                 break   // 第三方/内置兜底：预留（M4.1 扩展点）
             default:
@@ -153,15 +162,18 @@ final class SpeechOutputManager {
         }
         if chain.isEmpty { chain = [systemProvider] }   // 兜底：系统语音
         providerChain = chain
-        // 低优队列推进：provider 完成回调（S-P1-2 协议化，主线程）
+        // 低优队列推进：provider 完成回调（S-P1-2 协议化）——NSSound delegate 线程无主线程
+        // 保证，统一收口主线程再动队列（避免后台回调与 speak/stop 并发改 lowQueue）
         for p in providerChain {
             p.onPlaybackFinished = { [weak self] in
-                // R-2026-08-13：高优多句逐句推进（当前句播完 → 合成下一句）
-                self?.advanceHigh()
-                self?.advanceLowQueue()
-                // P0-2：自然播完（且无后续条目接管）→ 通知播报结束（持续聆听恢复采集）
-                if let self, !self.isSpeaking {
-                    self.notifySpeaking(false)
+                DispatchQueue.main.async {
+                    // R-2026-08-13：高优多句逐句推进（当前句播完 → 合成下一句）
+                    self?.advanceHigh()
+                    self?.advanceLowQueue()
+                    // P0-2：自然播完（且无后续条目接管）→ 通知播报结束（持续聆听恢复采集）
+                    if let self, !self.isSpeaking {
+                        self.notifySpeaking(false)
+                    }
                 }
             }
         }
@@ -172,7 +184,8 @@ final class SpeechOutputManager {
 
     func toggleMute() {
         isMuted.toggle()
-        if isMuted { stop() }
+        // 静音≠用户关注新内容：只停当前播报，排队条目保留（取消静音后继续播）
+        if isMuted { stopPlayback() }
         onMuteChange?(isMuted)
         LogManager.shared.info("播报静音：\(isMuted)")
         // P3-1：取消静音 → 恢复低优队列推进（静音期间队列保留，speak 被 isMuted 守卫拦截）
@@ -194,8 +207,14 @@ final class SpeechOutputManager {
             return
         }
         // high：打断当前播报；清低优队列仅当 clearsQueue（新内容优先）
-        stop()
-        if clearsQueue { lowQueue.removeAll() }
+        // 轻确认（clearsQueue=false，如「收到」）：正在播报/多句未播完时不打断不掐断——
+        // 直接跳过（调用方已有气泡确认），杜绝句间隙 isSpeaking 短暂为假的竞态窗口
+        if clearsQueue {
+            stopPlayback()
+            lowQueue.removeAll()
+        } else if isSpeaking || !pendingHigh.isEmpty {
+            return
+        }
         // R-2026-08-13：逐句串行——只提交第一句，其余句入 pendingHigh 播完推进
         // （多句并发合成 → 完成顺序乱 → 播放交叉，实测）。
         guard let first = sentences.first else { return }
@@ -213,8 +232,11 @@ final class SpeechOutputManager {
 
     /// R-2026-08-13：高优多句串行推进——当前句播完（provider 完成回调）→ 合成并播下一句；
     /// 该句全链失败则跳过继续。打断（stop）清空 pendingHigh，未播句全部作废。
+    /// 2026-08-16：isSpeaking 守卫——完成回调统一主线程派发后可能「迟到」（新旧播报交接窗口），
+    /// 迟到回调不得弹出下一句（新句已在播，交由其自己的完成回调推进）
     private func advanceHigh() {
         guard !pendingHigh.isEmpty else { return }
+        guard !isSpeaking else { return }
         let next = pendingHigh.removeFirst()
         for provider in providerChain where provider.speak(next) {
             activeProvider = provider
@@ -227,7 +249,7 @@ final class SpeechOutputManager {
     /// - newTag 非 nil（新任务派发）：停当前播报（含正在播的旧任务播报/主回复——最新指令优先）
     ///   + 清空低优队列（含无 tag 条目——不再继续播旧内容）+ 记录当前任务 tag（后到的旧任务播报按 tag 丢弃）
     /// - newTag nil（中断/删除任务）：停任务播报 + 清空队列（当前任务失效）
-    /// 与说话打断区分：stop()/打断保留队列（T-1 用户优先），只有任务派发/中断才清队列。
+    /// 与说话打断区分：两者现在都清队列（2026-08-16 最新优先）；静音/链重建只停当前不清队列。
     func cancelTaskSpeech(newTag: String?) {
         stop()   // 停当前播报
         currentTaskTag = newTag
@@ -266,36 +288,44 @@ final class SpeechOutputManager {
         advanceLowQueue()
     }
 
-    /// 停止当前播报（打断）。P3-1：**不清空低优队列**——说话打断只停当前，
-    /// 任务结果语音保留排队（用户决策「任务完成不卡断对话」+「说话打断」冲突的解法：
-    /// 打断停当前，等用户说完/空闲后由延迟推进继续播）。
-    /// 新 high 播报的清队语义在 speak(.high) 内显式执行（新内容优先）。
-    func stop() {
+    /// 停止当前播报（内部原语）：停 activeProvider + 作废未播高优句；**不动低优队列**。
+    /// speak(.high) 打断路径与「收到」确认（clearsQueue=false）共用。
+    private func stopPlayback() {
         pendingHigh = []   // R-2026-08-13：打断清高优多句剩余（未播句作废）
         activeProvider?.stop()
         activeProvider = nil
-        // P0-2：停止 = 播报结束（持续聆听恢复采集；去重——无播报时 stop 不误报）
         notifySpeaking(false)
-        // P3-1：stop 后 provider 无完成回调（打断不触发 didFinish）——延迟推进恢复低优队列；
-        // advanceLowQueue 幂等（空队列/在播/静音守卫），多次 stop 的延迟任务无副作用
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.advanceLowQueue()
-        }
+    }
+
+    /// 停止当前播报并**清空低优队列**（用户开口/外部打断——最新优先）。
+    /// 2026-08-16 语义修订：用户开口即代表关注新内容，旧任务播报排队条目全部丢弃，
+    /// 不再 2s 后回头续播（原 P3-1 保留语义实测造成话题穿插）；细节看气泡/历史。
+    func stop() {
+        stopPlayback()
+        lowQueue.removeAll()
     }
 
     /// B-2：降级统一走链上 systemProvider 实例（Edge/Duoyun 合成失败时调用）——
     /// 可被 stop() 控制（打断/静音/新播报），不与链上 system 双声重叠。
+    /// 线程收口：provider 失败路径可能在后台网络上下文调用——统一派发主线程再动共享状态。
     static func fallbackSpeak(_ text: String, from provider: String = "system", reason: String? = nil) {
-        guard !text.isEmpty else { return }
-        shared.systemProvider.speak(text)
-        shared.activeProvider = shared.systemProvider
-        shared.notifySpeaking(true)   // P0-2：降级播报同样通知（回声防护）
-        // 降级可见化：5 分钟冷却防刷屏（同一 provider 连续失败只提示一次）
-        guard provider != "system" else { return }
-        if Date().timeIntervalSince(shared.lastFallbackNoticeAt) > 300 {
-            shared.lastFallbackNoticeAt = Date()
-            let msg = reason.map { "\(provider)不可用（\($0)），已改用系统语音" } ?? "\(provider)不可用，已改用系统语音"
-            shared.onFallbackNotice?(msg)
+        let work: () -> Void = {
+            guard !text.isEmpty else { return }
+            shared.systemProvider.speak(text)
+            shared.activeProvider = shared.systemProvider
+            shared.notifySpeaking(true)   // P0-2：降级播报同样通知（回声防护）
+            // 降级可见化：5 分钟冷却防刷屏（同一 provider 连续失败只提示一次）
+            guard provider != "system" else { return }
+            if Date().timeIntervalSince(shared.lastFallbackNoticeAt) > 300 {
+                shared.lastFallbackNoticeAt = Date()
+                let msg = reason.map { "\(provider)不可用（\($0)），已改用系统语音" } ?? "\(provider)不可用，已改用系统语音"
+                shared.onFallbackNotice?(msg)
+            }
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
         }
     }
 
@@ -332,11 +362,15 @@ final class SpeechOutputManager {
         let cfg = DeskPetConfig.load()
         let edgeOK = edgeProvider.isAvailable()
         let duoyunOK = duoyunProvider.isAvailable()
+        // MiMo 可用性含缓存刷新（菜单打开时重读——Key/模式/克隆样本变化即时反映）
+        mimoProvider.refreshConfig()
+        let mimoOK = mimoProvider.isAvailable()
         let current = cfg.speechChain.first(where: { id in
             switch id {
             case "system": return true
             case "edge": return edgeOK
             case "duoyun": return duoyunOK
+            case "mimo": return mimoOK
             default: return false
             }
         }) ?? "system"
@@ -353,6 +387,23 @@ final class SpeechOutputManager {
         if manifestIDs.contains("duoyun") {
             list.append(ChannelInfo(id: "duoyun", name: "豆包语音", available: duoyunOK,
                         note: duoyunOK ? "" : "未填 Key（设置 ▸ 语音 ▸ 豆包语音设置 可配置）", isCurrent: current == "duoyun"))
+        }
+        if manifestIDs.contains("mimo") {
+            // MiMo note（2026-08-16）：不可用给原因（Key/设计描述/克隆样本）；
+            // 可用时按模式标注（design/clone 与 preset 体验不同——用户需知道当前是哪种）
+            let mimoMode = cfg.mimoTTSMode
+            let note: String
+            if mimoOK {
+                switch mimoMode {
+                case "design": note = "自定义设计音色"
+                case "clone": note = "克隆音色"
+                default: note = ""
+                }
+            } else {
+                note = mimoProvider.unavailableReason()
+            }
+            list.append(ChannelInfo(id: "mimo", name: "MiMo 语音", available: mimoOK,
+                                    note: note, isCurrent: current == "mimo"))
         }
         return list
     }

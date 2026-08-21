@@ -16,6 +16,55 @@ struct VoiceServiceManifest: Codable {
     }
 
     let services: [Service]
+    /// 已删除服务 id 墓碑（2026-08-16 MiMo 批次）：默认服务升级合并（upgradeServiceIDs）
+    /// 用——历史清单缺新服务时从源清单补入，墓碑内的不补（用户删除语义跨升级保持）。
+    /// 旧版本删除 edge/duoyun 无墓碑——但它们不在 upgradeServiceIDs，不会被合并复活。
+    var deleted: [String]?
+
+    init(services: [Service], deleted: [String]? = nil) {
+        self.services = services
+        self.deleted = deleted
+    }
+
+    /// 默认服务升级清单（2026-08-16）：仅本批次新增的 mimo——存量历史清单（老版本迁移而来）
+    /// 缺该服务时自动从源清单补入一次；后续版本新增默认服务在此追加。
+    static let upgradeServiceIDs: Set<String> = ["mimo"]
+
+    /// 源清单定位（项目树 config/ 优先，bundle 兜底——升级合并的数据源）
+    private static func sourceManifest() -> VoiceServiceManifest? {
+        if let root = ProjectPaths.projectRoot() {
+            let s = root.appendingPathComponent("config/voice-services.json")
+            if let data = try? Data(contentsOf: s),
+               let m = try? JSONDecoder().decode(VoiceServiceManifest.self, from: data) {
+                return m
+            }
+        }
+        if let res = Bundle.main.resourceURL {
+            let s = res.appendingPathComponent("config/voice-services.json")
+            if let data = try? Data(contentsOf: s),
+               let m = try? JSONDecoder().decode(VoiceServiceManifest.self, from: data) {
+                return m
+            }
+        }
+        return nil
+    }
+
+    /// 升级合并：缺 upgradeServiceIDs 且未被墓碑标记的服务 → 从源清单补入（一次，落盘）。
+    /// 返回合并后的清单（无补入时原样返回；源缺失/落盘失败不影响本次返回值）。
+    private func upgradeMerged() -> VoiceServiceManifest {
+        let existing = Set(services.map(\.id))
+        let tombstones = Set(deleted ?? [])
+        guard let source = Self.sourceManifest() else { return self }
+        let additions = source.services.filter { Self.upgradeServiceIDs.contains($0.id) && !existing.contains($0.id) && !tombstones.contains($0.id) }
+        guard !additions.isEmpty else { return self }
+        var merged = VoiceServiceManifest(services: services + additions, deleted: deleted)
+        if Self.save(merged) {
+            LogManager.shared.info("语音服务清单升级：补入默认服务 \(additions.map(\.id).joined(separator: "、"))（源 config/voice-services.json）")
+        } else {
+            LogManager.shared.warn("语音服务清单升级落盘失败（本次进程内已补入：\(additions.map(\.id))）")
+        }
+        return merged
+    }
 
     /// 一次性迁移：首次把源 config/voice-services.json（项目树优先）复制到 history/config/。
     /// 已存在不覆盖（用户删除持久——build-app.sh 打包副本不还原）。
@@ -45,13 +94,14 @@ struct VoiceServiceManifest: Codable {
         }
     }
 
-    /// 读清单：history/config/ 优先 → bundle/项目内 fallback；缺失/损坏返回 nil（展示层兜底提示）。
+    /// 读清单：history/config/ 优先（含升级合并——老版本迁移清单补入新默认服务）→
+    /// bundle/项目内 fallback；缺失/损坏返回 nil（展示层兜底提示）。
     static func load() -> VoiceServiceManifest? {
         ensureMigrated()
         let historyFile = DeskPetConfig.configDir().appendingPathComponent("voice-services.json")
         if let data = try? Data(contentsOf: historyFile),
            let manifest = try? JSONDecoder().decode(VoiceServiceManifest.self, from: data) {
-            return manifest
+            return manifest.upgradeMerged()
         }
         if let url = ProjectPaths.find(relative: "config/voice-services.json"),
            let data = try? Data(contentsOf: url),
@@ -83,8 +133,10 @@ struct VoiceServiceManifest: Codable {
         services.first { $0.id == id }
     }
 
-    /// 删除指定服务的副本（不落盘，调用方 save）。
+    /// 删除指定服务的副本（不落盘，调用方 save）——同时记墓碑（升级合并不再补回）。
     func deletingService(id: String) -> VoiceServiceManifest {
-        VoiceServiceManifest(services: services.filter { $0.id != id })
+        var tombstones = deleted ?? []
+        if !tombstones.contains(id) { tombstones.append(id) }
+        return VoiceServiceManifest(services: services.filter { $0.id != id }, deleted: tombstones)
     }
 }

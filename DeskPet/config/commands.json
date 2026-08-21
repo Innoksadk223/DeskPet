@@ -1,5 +1,5 @@
 {
-  "说明": "桌宠本地指令表（触发词机制）。未命中任何规则 → 走主会话闲聊。action: dispatch(派发任务) | interrupt(打断任务) | new_chat(新开对话) | history(查询记录) | steer_task(跟任务说) | mute(静音,M2) | help(帮助)。type: prefix(前缀) | contains(包含) | regex(正则)。",
+  "说明": "桌宠本地指令表（触发词机制）。未命中任何规则 → 走主会话闲聊。action: dispatch(派发任务) | interrupt(打断任务) | task_status(任务状态本地直答) | new_chat(新开对话) | history(查询记录) | steer_task(跟任务说) | mute(静音,M2) | help(帮助)。type: prefix(前缀) | contains(包含) | regex(正则)。",
   "rules": [
     {
       "type": "prefix",
@@ -249,6 +249,44 @@
     },
     {
       "type": "prefix",
+      "pattern": "停止回答",
+      "action": "interrupt_main",
+      "note": "v10 三分控制：只停主 Agent 当前回复，任务侧不动（前缀语义——非宽泛 contains，否定句「请不要停止回答」不命中）"
+    },
+    {
+      "type": "prefix",
+      "pattern": "全部停止",
+      "action": "interrupt_all",
+      "note": "v10 三分控制：主 Agent 回复与任务 Agent 同时收口"
+    },
+    {
+      "type": "contains",
+      "pattern": "还在工作吗",
+      "action": "task_status",
+      "note": "v3：本地直答任务状态（零延迟），不绕主 Agent"
+    },
+    {
+      "type": "contains",
+      "pattern": "在工作吗",
+      "action": "task_status"
+    },
+    {
+      "type": "contains",
+      "pattern": "任务状态",
+      "action": "task_status"
+    },
+    {
+      "type": "contains",
+      "pattern": "任务进度",
+      "action": "task_status"
+    },
+    {
+      "type": "contains",
+      "pattern": "任务做完了吗",
+      "action": "task_status"
+    },
+    {
+      "type": "prefix",
       "pattern": "打断",
       "action": "interrupt",
       "note": "短触发词，需唤醒后使用（M3）"
@@ -311,6 +349,18 @@
       "action": "mute",
       "note": "切换播报静音",
       "matchType": "prefixStrict"
+    },
+    {
+      "type": "regex",
+      "pattern": "^请?帮我(执行|运行)\\S",
+      "action": "dispatch",
+      "note": "v4 高置信直派：帮我/请帮我+执行/运行（至少一个对象字符）——完整原文直传任务 Agent（不剥前缀）"
+    },
+    {
+      "type": "regex",
+      "pattern": "^请?帮我(写|编写|改|修改|创建|新建|生成|整理|删除|移除|修复|测试|编译|查看|阅读|保存)(一下|下|个|份|段|点|一个|一份|一段|一点)?[^，。！？、,.!?;:]{0,12}?(文件|代码|脚本|命令|目录|项目|文档)",
+      "action": "dispatch",
+      "note": "v4 高置信直派：帮我/请帮我+文件/代码/脚本/命令/目录/项目/文档类操作——对象名词锚定；「帮我整理一下思路」等无工具对象闲聊不劫持"
     }
   ]
 }

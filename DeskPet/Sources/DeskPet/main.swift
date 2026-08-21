@@ -5,6 +5,10 @@ import AppKit
 
 // CLI 自测模式：--self-test-hermes / --self-test-bridge / --self-test-router（连本地 serve 跑全链路后退出）
 let args = CommandLine.arguments
+if args.contains("--self-test-pet") {
+    // Pet atlas 状态/行/帧数契约纯离线自测：不读取图片、不连接 Hermes。
+    exit(PetAtlasSelfTest.run())
+}
 if args.contains("--self-test-duoyun-asr") {
     let wav = args.drop(while: { $0 != "--self-test-duoyun-asr" }).dropFirst().first ?? "/tmp/deskpet-asr-test.wav"
     Task {
@@ -15,8 +19,36 @@ if args.contains("--self-test-duoyun-asr") {
 if args.contains("--self-test-vad") {
     exit(ASRVAD.runSelfTest())
 }
+if args.contains("--self-test-mimo") {
+    // MiMo 语音（2026-08-16）：纯函数离线自测（WAV 头布局 + TTS/ASR 请求体构造）——不触网络
+    exit(MiMoSelfTest.run())
+}
 if args.contains("--self-test-markers") {
     exit(HermesBridgeSelfTest.runMarkersSelfTest())
+}
+if args.contains("--self-test-companion") {
+    // 陪伴伙伴（活人感 MVP）纯离线自测：feedback 解析 / <ok/>+<feedback> 混合 / 迟到 ok+feedback 抑制 / 向后兼容
+    exit(HermesSelfTest.runCompanionSelfTest())
+}
+if args.contains("--self-test-history-storage") {
+    // v5 历史存储隔离回归：纯离线（临时目录 + ObjC runtime 注入 HOME）——不连 serve、不触碰用户 home
+    exit(HistoryStorageSelfTest.run())
+}
+if args.contains("--self-test-wake") {
+    // v7 唤醒词热生效回归：纯离线（决策纯函数 + 状态机 guard）——不触碰真实音频设备/模型
+    exit(WakeControllerSelfTest.run())
+}
+if args.contains("--self-test-asr-seg") {
+    // v8 ASR 分段合并回归：纯离线（SpeechSegmenter 纯值类型事件驱动）——不触碰音频设备/模型/网络
+    exit(SpeechSelfTest.runSegmentationSelfTest())
+}
+if args.contains("--self-test-hermes-discovery") {
+    // P1：本机 Hermes 候选排序/过滤/空结果诊断——不启动 Hermes、不触碰用户安装。
+    exit(HermesSelfTest.runDiscoverySelfTest())
+}
+if args.contains("--self-test-persona") {
+    // task-config：人设配置写 API 纯离线自测（临时目录注入）——不触碰真实配置。
+    exit(HermesSelfTest.runPersonaConfigSelfTest())
 }
 if args.contains("--self-test-hermes") || args.contains("--self-test-bridge") || args.contains("--self-test-router") || args.contains("--self-test-tts") || args.contains("--self-test-speech") || args.contains("--self-test-duoyun") || args.contains("--self-test-transcript") || args.contains("--self-test-edge") {
     if args.contains("--self-test-duoyun") {
@@ -53,6 +85,8 @@ let app = NSApplication.shared
 // runningApplications(withBundleIdentifier:) 查询恒空集，2026-08-13 optimizer 实测推断）。
 // 路径可移植化（F3）：项目内 history/data/deskpet.lock（随项目走；数据/临时文件，可清理）；
 // .app 分发定位失败回退 AS。
+// v6（M4 fresh-install 加固）：单实例锁是硬门槛——无法确认独占锁（另一实例在运行，或
+// 锁文件/目录不可用）必须阻止继续初始化（退出），绝不静默降级为多实例双写会话索引/状态。
 private let lockDirURL = ProjectPaths.projectDataDir()
     ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/DeskPet", isDirectory: true)
 private let instanceLockPath = lockDirURL.appendingPathComponent("deskpet.lock").path
@@ -60,14 +94,13 @@ do {
     try FileManager.default.createDirectory(atPath: (instanceLockPath as NSString).deletingLastPathComponent,
                                             withIntermediateDirectories: true)
     let fd = open(instanceLockPath, O_CREAT | O_RDWR, 0o644)
-    if fd >= 0 {
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            LogManager.shared.info("已有桌宠实例在运行，退出")
-            exit(0)
-        }
+    guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        LogManager.shared.error("单实例锁获取失败（另一桌宠实例在运行，或锁文件不可用）——退出，避免双写")
+        exit(1)
     }
 } catch {
-    LogManager.shared.warn("单实例锁初始化失败：\(error)")
+    LogManager.shared.error("单实例锁初始化失败：\(error)——退出，避免双写")
+    exit(1)
 }
 let delegate = AppDelegate()
 app.delegate = delegate

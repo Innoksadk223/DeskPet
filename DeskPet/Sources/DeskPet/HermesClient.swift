@@ -267,28 +267,66 @@ final class HermesClient {
         let sessionID: String
         let storedSessionID: String
         let model: String?
+        /// v6 fresh-install 加固：serve 回报的 desktop_contract（create/resume info 解析；
+        /// nil=后端未回报——硬门槛校验时视为不兼容）
+        let desktopContract: Int?
+        /// v6：serve 回报的 profile_name（nil=未回报；若请求 deskpet-app 却回报默认名
+        /// → 后端静默降级，硬门槛校验拒绝）
+        let profileName: String?
+
+        init(sessionID: String, storedSessionID: String, model: String?,
+             desktopContract: Int? = nil, profileName: String? = nil) {
+            self.sessionID = sessionID; self.storedSessionID = storedSessionID
+            self.model = model; self.desktopContract = desktopContract; self.profileName = profileName
+        }
+
+        static func parse(_ r: [String: Any]) -> SessionInfo {
+            let info = r["info"] as? [String: Any]
+            return SessionInfo(
+                sessionID: r["session_id"] as? String ?? "",
+                storedSessionID: r["stored_session_id"] as? String ?? "",
+                model: info?["model"] as? String,
+                desktopContract: (info?["desktop_contract"] as? NSNumber)?.intValue ?? (info?["desktop_contract"] as? Int),
+                profileName: info?["profile_name"] as? String)
+        }
     }
 
-    func createSession(title: String? = nil, parentSessionID: String? = nil, seedMessages: [[String: Any]]? = nil) async throws -> SessionInfo {
+    /// v5 历史存储隔离：profile 非空时路由到 named profile（serve 端 session.create 按
+    /// profile 的 HERMES_HOME 构建 agent 与持久化——DeskPet 用 deskpet-app 隔离会话数据）。
+    /// v12（DeskPet-only cwd 覆盖）：cwd 非空时随 session.create 显式下发（serve 端
+    /// methods_session.py 支持 cwd 参数并解析为会话工作目录）——仅 DeskPet 调用传值
+    /// （主/任务会话绑定 ~/.deskpet/hermes/workspace）；默认 nil 不带 cwd 键，其他调用者行为不变。
+    func createSession(title: String? = nil, parentSessionID: String? = nil, seedMessages: [[String: Any]]? = nil, profile: String? = nil, cwd: String? = nil) async throws -> SessionInfo {
+        let params = Self.createSessionParams(title: title, parentSessionID: parentSessionID, seedMessages: seedMessages, profile: profile, cwd: cwd)
+        let r = try await call("session.create", params: params)
+        return SessionInfo.parse(r)
+    }
+
+    /// v12：session.create 参数构造（纯函数，可离线自测）——cwd 非空才带 cwd 键。
+    /// 默认 nil 行为与历史完全一致（不带 cwd 键，不影响其他调用者）。
+    static func createSessionParams(title: String?, parentSessionID: String?, seedMessages: [[String: Any]]?, profile: String?, cwd: String?) -> [String: Any] {
         var params: [String: Any] = [:]
         if let title { params["title"] = title }
         if let parentSessionID { params["parent_session_id"] = parentSessionID }
         if let seedMessages { params["messages"] = seedMessages }
-        let r = try await call("session.create", params: params)
-        return SessionInfo(sessionID: r["session_id"] as? String ?? "",
-                           storedSessionID: r["stored_session_id"] as? String ?? "",
-                           model: (r["info"] as? [String: Any])?["model"] as? String)
+        if let profile, !profile.isEmpty { params["profile"] = profile }
+        if let cwd, !cwd.isEmpty { params["cwd"] = cwd }
+        return params
     }
 
     /// 恢复已存在会话（跨重启复用主会话）：params session_id = **stored_session_id**（实测：
     /// 内部 id 返回 4007；stored id 成功——tui_gateway/methods_session.py:306 resume 语义）。
     /// 返回 {session_id: 恢复后的内部 id（断连自动落盘场景与原 id 相同）, resumed: stored id, ...}；
     /// 会话不存在返回错误码 4007。
-    func resume(sessionID: String) async throws -> SessionInfo {
-        let r = try await call("session.resume", params: ["session_id": sessionID])
-        return SessionInfo(sessionID: r["session_id"] as? String ?? "",
+    /// v5：profile 非空时从指定 profile 的 state.db 恢复（记录按 profile 路由）。
+    func resume(sessionID: String, profile: String? = nil) async throws -> SessionInfo {
+        var params: [String: Any] = ["session_id": sessionID]
+        if let profile, !profile.isEmpty { params["profile"] = profile }
+        let r = try await call("session.resume", params: params)
+        let info = SessionInfo.parse(r)
+        return SessionInfo(sessionID: info.sessionID,
                            storedSessionID: r["resumed"] as? String ?? r["stored_session_id"] as? String ?? "",
-                           model: (r["info"] as? [String: Any])?["model"] as? String)
+                           model: info.model, desktopContract: info.desktopContract, profileName: info.profileName)
     }
 
     /// 提交一轮 prompt；queued=true 表示忙时必须排队，不能 redirect/interrupt 当前 turn。
@@ -310,9 +348,12 @@ final class HermesClient {
         try await call("session.interrupt", params: ["session_id": sessionID])
     }
 
-    func history(sessionID: String) async throws -> [[String: Any]] {
+    /// v6：history 支持可选 profile——主/任务历史查询按记录 profile 路由（legacy=nil 走默认）。
+    func history(sessionID: String, profile: String? = nil) async throws -> [[String: Any]] {
         // F5：历史查看 15s 超时（默认 30s——慢 serve 下用户得不到及时反馈）
-        let r = try await call("session.history", params: ["session_id": sessionID], timeout: 15)
+        var params: [String: Any] = ["session_id": sessionID]
+        if let profile, !profile.isEmpty { params["profile"] = profile }
+        let r = try await call("session.history", params: params, timeout: 15)
         return r["messages"] as? [[String: Any]] ?? []
     }
 
@@ -334,9 +375,12 @@ final class HermesClient {
     }
 
     /// 删除落盘会话（须先 close；参数为 stored_session_id）。删除已不存在的会话视为成功。
-    func delete(storedSessionID: String) async throws {
+    /// v5：profile 非空时按 profile 的 sessions 目录删除（记录按 profile 路由）。
+    func delete(storedSessionID: String, profile: String? = nil) async throws {
         do {
-            try await call("session.delete", params: ["session_id": storedSessionID])
+            var params: [String: Any] = ["session_id": storedSessionID]
+            if let profile, !profile.isEmpty { params["profile"] = profile }
+            try await call("session.delete", params: params)
         } catch HermesError.server(let code, let message)
             where code == 4001 || code == 4007 || message.localizedCaseInsensitiveContains("not found") {
             LogManager.shared.info("会话已不存在，删除视为成功：\(storedSessionID)")

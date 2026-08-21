@@ -1,11 +1,11 @@
 #!/bin/bash
 # 打包 DeskPet.dmg（含最新构建 + Applications 快捷方式）
-# 用法：./build-dmg.sh [版本号]   （默认 0.3.0）
+# 用法：./build-dmg.sh [版本号]   （默认 0.7.8）
 # 产物：DeskPet-<版本>.dmg（项目根；不含任何 key——build-app.sh 强制剥离）
 set -e
 cd "$(dirname "$0")"
 
-VERSION="${1:-0.3.0}"
+VERSION="${1:-0.7.5}"
 DMG="DeskPet-${VERSION}.dmg"
 
 echo "== 1/3 构建并组装 DeskPet.app =="

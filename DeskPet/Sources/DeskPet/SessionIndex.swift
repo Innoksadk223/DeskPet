@@ -18,14 +18,18 @@ final class SessionIndex {
         var completed: Bool = false
         /// B：归属主会话（addTask 时自动填当前主；旧数据迁移默认当前主）
         var mainStoredSessionID: String? = nil
+        /// v5 历史存储隔离：会话所在 Hermes named profile（nil=legacy 默认 profile）——
+        /// resume/delete 按记录 profile 路由；旧数据缺键解码为 nil 即 legacy，不迁移不删除。
+        var profile: String? = nil
 
-        enum CodingKeys: String, CodingKey { case id, sessionID, storedSessionID, title, createdAt, completed, mainStoredSessionID }
+        enum CodingKeys: String, CodingKey { case id, sessionID, storedSessionID, title, createdAt, completed, mainStoredSessionID, profile }
         init(sessionID: String, storedSessionID: String, title: String, createdAt: Date,
-             completed: Bool = false, mainStoredSessionID: String? = nil) {
+             completed: Bool = false, mainStoredSessionID: String? = nil, profile: String? = nil) {
             self.id = UUID().uuidString
             self.sessionID = sessionID; self.storedSessionID = storedSessionID
             self.title = title; self.createdAt = createdAt
             self.completed = completed; self.mainStoredSessionID = mainStoredSessionID
+            self.profile = profile
         }
         // 兼容旧数据：completed/mainStoredSessionID/id 缺失（A 覆盖 bug 根因——合成 Decodable
         // 对带默认值的非 Optional 属性仍要求键存在；id 缺失 → 迁移时生成新 UUID 一次性写入）
@@ -38,6 +42,7 @@ final class SessionIndex {
             createdAt = try c.decode(Date.self, forKey: .createdAt)
             completed = try c.decodeIfPresent(Bool.self, forKey: .completed) ?? false
             mainStoredSessionID = try c.decodeIfPresent(String.self, forKey: .mainStoredSessionID)
+            profile = try c.decodeIfPresent(String.self, forKey: .profile)
         }
     }
 
@@ -46,15 +51,34 @@ final class SessionIndex {
         let storedSessionID: String
         let sessionID: String
         let createdAt: Date
+        /// v5：会话所在 Hermes named profile（nil=legacy 默认 profile；resume/delete 按此路由）
+        var profile: String? = nil
+
+        enum CodingKeys: String, CodingKey { case storedSessionID, sessionID, createdAt, profile }
+        init(storedSessionID: String, sessionID: String, createdAt: Date, profile: String? = nil) {
+            self.storedSessionID = storedSessionID; self.sessionID = sessionID
+            self.createdAt = createdAt; self.profile = profile
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            storedSessionID = try c.decode(String.self, forKey: .storedSessionID)
+            sessionID = try c.decode(String.self, forKey: .sessionID)
+            createdAt = try c.decode(Date.self, forKey: .createdAt)
+            profile = try c.decodeIfPresent(String.self, forKey: .profile)
+        }
     }
 
     struct Record: Codable {
         var mainSessionID: String = ""
         var mainStoredSessionID: String = ""
+        /// v3：主会话 seed 协议版本（协议大改时+1——版本不符的旧会话不 resume，新建）
+        var mainSeedVersion: Int = 0
+        /// v5：当前主会话的 profile（归档旧当前时保留其 profile）
+        var mainProfile: String? = nil
         var mainSessions: [MainRecord] = []   // B：全部主会话（最近在前，含当前）
         var tasks: [TaskRecord] = []
 
-        enum CodingKeys: String, CodingKey { case mainSessionID, mainStoredSessionID, mainSessions, tasks }
+        enum CodingKeys: String, CodingKey { case mainSessionID, mainStoredSessionID, mainSeedVersion, mainProfile, mainSessions, tasks }
         init() {}
         // 兼容旧数据：缺失键（B 前的 mainSessions）用默认值——合成 Decodable 对缺失键会抛错
         // （属性默认值不参与 decode），自定义 decodeIfPresent 兜底。
@@ -62,6 +86,8 @@ final class SessionIndex {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             mainSessionID = try c.decodeIfPresent(String.self, forKey: .mainSessionID) ?? ""
             mainStoredSessionID = try c.decodeIfPresent(String.self, forKey: .mainStoredSessionID) ?? ""
+            mainSeedVersion = try c.decodeIfPresent(Int.self, forKey: .mainSeedVersion) ?? 0
+            mainProfile = try c.decodeIfPresent(String.self, forKey: .mainProfile)
             mainSessions = try c.decodeIfPresent([MainRecord].self, forKey: .mainSessions) ?? []
             tasks = try c.decodeIfPresent([TaskRecord].self, forKey: .tasks) ?? []
         }
@@ -169,21 +195,26 @@ final class SessionIndex {
 
     /// 设置当前主会话。B 归档语义：stored 变化（新开对话/新建）→ 旧当前归档进 mainSessions；
     /// 同 ID（启动 resume 回写）不归档。当前始终在 mainSessions[0]（最近在前）。
-    func setMain(sessionID: String, storedSessionID: String) {
+    /// v3：同步记录 seed 版本（resume 判定用）。
+    /// v5：同步记录 profile（旧当前归档时保留其 profile——legacy 旧主归档后仍可按默认 profile 查看删除）。
+    func setMain(sessionID: String, storedSessionID: String, seedVersion: Int = 0, profile: String? = nil) {
         lock.withLock {
             let oldStored = record.mainStoredSessionID
             if !oldStored.isEmpty && oldStored != storedSessionID {
-                // 归档旧当前（防重复：若已在 mainSessions 则不重复 append）
+                // 归档旧当前（防重复：若已在 mainSessions 则不重复 append；profile 用记录值，legacy 为 nil）
                 if !record.mainSessions.contains(where: { $0.storedSessionID == oldStored }) {
                     record.mainSessions.append(.init(storedSessionID: oldStored,
-                                                     sessionID: record.mainSessionID, createdAt: Date()))
+                                                     sessionID: record.mainSessionID, createdAt: Date(),
+                                                     profile: record.mainProfile))
                 }
             }
             record.mainSessionID = sessionID
             record.mainStoredSessionID = storedSessionID
+            record.mainSeedVersion = seedVersion
+            record.mainProfile = profile
             // 当前指针同步到 mainSessions（幂等：同 ID 先移除再插最前）
             record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
-            record.mainSessions.insert(.init(storedSessionID: storedSessionID, sessionID: sessionID, createdAt: Date()), at: 0)
+            record.mainSessions.insert(.init(storedSessionID: storedSessionID, sessionID: sessionID, createdAt: Date(), profile: profile), at: 0)
             // 上限：超 50 删最旧非当前（当前在 [0]，从尾部删）
             if record.mainSessions.count > maxMainSessions {
                 record.mainSessions.removeLast(record.mainSessions.count - maxMainSessions)
@@ -195,17 +226,35 @@ final class SessionIndex {
     /// 全部主会话（最近在前，含当前）。
     func mainSessions() -> [MainRecord] { lock.withLock { record.mainSessions } }
 
+    /// v3：当前主会话的 seed 协议版本（无记录=0）。
+    func mainSeedVersion() -> Int { lock.withLock { record.mainSeedVersion } }
+
+    /// v5：按 stored_session_id 查主会话记录（resume/删除按记录 profile 路由；nil=不存在）。
+    func mainRecord(storedSessionID: String) -> MainRecord? {
+        lock.withLock { record.mainSessions.first { $0.storedSessionID == storedSessionID } }
+    }
+
+    /// v5：当前主会话的 profile（nil=legacy 默认 profile）。
+    var mainProfile: String? { lock.withLock { record.mainProfile } }
+
+    /// v5：按任务实例 id 查记录（删除/查看按记录 profile 路由）。
+    func taskRecord(id: String) -> TaskRecord? {
+        lock.withLock { record.tasks.first { $0.id == id } }
+    }
+
     /// 删除单个主会话记录 + 归属其的任务（服务端级联删除由调用方负责）。
     /// 当前主被删 → 清空当前指针（调用方负责新建）。返回被删的主记录（供调用方判断是否当前）。
+    /// v5：远端删除失败的归属任务保留索引（keepTaskIDs 跳过级联删除，可重试）。
     @discardableResult
-    func removeMain(storedSessionID: String) -> MainRecord? {
+    func removeMain(storedSessionID: String, keepTaskIDs: Set<String> = []) -> MainRecord? {
         lock.withLock {
             let removed = record.mainSessions.first { $0.storedSessionID == storedSessionID }
             record.mainSessions.removeAll { $0.storedSessionID == storedSessionID }
-            record.tasks.removeAll { $0.mainStoredSessionID == storedSessionID }
+            record.tasks.removeAll { $0.mainStoredSessionID == storedSessionID && !keepTaskIDs.contains($0.id) }
             if record.mainStoredSessionID == storedSessionID {
                 record.mainStoredSessionID = ""
                 record.mainSessionID = ""
+                record.mainProfile = nil
             }
             save()
             return removed

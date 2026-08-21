@@ -1,18 +1,19 @@
 {
-  "petID": "monthly-salary-cat",
+  "petID": "whale-girl",
   "voice": "",
   "duoyunApiKey": "",
   "duoyunResourceId": "seed-tts-2.0",
   "duoyunVoiceType": "zh_female_vv_uranus_bigtts",
   "launchAtLogin": false,
   "speechChain": [
+    "mimo",
     "edge",
     "system",
     "duoyun",
     "thirdparty",
     "hermes"
   ],
-  "wakePhrase": "嘿猫猫",
+  "wakePhrase": "小鲸鱼",
   "edgeVoice": "zh-CN-XiaoxiaoNeural",
   "asrProvider": "local",
   "asrApiKey": "",
@@ -21,5 +22,8 @@
     "晚安"
   ],
   "listenSilenceTimeout": 2.0,
-  "wakeThreshold": 0.25
+  "wakeThreshold": 0.25,
+  "mimoTTSMode": "design",
+  "mimoVoiceDesignPrompt": "年轻女性声音，明亮元气、清透有活力，音色自然甜而不腻，带轻微海风般的清爽感；中高音区，语速中等偏快，咬字清晰，句尾利落并带轻微笑意。不要幼童声，不要夹嗓，不要过度撒娇，不要尖锐高亢或夸张动漫腔。",
+  "mimoStyleInstruction": ""
 }

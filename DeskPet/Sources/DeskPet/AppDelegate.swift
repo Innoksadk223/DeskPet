@@ -23,11 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // M2：语音
     let speechInput = SpeechInputController()
 
-    /// 豆包识别失败 → 本次会话回退本地 + 提示（语音输入自动降级，无需用户操作）
+    /// 云端识别（豆包/MiMo）失败 → 本次会话回退本地 + 提示（语音输入自动降级，无需用户操作）
     private func wireSpeechInput() {
         speechInput.onASRError = { [weak self] message in
             DispatchQueue.main.async {
-                self?.feedback("⚠️ 豆包识别不可用（\(message.prefix(40))）——本次会话已回退本地识别")
+                self?.feedback("⚠️ 云端识别不可用（\(message.prefix(40))）——本次会话已回退本地识别")
             }
         }
     }
@@ -38,8 +38,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let listeningCoordinator = ListeningCoordinator()
     /// U5：连接失败统一文案——气泡纯文本无按钮，给真实菜单路径（设置▸系统▸重新连接助手服务）
     private static let connectFailureText = "⚠️ 连不上助手服务——设置菜单「系统▸重新连接助手服务」可重试"
+    /// 真实菜单入口（U5：文案只指向真实存在的条目，避免误导）——选择与重连两个入口。
+    private static let hermesSelectEntry = "设置▸系统▸选择 Hermes 可执行文件…"
+    private static let hermesRetryEntry = "设置▸系统▸重新连接助手服务"
+
+    /// P1：启动适配引导（纯函数，可离线断言）。把 HermesDiscovery 的适配决策转成
+    /// 「新用户可见引导」文案：只对「未安装/全失败」给可行动文案——说清原因 + 指向真实菜单
+    /// 条目（选择 Hermes 可执行文件… / 重新连接助手服务）；正常（已找到/多安装自动接管）返回 nil 不打扰。
+    static func adaptationGuidanceText(for decision: HermesAdaptationDecision) -> String? {
+        switch decision.mode {
+        case .notInstalled:
+            return "🚫 检测到 Hermes 未安装（未找到任何本机安装）。请先安装 Hermes 后重启桌宠，或在（\(hermesSelectEntry)）手动指定路径；完成后到（\(hermesRetryEntry)）重试。"
+        case .allFailed:
+            return "🚫 本机 Hermes 候选均不可用（\(decision.message)）。请检查候选权限/安装完整性，或在（\(hermesSelectEntry)）指定可用路径；再到（\(hermesRetryEntry)）重试。"
+        case .autoUse, .multiple:
+            return nil
+        }
+    }
+
+    /// P1：启动适配检测——本地纯逻辑评估 + 可见引导（气泡+播报走 feedback 收口）。
+    /// 缺失/不可用 → 主动气泡+播报说清原因；已找到/多安装只记日志不打扰（多安装由
+    /// ServeManager 自动选首个可用）。不启动 serve、不联网、不触碰 Hermes 本体。
+    private func runStartupHermesGuidance() {
+        let decision = HermesDiscovery.adaptationDecision(HermesDiscovery.statuses(from: HermesDiscovery.discover()))
+        switch decision.mode {
+        case .notInstalled:
+            LogManager.shared.error("启动适配检测：Hermes 未安装（候选 0）")
+        case .allFailed:
+            LogManager.shared.error("启动适配检测：\(decision.message)")
+        case .autoUse(let path, let source):
+            LogManager.shared.info("启动适配检测：已找到唯一可用 Hermes（\(HermesExecutableCandidate(path: "", source: source).sourceName)）：\(path)")
+        case .multiple(let selected, let alternatives):
+            LogManager.shared.warn("启动适配检测：多 Hermes 安装，自动使用 \(selected)，可选项：\(alternatives.joined(separator: "、"))")
+        }
+        guard let text = Self.adaptationGuidanceText(for: decision) else { return }
+        feedback(text)
+    }
     /// C1：过渡气泡超时（persistent 过渡型气泡最长显示——被新气泡替换则提前结束；防卡死）
     private static let transitionBubbleTimeout: TimeInterval = 4
+    /// fix-live-ux-details：任务启动等待气泡最长显示（8s 无首个活动才显示；60s 内被
+    /// 首个活动/结果/失败/⏹ 反馈气泡替换则提前结束；服务端中断 drain 约 60s 的边界）
+    private static let taskStartPendingBubbleTimeout: TimeInterval = 60
     // E-M3-1：唤醒命中可视反馈（气泡「在听，请说~」+ 聆听状态）标记
     private var wakeDictationActive = false
     private var preWakeState: PetState = .idle
@@ -123,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.showBubble("📝 收到：\(text)", persistent: true, maxDuration: Self.transitionBubbleTimeout)   // 过渡型：4s 无替换自动隐藏（防任务运行中卡死）
             // P2-07：正在播报（主回复/任务消息）时不打断——仅气泡确认
             // U6：播报确认去重——「收到」移到 routeUserInput 内按路由结果决定
-            // （任务派发路径只播「好嘞，开始执行！」；纯聊天/其他路径播「收到」）
+            // （任务派发路径只播气泡「📋 标题」，不再额外语音确认；纯聊天/其他路径播「收到」）
             self.routeUserInput(text, fromVoice: true)
         }
         speechInput.onStateChange = { [weak self] recording in
@@ -157,6 +196,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // M1：Hermes 桥接初始化（异步，不阻塞 GUI）
+        // P1：启动前先做本地适配评估——缺失/不可用立即气泡+播报引导（说清原因，指向真实菜单入口）
+        runStartupHermesGuidance()
         initializeBridge()
 
         // P3-1：首启引导（一次性）——气泡显示核心用法，标记后不再弹
@@ -226,9 +267,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupWakeWord(bridge)
             } catch {
                 LogManager.shared.error("Hermes 桥接初始化失败：\(error)")
-                // P1-02：失败可见化（不再静默）；右键菜单/菜单栏可重试
-                // U5：文案指向真实入口（设置▸系统▸重新连接助手服务），不再误导"点『重新连接』"
-                feedback(Self.connectFailureText)
+                // v6（M1）：Profile/后端能力错误给可行动中文反馈；其余走通用连接失败文案
+                if let pe = error as? DeskPetHermesProfile.ProfileError {
+                    switch pe {
+                    case .conflict(let msg):
+                        // P1-02：失败可见化（不再静默）；U5：文案指向真实入口（设置▸系统▸重新连接助手服务）
+                        feedback("⚠️ 桌宠专属配置冲突：\(msg)\n请先备份并移除 ~/.hermes/profiles/deskpet-app 后重试（设置▸系统▸重新连接助手服务）")
+                    case .directory(let msg):
+                        feedback("⚠️ 桌宠数据目录不可用：\(msg)\n请检查 ~/.deskpet 与 ~/.hermes 的读写权限后重试（设置▸系统▸重新连接助手服务）")
+                    case .backendIncompatible(let msg):
+                        feedback("⚠️ \(msg)\n请升级 hermes-agent 后重试（设置▸系统▸重新连接助手服务）")
+                    }
+                } else {
+                    // U5：文案指向真实入口（设置▸系统▸重新连接助手服务），不再误导"点『重新连接』"
+                    feedback(Self.connectFailureText)
+                }
             }
         }
     }
@@ -373,8 +426,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// F3：当前是否有运行中任务（菜单「中断任务」可用态——无任务置灰防假成功）。
+    /// F3：当前是否有运行中任务（语音/状态路径用）。
     func isTaskRunning() -> Bool { bridge?.activeTask != nil }
+
+    /// GUI 菜单「中断任务」同时覆盖主 Agent 与任务 Agent；任一侧忙时可用。
+    func isAnyAgentBusy() -> Bool { bridge?.isAnyAgentBusy() ?? false }
 
     private func wireBridgeCallbacks(_ bridge: HermesBridge) {
         // 崩溃修复（DeskPet-2026-08-12-135431.ips）：HermesBridge 的 Task 内部
@@ -390,34 +446,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // spoken 过短（<30 字）时兜底念 formal 正文（Markdown 清洗后））
         // pm3 P1-2：回填/状态写回触发的报告降 low（不打断当前对话/不清队列——high 仅用户主动对话）
         bridge.onMainMessage = { [weak self] msg in
-            LogManager.shared.info("主回复 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isUserTurn=\(msg.isUserTurn)")
+            LogManager.shared.info("主回复 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isUserTurn=\(msg.isUserTurn) feedback=\(msg.feedback.map { "有(\($0.count)字)" } ?? "无")")
             DispatchQueue.main.async {
                 guard let self else { return }
+                // companion：任务归档 <ok/>+<feedback> 情绪收尾（主 Agent 以 persona 口吻生成）——
+                // 先于空回复保护处理：气泡 + 短播报（low 排队、不打断当前播报）。feedback 只收尾、
+                // 不转述任务结果（结果全文仍由任务 Agent 直报，此处不重复）；无 feedback 时与现状一致。
+                if let fb = msg.feedback, !fb.isEmpty {
+                    self.showBubble(fb)
+                    SpeechOutputManager.shared.speak(fb, priority: .low)
+                    return
+                }
                 // U1：空回复保护——formal/spoken 均空（trim 后）：不弹空气泡不播报（仅日志）；
                 // 用户命令路径给可见 fallback（不静默丢失）
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanedFormal = msg.formal.trimmingCharacters(in: .whitespacesAndNewlines)
                 if cleanedSpoken.isEmpty && cleanedFormal.isEmpty {
-                    LogManager.shared.warn("主回复为空（formal/spoken 均空，isUserTurn=\(msg.isUserTurn), protocolOnly=\(msg.protocolOnly)）——跳过气泡与播报")
-                    if msg.protocolOnly {
-                        self.showBubble("⏳ 正在处理，请稍等…", maxDuration: Self.transitionBubbleTimeout)
-                    } else if msg.isUserTurn {
-                        self.showBubble("刚才那句我没接住，再说一遍？")
+                    if !msg.isUserTurn {
+                        // v3：归档 <ok/> 纯确认（正常路径，非异常）——info 级日志，不弹「没接住」
+                        LogManager.shared.info("归档 ack 已静默（主 Agent 确认存档）")
+                    } else {
+                        LogManager.shared.warn("主回复为空（formal/spoken 均空，protocolOnly=\(msg.protocolOnly)）——跳过气泡与播报")
+                        if msg.protocolOnly {
+                            self.showBubble("⏳ 正在处理，请稍等…", maxDuration: Self.transitionBubbleTimeout)
+                        } else {
+                            self.showBubble("刚才那句我没接住，再说一遍？")
+                        }
                     }
                     return
                 }
+                if !msg.isUserTurn {
+                    // v3：归档轮违反协议多说的话（如「好的已存」）——仅日志，不弹气泡不播报：
+                    // 任务结果详情气泡刚显示，被 ack 废话覆盖是净损失；播报已由任务 spoken 直报完成。
+                    LogManager.shared.info("归档轮多余回复（已忽略，不覆盖任务详情气泡）：\(String((cleanedFormal.isEmpty ? cleanedSpoken : cleanedFormal).prefix(60)))")
+                    return
+                }
                 self.showBubble(cleanedFormal.isEmpty ? msg.spoken : msg.formal)
-                // R-2026-08-13：只念 spoken（口语轨）——formal 仅气泡展示，绝不生成语音；
-                // spoken 空则不播报（气泡仍显示 formal）。此前 spoken<30 字兜底念 formal 已移除。
+                // R-2026-08-13：只念 spoken（口语轨）——formal 仅气泡展示，绝不生成语音。
                 let finalSpeak = cleanedSpoken.count > 200
                     ? String(cleanedSpoken.prefix(200)) + "，更多内容请看气泡"
                     : cleanedSpoken
-                if msg.isUserTurn {
-                    SpeechOutputManager.shared.speak(finalSpeak)
-                } else {
-                    // 播报抢占：非用户轮（回填/状态报告）带任务 tag——新任务派发后旧任务报告按 tag 舍弃
-                    SpeechOutputManager.shared.speak(finalSpeak, priority: .low, tag: msg.taskTag)
-                }
+                SpeechOutputManager.shared.speak(finalSpeak)
             }
         }
         // P1：聊天入队提示（busy 不静默）
@@ -444,72 +513,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.showBubble("⚠️ \(message)")
             }
         }
-        bridge.onTaskStarted = { [weak self] title, tag in
+        bridge.onTaskStarted = { [weak self] title, _ in
             LogManager.shared.info("任务开始：\(title)")
-            // E-W3：任务接受要有声反馈（语音 + 气泡）——播报低优入队（不卡断当前对话）。
-            // P2-2：播报不读 title（英文逐字母卡带/句中截断）——title 只进气泡
-            // P4-1：任务播报带实例 tag（新任务派发抢占——旧任务播报全部丢弃）
-            let spoken = "好嘞，开始执行！"
+            // 用户反馈（活人感）：任务开始不再读「好嘞，开始执行！」——派发确认语音太打扰。
+            // 只保留气泡「📋 标题」视觉确认；任务过程/完成/失败播报照旧。（P2-2：title 只进气泡）
             DispatchQueue.main.async {
                 self?.showBubble("📋 \(title)")
-                SpeechOutputManager.shared.speak(spoken, priority: .low, tag: tag)
             }
         }
-        bridge.onTaskQueued = { [weak self] title, position in
-            LogManager.shared.info("任务排队：第 \(position) 个：\(title)")
+        bridge.onTaskQueued = { [weak self] title, position, starting in
+            LogManager.shared.info("任务排队：第 \(position) 个：\(title)（前置\(HermesBridge.queuedBehindText(starting: starting))）")
             DispatchQueue.main.async {
-                self?.showBubble("⏳ 当前任务还在执行，已排队第 \(position) 项：\(title)", persistent: true)
+                // fix-ghost-task-queue：前置是启动中任务时如实说明「正在启动」，不误报「正在执行」
+                self?.showBubble("⏳ \(HermesBridge.queuedBehindText(starting: starting))，已排队第 \(position) 项：\(title)", persistent: true)
+            }
+        }
+        // fix-live-ux-details：任务启动等待反馈（提交后 8s 无首个 delta/tool 活动才显示一次；
+        // 首个活动/收口回调 nil 时仅收起仍是等待文案的气泡——身份守卫，不覆盖最终结果/新气泡）
+        bridge.onTaskStartPending = { [weak self] title in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let title {
+                    LogManager.shared.info("任务等待反馈：\(title)（8s 无首个活动，可能仍在完成中断收尾）")
+                    self.showBubble("⏳ 任务已提交：\(title)\n模型可能仍在完成上一任务的中断收尾，开始输出后自动消失",
+                                    persistent: true, maxDuration: Self.taskStartPendingBubbleTimeout)
+                } else {
+                    // 仅收起仍是等待文案的气泡（不覆盖任务最终结果/失败/⏹ 反馈/新任务气泡）
+                    if self.bubblePanel?.currentText?.hasPrefix("⏳ 任务已提交") == true {
+                        self.bubblePanel?.hideBubble()
+                    }
+                }
             }
         }
         bridge.onTaskMessage = { [weak self] msg in
             LogManager.shared.info("任务消息 spoken=\(msg.spoken.prefix(60)) formal=\(msg.formal.count)字 isFinal=\(msg.isFinal)")
             DispatchQueue.main.async {
                 if msg.isFinal {
-                    // pm3 P1-1：详情气泡 persistent——不被「✅ 完成」覆盖（轻提示仅播报不弹气泡）
+                    // 详情气泡 persistent——结果全文可展开阅读
                     self?.showBubble(msg.formal.isEmpty ? msg.spoken : msg.formal, persistent: true)
-                    // 标记协议（主 Agent 掌控任务 Agent）：详细结果由主 Agent 口语化报告——
-                    // isFinal 只播轻提示防双播（完整总结已在气泡；回填后主 Agent 会完整转述）
-                    SpeechOutputManager.shared.speak("任务完成", priority: .low, tag: msg.speechTag)
+                    // v3 直报：播任务 spoken（任务 Agent 亲自浓缩的 formal 精简版——零二次失真、
+                    // 零回填等待）；spoken 为空兜底 formal（清洗后）；超 150 字（约 35s）截断护栏。
+                    let cleaned = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let base: String
+                    if cleaned.count >= 30 || msg.formal.isEmpty {
+                        base = cleaned
+                    } else {
+                        base = SpeechOutputManager.cleanForSpeech(msg.formal)
+                    }
+                    let speakText = base.count > 150
+                        ? String(base.prefix(150)) + "，更多内容请看气泡"
+                        : base
+                    if !speakText.isEmpty {
+                        SpeechOutputManager.shared.speak(speakText, priority: .low, tag: msg.speechTag)
+                    }
                     return
                 }
-                // P1-4：任务消息播报低优入队；用户决策「口语完整版」——念 spoken 完整转述，
-                // spoken 过短（<30 字）兜底 formal 正文（清洗后）
-                // P4-1：带任务实例 tag（新任务派发后旧任务完成播报被跳过）
+                // 进度消息（2026-08-16 播报策略「最新优先」）：只出气泡不出声——
+                // 过程性内容时效短、价值低，出声会在任务期间不断插进对话造成话题穿插；
+                // 文字仍可见（自动消失），最终结果仍由 isFinal 分支语音播报。
                 let cleanedSpoken = msg.spoken.trimmingCharacters(in: .whitespacesAndNewlines)
-                let speakText: String
+                let progressText: String
                 if cleanedSpoken.count >= 30 || msg.formal.isEmpty {
-                    speakText = cleanedSpoken
+                    progressText = cleanedSpoken
                 } else {
-                    speakText = SpeechOutputManager.cleanForSpeech(msg.formal)
+                    progressText = SpeechOutputManager.cleanForSpeech(msg.formal)
                 }
-                SpeechOutputManager.shared.speak(speakText, priority: .low, tag: msg.speechTag)
+                if !progressText.isEmpty {
+                    self?.showBubble("⏳ \(progressText)")
+                }
             }
         }
         bridge.onTaskComplete = { [weak self] title in
             LogManager.shared.info("任务完成：\(title)")
-            // pm3 P1-1：轻提示仅播报（isFinal 已播）——不再弹「✅ title 完成」气泡覆盖详情
-            // （详情气泡 persistent 保留；「任务完成」轻提示播报在 isFinal 已入队）
             DispatchQueue.main.async {
                 // R3-1：任务完成 → 执行延迟的 serve 重启（若任务运行中曾触发）
                 ServeManager.shared.flushPendingRestart()
-            }
-        }
-        // pm3 P1-3/P1-4：回填过渡气泡 + 写回失败提示（⚠️ 前缀同时播报）
-        // U2：过渡气泡（⏳）不覆盖任务结果详情——详情气泡长留，主 Agent 口语化报告到达时自然替换
-        bridge.onBackfillNotice = { [weak self] message in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if message.hasPrefix("⏳") {
-                    if let current = self.bubblePanel?.currentText, !current.isEmpty,
-                       !current.hasPrefix("⏳"), !current.hasPrefix("📝"), !current.hasPrefix("📋") {
-                        LogManager.shared.info("当前气泡为内容详情（\(current.prefix(20))…）——跳过整理占位气泡")
-                        return
-                    }
-                }
-                self.showBubble(message, persistent: true, maxDuration: message.hasPrefix("⏳") ? Self.transitionBubbleTimeout : nil)
-                if message.hasPrefix("⚠️") {
-                    SpeechOutputManager.shared.speak(message)
-                }
             }
         }
         // P0-01：任务失败 → ❌ 气泡（带原因摘要）+ 播报 + 回 idle（不卡 failed 态）
@@ -773,6 +851,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         initializeBridge(isUserRetry: true)
     }
 
+    /// P1：选择本机 Hermes 可执行文件。只保存路径，不读取或记录 token/凭证。
+    @objc func chooseHermesExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Hermes 可执行文件"
+        panel.prompt = "选择"
+        panel.message = "请选择本机可执行的 hermes 文件；不要选择 Hermes 项目目录或配置文件。"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            guard FileManager.default.isExecutableFile(atPath: url.path) else {
+                self.feedback("⚠️ 选择的文件不可执行：\(url.path)")
+                return
+            }
+            UserDefaults.standard.set(url.standardizedFileURL.path, forKey: HermesDiscovery.configuredPathKey)
+            LogManager.shared.info("用户选择 Hermes 可执行文件：\(url.standardizedFileURL.path)")
+            ServeManager.shared.stop()
+            self.feedback("✅ 已记住 Hermes 路径，正在重新连接…")
+            // 给 TERM 一个短暂的端口释放窗口，避免旧 serve 抢在新路径前被复用。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.initializeBridge(isUserRetry: true)
+            }
+        }
+    }
+
     // MARK: - 设置（todo #15/#16）
 
     /// 唤醒灵敏度三档（sherpa KWS 阈值）。
@@ -838,12 +942,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
             return
         }
-        // 热生效：更新检测器关键词；监听中重启检测器使新词生效（重新武装）
+        // v7（wake-reload-fix 根因对照）：旧实现仅 listening 时 stop+start——arming 时
+        // start() guard 挡住不生效、disabled（检测器失效）不恢复监听、detected（听写中）
+        // 新词要等 resume 但 resume 不重启子进程（旧词残留）。修复：决策提取为纯函数
+        // wakeReloadAction——listening/arming/disabled 立即 stop+start（stop 幂等，
+        // disabled 也能从失效恢复）；detected 标记延后，resume 后防抖回调内重启（不打断听写）。
         if let wake = wakeController {
             wake.wakePhrase = phrase
-            if wake.currentState == .listening {
-                wake.stop()
+            switch WakeController.wakeReloadAction(for: wake.currentState) {
+            case .reloadNow:
+                wake.stop()   // 幂等：disabled 也安全（从失效恢复监听）
                 wake.start()
+                LogManager.shared.info("唤醒词已更新并重启检测器：\(phrase)")
+            case .reloadAfterResume:
+                wake.pendingReload = true
+                LogManager.shared.info("唤醒词已更新（听写中，resume 后生效）：\(phrase)")
             }
         }
         LogManager.shared.info("唤醒词已更新：\(phrase)")
@@ -884,9 +997,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         feedback("✅ 退出词已更新：\(phrases.joined(separator: " / "))")
     }
 
-    /// 切换人设：写 petID（personas 内容在 config/personas.json，手动编辑）。
-    /// ① 人设热切换：人设提示词每条用户消息前缀注入（HermesBridge.personaPrefixed 按 petID
-    /// 实时读取）——保存后下一条对话立即生效，无需新开对话。
+    /// 切换人设（v3：人设已进 seed——切人设时向当前主会话提交一次变更消息，
+    /// 主 Agent 按新人设打招呼确认（正常用户轮：显示+播报）；新开对话则按新 petID 重建 seed）。
     private func setPersona(_ petID: String) {
         var cfg = DeskPetConfig.load()
         guard cfg.petID != petID else { return }
@@ -897,7 +1009,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let name = DeskPetConfig.personaDisplayName(for: petID)
         LogManager.shared.info("人设已切换：\(petID)")
-        feedback("✅ 已切换人设：\(name)——下一条对话即生效")
+        feedback("✅ 已切换人设：\(name)")
+        Task { [weak self] in
+            await self?.bridge?.applyPersonaChange(petID)
+        }
     }
 
     /// 打开 personas.json（默认编辑器；history/config/ 持久化副本——打包副本不覆盖用户编辑）。
@@ -1037,6 +1152,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - MiMo 语音（2026-08-16）
+
+    /// ④ MiMo 语音设置（结构对齐豆包设置弹窗）：API Key（密文）+ 预置音色下拉 + 测试发声。
+    /// 设计/克隆音色为高级项——不入弹窗（配置文件 mimoTTSMode/mimoVoiceDesignPrompt/
+    /// mimoVoiceClonePath，见 DeskPet/MiMo音色指南.md）；informativeText 给出文件路径指引。
+    private func mimoSettings() {
+        let cfg = DeskPetConfig.load()
+        let a = alert("MiMo 语音设置",
+                      "API Key 在 platform.xiaomimimo.com 注册创建（控制台 → API Key 管理）；语音合成目前限时免费，识别与合成共用同一 Key。\n\n高级玩法（设计音色/克隆音色/朗读风格）：编辑配置文件中的 mimoTTSMode / mimoVoiceDesignPrompt / mimoVoiceClonePath 等键，详见 DeskPet/MiMo音色指南.md。",
+                      buttons: ["保存", "取消", "测试发声"])
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 118))
+        let keyLabel = NSTextField(labelWithString: "MiMo API Key")
+        keyLabel.frame = NSRect(x: 0, y: 104, width: 300, height: 14)
+        keyLabel.font = NSFont.systemFont(ofSize: 10)
+        keyLabel.textColor = NSColor.secondaryLabelColor
+        container.addSubview(keyLabel)
+        let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 74, width: 300, height: 24))
+        keyField.stringValue = cfg.mimoApiKey
+        keyField.placeholderString = "粘贴 MiMo API Key"
+        keyField.setAccessibilityLabel("MiMo API Key")
+        container.addSubview(keyField)
+        let voiceLabel = NSTextField(labelWithString: "预置音色（preset 模式生效）")
+        voiceLabel.frame = NSRect(x: 0, y: 52, width: 300, height: 14)
+        voiceLabel.font = NSFont.systemFont(ofSize: 10)
+        voiceLabel.textColor = NSColor.secondaryLabelColor
+        container.addSubview(voiceLabel)
+        let voicePopup = NSPopUpButton(frame: NSRect(x: 0, y: 20, width: 300, height: 26), pullsDown: false)
+        for v in MiMoSpeechProvider.presetVoiceCatalog {
+            voicePopup.addItem(withTitle: v.name)
+        }
+        // 当前音色不在目录（自定义/留空）→ 追加显示项（不丢配置）
+        if let match = MiMoSpeechProvider.presetVoiceCatalog.first(where: { $0.id == cfg.mimoVoice }) {
+            voicePopup.selectItem(withTitle: match.name)
+        } else {
+            voicePopup.addItem(withTitle: "当前：\(cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice)")
+            voicePopup.selectItem(withTitle: "当前：\(cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice)")
+        }
+        container.addSubview(voicePopup)
+        a.accessoryView = container
+        a.window.initialFirstResponder = keyField
+        let resp = a.runModal()
+        func selectedVoiceID() -> String {
+            let idx = voicePopup.indexOfSelectedItem
+            guard idx >= 0, idx < MiMoSpeechProvider.presetVoiceCatalog.count else { return cfg.mimoVoice }
+            return MiMoSpeechProvider.presetVoiceCatalog[idx].id
+        }
+        func applySave(key: String, voice: String) -> Bool {
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoApiKey = key
+            newCfg.mimoVoice = voice
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return false
+            }
+            SpeechOutputManager.shared.rebuild()
+            feedback("✅ MiMo 语音设置已保存")
+            return true
+        }
+        if resp == .alertFirstButtonReturn {   // 保存
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                feedback("⚠️ API Key 不能为空")
+                return
+            }
+            _ = applySave(key: key, voice: selectedVoiceID())
+        } else if resp == .alertThirdButtonReturn {   // 测试发声（先临时保存再测——链上立即生效）
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                feedback("⚠️ 请先填写 API Key 再测试")
+                return
+            }
+            if applySave(key: key, voice: selectedVoiceID()) {
+                testMiMoVoice()
+            }
+        }
+    }
+
+    /// ④ MiMo 测试发声：真实合成往返，成功播报 + 气泡确认；失败提示原因（401/429 直译）。
+    private func testMiMoVoice() {
+        let provider = MiMoSpeechProvider()
+        Task {
+            let result = await provider.testSpeak()
+            await MainActor.run {
+                if result.ok {
+                    LogManager.shared.info("MiMo 测试发声成功：\(result.detail)")
+                    let currentName = SpeechOutputManager.shared.channelList().first(where: { $0.isCurrent })?.name ?? "系统语音"
+                    feedback("✅ MiMo 发声成功！当前语音：\(currentName)——设置 ▸ 语音 ▸ 播报方式选「MiMo 语音」即可用它说话")
+                } else {
+                    LogManager.shared.warn("MiMo 测试发声失败：\(result.detail)")
+                    feedback("⚠️ MiMo 发声失败：\(String(result.detail.prefix(80)))")
+                }
+            }
+        }
+    }
+
     // MARK: - Edge 语音（默认读轨）
 
     /// Edge 中文音色清单（2026-08-12 微软端点实测 9 个可用：晓晓/晓伊/云希/云扬/晓萱/云健/
@@ -1126,6 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let channels = SpeechOutputManager.shared.channelList()
         let edgeOK = channels.first(where: { $0.id == "edge" })?.available ?? false
         let duoyunOK = channels.first(where: { $0.id == "duoyun" })?.available ?? false
+        let mimoOK = channels.first(where: { $0.id == "mimo" })?.available ?? false
         let cfg = DeskPetConfig.load()
         return manifest.services.map { s in
             let enabled: Bool
@@ -1134,11 +1345,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "system": enabled = true
             case "edge-tts": enabled = edgeOK
             case "duoyun": enabled = duoyunOK
+            case "mimo":
+                // MiMo（2026-08-16）：Key+模式可用性由 channelList 判定（design 缺描述/clone 缺样本同样不可用）
+                enabled = mimoOK
+                note = (note.map { "\($0) · " } ?? "") + (mimoOK ? "模式：\(cfg.mimoTTSMode)" : "未配置 Key")
             case "cloud-asr":
-                // 豆包识别来源联动：当前来源显示在副行（asrProvider 实际值）
-                let active = cfg.asrProvider == "duoyun"
-                enabled = active || !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                note = (note.map { "\($0) · " } ?? "") + "当前识别：\(active ? "豆包" : "本地")"
+                // 云端识别来源联动：当前来源显示在副行（asrProvider 实际值——豆包流式/MiMo 整段）
+                let providerName: String
+                switch cfg.asrProvider {
+                case "duoyun": providerName = "豆包"
+                case "mimo": providerName = "MiMo"
+                default: providerName = "本地"
+                }
+                let active = cfg.asrProvider == "duoyun" || cfg.asrProvider == "mimo"
+                enabled = active
+                    || !cfg.asrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !cfg.mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                note = (note.map { "\($0) · " } ?? "") + "当前识别：\(providerName)"
             default: enabled = s.enabled
             }
             return VoiceServicesPanelController.Row(
@@ -1178,13 +1401,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "edgeVoice": cfg.edgeVoice = ""               // 合成 fallback 默认音色，安全
             case "duoyunApiKey": cfg.duoyunApiKey = ""         // 清空 → isAvailable false → 链跳过
             case "duoyunVoiceType": cfg.duoyunVoiceType = ""   // fallback 默认音色，安全
+            case "mimoApiKey": cfg.mimoApiKey = ""             // 2026-08-16：MiMo Key 清空 → 链/识别跳过
+            case "mimoVoice": cfg.mimoVoice = defaults.mimoVoice
+            case "mimoTTSMode": cfg.mimoTTSMode = defaults.mimoTTSMode
+            case "mimoVoiceDesignPrompt": cfg.mimoVoiceDesignPrompt = ""
+            case "mimoVoiceClonePath": cfg.mimoVoiceClonePath = ""
             case "asrProvider": cfg.asrProvider = defaults.asrProvider
             case "asrApiKey": cfg.asrApiKey = ""
             default: break
             }
         }
         // 播报链移除该服务（服务 id → 链 id 映射）
-        let chainIDs = ["edge-tts": "edge", "duoyun": "duoyun", "system": "system"]
+        let chainIDs = ["edge-tts": "edge", "duoyun": "duoyun", "system": "system", "mimo": "mimo"]
         if let chainID = chainIDs[id] {
             cfg.speechChain.removeAll { $0 == chainID }
         }
@@ -1215,6 +1443,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func duoyunVoiceMenuList() -> [(id: String, name: String, isCurrent: Bool)] {
         let current = DeskPetConfig.load().duoyunVoiceType
         return Self.duoyunVoiceCatalog.map { ($0.id, $0.name, $0.id == current) }
+    }
+
+    // MARK: MiMo 声线（2026-08-16：与豆包声线同款子菜单——preset 模式生效）
+
+    func mimoKeyConfigured() -> Bool {
+        !DeskPetConfig.load().mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func mimoVoiceMenuList() -> [(id: String, name: String, isCurrent: Bool)] {
+        let cfg = DeskPetConfig.load()
+        let current = cfg.mimoVoice.isEmpty ? "茉莉" : cfg.mimoVoice
+        return MiMoSpeechProvider.presetVoiceCatalog.map { ($0.id, $0.name, $0.id == current) }
+    }
+
+    @objc func menuSelectMiMoVoice(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectMiMoVoice(id)
+    }
+
+    /// 切换 MiMo 预置音色：保存 mimoVoice + 重建链 + 气泡确认（preset 模式生效；
+    /// design/clone 模式音色来自配置文件——提示里说明，不误以为坏了）
+    private func selectMiMoVoice(_ id: String) {
+        var cfg = DeskPetConfig.load()
+        guard cfg.mimoVoice != id else { return }
+        cfg.mimoVoice = id
+        guard cfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()
+        let name = MiMoSpeechProvider.presetVoiceCatalog.first { $0.id == id }?.name ?? id
+        let mode = cfg.mimoTTSMode
+        let suffix = (mode == "design" || mode == "clone")
+            ? "（注意：当前是\(mode == "design" ? "设计" : "克隆")音色模式，预置音色不生效——切换回 preset 见 MiMo音色指南.md）"
+            : "（当前语音：\(Self.channelName(SpeechOutputManager.shared.channelList().first(where: \.isCurrent)?.id ?? "system"))——想听 MiMo：设置 ▸ 语音 ▸ 播报方式选 MiMo 语音）"
+        feedback("✅ 已切换 MiMo 声线：\(name)\(suffix)")
+    }
+
+    // MARK: MiMo 声线模式（2026-08-16：preset/design/clone 三模式热切换）
+
+    /// 当前 MiMo 声线模式（菜单顶部单选勾选用；未知值按 preset）。
+    func mimoModeCurrent() -> String {
+        let mode = DeskPetConfig.load().mimoTTSMode
+        return (mode == "design" || mode == "clone") ? mode : "preset"
+    }
+
+    /// 当前设计音色描述（design 分支 tooltip 用；空 = 未填写）。
+    func mimoDesignPromptText() -> String {
+        DeskPetConfig.load().mimoVoiceDesignPrompt
+    }
+
+    /// 当前克隆样本路径（clone 分支 tooltip 用；空 = 未配置）。
+    func mimoClonePathText() -> String {
+        DeskPetConfig.load().mimoVoiceClonePath
+    }
+
+    /// 克隆样本路径可读性：非空 + 存在 + 常规文件 + 可读。空/目录/无权限均 false。
+    private func cloneSampleReadable(_ path: String) -> Bool {
+        let p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !p.isEmpty else { return false }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue else { return false }
+        return FileManager.default.isReadableFile(atPath: p)
+    }
+
+    /// 切换 MiMo 声线模式（菜单栏入口）：校验 id → 与当前不同 → 改 mimoTTSMode →
+    /// save() → rebuild()（内部 refreshConfig 清缓存）→ 气泡反馈（立即生效）；
+    /// design 描述为空 / clone 样本不可读时附加提示。
+    @objc func menuSelectMiMoMode(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectMiMoMode(id)
+    }
+
+    private func selectMiMoMode(_ id: String) {
+        guard id == "preset" || id == "design" || id == "clone" else { return }
+        var cfg = DeskPetConfig.load()
+        guard cfg.mimoTTSMode != id else { return }
+        cfg.mimoTTSMode = id
+        guard cfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()   // 热切换立即生效（内部 refreshConfig 清缓存）
+        let names: [String: String] = ["preset": "预置音色", "design": "设计音色", "clone": "克隆音色"]
+        let name = names[id] ?? id
+        LogManager.shared.info("MiMo 声线模式已切换：\(name)（\(id)）")
+        let cfgAfter = DeskPetConfig.load()
+        var note = ""
+        if id == "design", cfgAfter.mimoVoiceDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            note = "；⚠️ 设计音色描述未填写——点「设计音色描述…」填写后才能发声"
+        } else if id == "clone", !cloneSampleReadable(cfgAfter.mimoVoiceClonePath) {
+            note = "；⚠️ 样本未就绪（文件夹里还没有 mp3）——点「克隆样本文件夹…」打开文件夹放入 10-20s 干净人声"
+        }
+        feedback("✅ 已切换 MiMo 声线模式：\(name)（立即生效）\(note)")
+    }
+
+    /// 设计音色描述编辑（design 模式入口）：多行输入预填当前描述 → 保存写
+    /// mimoVoiceDesignPrompt + save + rebuild + 反馈；「测试发声」= 临时保存成功后 testMiMoVoice()。
+    @objc func menuEditMiMoDesignPrompt() {
+        let current = DeskPetConfig.load().mimoVoiceDesignPrompt
+        let currentText = current.isEmpty ? "未填写" : current
+        let a = alert("设计音色描述",
+                      "用文字描述你想要的音色——design 模式由此生成专属音色，如：\n「沉稳的男声，语速适中，像纪录片旁白」\n\n（当前：\(currentText)）",
+                      buttons: ["保存", "取消", "测试发声"])
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 84))
+        field.stringValue = current
+        field.placeholderString = "例如：沉稳的男声，语速适中，像纪录片旁白"
+        field.setAccessibilityLabel("设计音色描述")
+        field.cell?.wraps = true
+        field.cell?.isScrollable = false
+        field.usesSingleLineMode = false
+        field.maximumNumberOfLines = 0
+        a.accessoryView = field
+        a.window.initialFirstResponder = field
+        let resp = a.runModal()
+        guard resp != .alertSecondButtonReturn else { return }   // 取消
+        let prompt = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch resp {
+        case .alertFirstButtonReturn:   // 保存
+            guard !prompt.isEmpty else {
+                feedback("⚠️ 设计音色描述不能为空（design 模式需要描述才能发声）")
+                return
+            }
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoVoiceDesignPrompt = prompt
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return
+            }
+            SpeechOutputManager.shared.rebuild()
+            LogManager.shared.info("设计音色描述已保存：\(String(prompt.prefix(40)))…")
+            feedback("✅ 设计音色描述已保存（design 模式现在可以发声了）")
+        default:   // 测试发声：临时保存成功后测试
+            guard !prompt.isEmpty else {
+                feedback("⚠️ 请先填写设计音色描述再测试")
+                return
+            }
+            var newCfg = DeskPetConfig.load()
+            newCfg.mimoVoiceDesignPrompt = prompt
+            guard newCfg.save() else {
+                feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+                return
+            }
+            SpeechOutputManager.shared.rebuild()
+            testMiMoVoice()
+        }
+    }
+
+    /// 克隆样本文件夹（固定位置：Application Support/DeskPet/mimo-samples/——
+    /// App 自己的数据目录，与源码/安装版路径无关，用户可直观在 Finder 找到）。
+    private func mimoSamplesDir() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("DeskPet/mimo-samples", isDirectory: true)
+    }
+
+    /// 克隆样本编辑（clone 模式入口）：打开固定样本文件夹，用户把 mp3 复制进去即可。
+    /// 目录内已有 mp3 → 自动采用最新一个并保存生效；无 → 提示放好后再次点击。
+    @objc func menuEditMiMoClonePath() {
+        let dir = mimoSamplesDir()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)   // Finder 打开样本文件夹
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let mp3s = files
+            .filter { $0.pathExtension.lowercased() == "mp3" }
+            .sorted { lhs, rhs in
+                let lt = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rt = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lt > rt
+            }
+        guard let sample = mp3s.first else {
+            LogManager.shared.info("克隆样本文件夹已打开（空）：\(dir.path)")
+            feedback("📂 已打开样本文件夹：\(dir.path)\n请把 10-20s 干净人声 mp3 复制进去，放好后再次点击「克隆样本文件夹…」")
+            return
+        }
+        var newCfg = DeskPetConfig.load()
+        newCfg.mimoVoiceClonePath = sample.path
+        guard newCfg.save() else {
+            feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        SpeechOutputManager.shared.rebuild()
+        LogManager.shared.info("克隆样本已采用：\(sample.path)（\(sample.lastPathComponent)）")
+        feedback("✅ 已采用样本：\(sample.lastPathComponent)（clone 模式现在可以发声了）")
     }
 
     /// 切换豆包音色：保存 duoyunVoiceType + 重建链 + 气泡确认。
@@ -1361,6 +1774,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setPersona(id)
     }
     @objc func menuEditPersonas() { editPersonasFile() }
+
+    // MARK: - 人设 GUI 管理（task-panel：新增/编辑面板 + 删除确认 + 菜单刷新）
+
+    @objc func menuAddPersona() {
+        Task { @MainActor in self.showPersonaEditor(mode: .add) }
+    }
+    @objc func menuEditPersona() {
+        Task { @MainActor in self.showPersonaEditor(mode: .edit) }
+    }
+    @objc func menuDeletePersona(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Task { @MainActor in self.deletePersonaWithConfirm(id: id) }
+    }
+
+    private var personaEditorPanel: PersonaEditorPanelController?
+
+    /// 打开人设编辑面板（新增=空表单；编辑=预填当前人设），锚定桌宠旁；
+    /// 面板内保存/删除都刷新两侧菜单（右键菜单每次弹出重建，菜单栏强制重建）。
+    @MainActor
+    private func showPersonaEditor(mode: PersonaEditorPanelController.Mode) {
+        guard let petPanel else { return }
+        let panel = personaEditorPanel ?? PersonaEditorPanelController()
+        personaEditorPanel = panel
+        panel.onRefreshMenus = { [weak self] in self?.refreshPersonaMenus() }
+        panel.onFeedback = { [weak self] text in self?.feedback(text) }
+        panel.onCurrentPersonaDeleted = { [weak self] in
+            // petID 已由写 API 回退默认；让当前会话按默认人设继续（同 setPersona 的应用语义）
+            Task { [weak self] in await self?.bridge?.applyPersonaChange("monthly-salary-cat") }
+        }
+        panel.show(mode: mode, anchoredTo: petPanel.frame, screen: petPanel.screen)
+    }
+
+    /// 删除人设（菜单入口）：确认弹窗（破坏性按钮视觉）→ 写 API（删除当前 → petID 回退默认）→ 刷新菜单。
+    @MainActor
+    private func deletePersonaWithConfirm(id: String) {
+        let name = DeskPetConfig.personaDisplayName(for: id)
+        let isCurrent = DeskPetConfig.load().petID == id
+        let confirm = alert("删除人设「\(name)」？",
+                            "将从 personas.json 永久移除，不可恢复。"
+                                + (isCurrent ? "\n当前人设删除后，形象将回退默认「月薪猫」。\n" : ""),
+                            buttons: ["删除", "取消"])
+        confirm.buttons.first?.hasDestructiveAction = true   // 破坏性可视化（macOS 11+）
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        guard DeskPetConfig.removePersona(id) else {
+            feedback("⚠️ 删除失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        if isCurrent {
+            Task { [weak self] in await self?.bridge?.applyPersonaChange("monthly-salary-cat") }
+        }
+        refreshPersonaMenus()
+        LogManager.shared.info("人设已删除（GUI）：\(id)")
+        feedback("🗑 已删除人设：\(name)")
+    }
+
+    /// 保存/删除人设后刷新菜单栏菜单（右键菜单每次弹出重建，无需处理）。
+    @MainActor
+    private func refreshPersonaMenus() {
+        statusItemController?.refreshMenu()
+    }
+
     @objc func menuEditVoicePrompts() { editVoicePromptsFile() }
     @objc func menuSetExitPhrases() { setExitPhrases() }
     @objc func menuSelectChannel(_ sender: NSMenuItem) {
@@ -1368,12 +1842,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectChannel(id)
     }
     @objc func menuDuoyunSettings() { duoyunSettings() }
+    @objc func menuMiMoSettings() { mimoSettings() }
 
     private static func channelName(_ id: String) -> String {
         switch id {
         case "edge": return "Edge 语音"
         case "system": return "系统语音"
         case "duoyun": return "豆包语音"
+        case "mimo": return "MiMo 语音"
         case "thirdparty": return "第三方"
         case "hermes": return "Hermes 内置"
         default: return id
@@ -1429,13 +1905,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 触发词路由：本地指令表 → 未命中走主会话闲聊（M1-4）。
-    /// fromVoice=true：语音路径确认播报（U6 去重——任务派发只播「好嘞，开始执行！」，
+    /// fromVoice=true：语音路径确认播报（U6 去重——任务派发不播「收到」与开始确认语，
     /// 其余路径播「收到」；T-2 语义保留：不清低优队列、播报中不插播）
     private func routeUserInput(_ text: String, fromVoice: Bool = false) {
         // P1：持续聆听退出词拦截（聆听模式下、CommandRouter 之前——不进 chat 路径）
         if listeningCoordinator.handleText(text) { return }
         let result = router.route(text)
-        // U6：语音确认播报去重——任务派发路径跳过「收到」（onTaskStarted 播「好嘞，开始执行！」）
+        // U6：语音确认播报去重——任务派发路径跳过「收到」（任务开始也不再额外语音确认——用户反馈太打扰）
         if fromVoice, !SpeechOutputManager.shared.isSpeaking {
             if case .dispatch = result {} else {
                 SpeechOutputManager.shared.speak("收到", clearsQueue: false)
@@ -1470,22 +1946,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 showBubble(Self.connectFailureText)   // U5：真实入口路径文案
                 return
             }
+            // v4 安全加速：派发提交前立即显示「已接收 + 标题」——冷启动建任务会话（网络往返）
+            // 期间也有可视反馈；onTaskStarted 到达时替换为同内容气泡（幂等），失败路径由 ⚠️/❌ 替换。
+            // （U9 标题保留完整动词短语原文；任务开始无语音确认——用户反馈太打扰）
+            showBubble("📋 \(title)", persistent: true)
             Task {
-                do {
-                    try await bridge.dispatchTask(task, title: title)   // U9：标题保留完整动词短语（原文）
-                    // P2-④：派发后等待气泡（任务开始事件自动替换；语音「📝 收到」不重复弹）
-                    // U4：任务标题（📋）已显示则不弹占位气泡——不被瞬间覆盖
-                    await MainActor.run {
-                        let current = self.bubblePanel?.currentText ?? ""
-                        if !current.hasPrefix("📝"), !current.hasPrefix("📋") {
-                            self.showBubble("⏳ 正在派出任务…", persistent: true, maxDuration: Self.transitionBubbleTimeout)   // 过渡型：4s 超时
-                        }
-                    }
-                } catch {
-                    // U1：任务派发失败可见化（不再 try? 静默吞——用户命令不石沉大海）
-                    LogManager.shared.warn("任务派发失败：\(error.localizedDescription)")
-                    self.feedback("⚠️ 任务派发失败：\(error.localizedDescription)")
-                }
+                // v9（fix-audio-task-state）：派发不再抛错——失败已由 bridge 统一 onTaskFailed 可见收口
+                // （主会话未就绪/队列满/启动异常均不静默，杜绝「任务已接收却无下文」）
+                await bridge.dispatchTask(task, title: title)   // U9：标题保留完整动词短语（原文）
             }
         case .steerTask(let instruction):
             guard let bridge else { return }
@@ -1499,6 +1967,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .interrupt:
             interruptCurrentTask()
+        case .interruptMain:
+            stopMainAnswer()
+        case .interruptAll:
+            stopAllAgents()
+        case .taskStatus:
+            // v3：状态查询本地直答（零延迟零失真——不再绕主 Agent 写回转述）
+            guard let bridge else {
+                showBubble(Self.connectFailureText)   // 与其他路由一致：未就绪不静默
+                return
+            }
+            let summary = bridge.taskStatusSummary()
+            showBubble(summary)
+            // 2026-08-16：状态查询是用户当下直接问的——按 high 播（最新优先，可打断旧播报），
+            // 不再 low 排队（排队期间用户已在等答案，反而被旧内容抢先）
+            SpeechOutputManager.shared.speak(summary)
         case .newChat:
             startNewConversation()
         case .history:
@@ -1566,24 +2049,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 设置 ▸ 菜单栏入口。
     @objc func menuToggleListenMode() { toggleListenMode() }
 
-    /// #22 中断任务（语音命令/右键菜单共用——与 CommandRouter 打断命令同路径）。
+    /// #22 中断任务（语音命令路径，task-only；GUI 菜单走 interruptAllFromMenu）。
     /// F3：无运行中任务时如实提示（不做假成功）；F4：打断成功明确告知不会再有结果。
+    /// fix-ghost-task-queue：本地收口始终完成；远端 RPC 失败时如实区分「已本地停止但远端未确认」。
     @objc func interruptCurrentTask() {
         guard let bridge else { return }
         Task {
+            let outcome = await bridge.interruptTask()
+            switch outcome {
+            case .stopped:
+                feedback("⏹ 任务已停止，不会再有结果了")
+            case .stoppedUnconfirmed:
+                // 本地已收口（新任务不再被旧任务阻塞）；远端未确认如实提示。
+                // fix-live-ux-details：逗号连接保证单句播报（分号会触发多句高优串播）
+                feedback("⏹ 任务已本地停止（远端停止未确认，可能短暂恢复），排队任务已清空")
+            case .cancelledDuringStart:
+                feedback("⏹ 任务已取消（尚未开始执行），排队任务已清空")
+            case .inactive:
+                feedback("当前没有正在运行的任务")
+            }
+            // F3：打断后立即刷新菜单栏「中断任务」可用态（任务已结束 → 置灰）
+            statusItemController?.updateState(currentState)
+        }
+    }
+
+    /// GUI 菜单「中断任务」语义：主 Agent 与任务 Agent 同时停止。
+    /// 语音「中断任务」仍保留 task-only；语音「全部停止」继续走同一 all-stop 路径。
+    @objc func interruptAllFromMenu() { stopAllAgents() }
+
+    /// v10（split-interrupt-commands）：停止回答——只停主 Agent 当前回复，任务侧不动。
+    /// 主侧不在回复时如实反馈（不伪报成功）；网络失败明确报错。
+    private func stopMainAnswer() {
+        guard let bridge else {
+            showBubble(Self.connectFailureText)   // 未就绪不静默
+            return
+        }
+        Task {
             do {
-                let interrupted = try await bridge.interruptTask()
-                if interrupted {
-                    feedback("⏹ 任务已停止，不会再有结果了")
-                } else {
-                    feedback("当前没有正在运行的任务")
+                let stopped = try await bridge.interruptMainAnswer()
+                await MainActor.run {
+                    if stopped {
+                        self.feedback("🛑 已停止回答")
+                    } else {
+                        self.feedback("主 Agent 当前没有在回答")
+                    }
                 }
-                // F3：打断后立即刷新菜单栏「中断任务」可用态（任务已结束 → 置灰）
-                statusItemController?.updateState(currentState)
             } catch {
-                feedback("⚠️ 打断失败：\(error.localizedDescription)")
+                LogManager.shared.warn("停止回答失败：\(error.localizedDescription)")
+                await MainActor.run { self.feedback("⚠️ 停止回答失败：\(error.localizedDescription)") }
             }
         }
+    }
+
+    /// v10：全部停止——主/任务两侧独立收口；各侧实际结果如实反馈（不伪报失败）。
+    private func stopAllAgents() {
+        guard let bridge else {
+            showBubble(Self.connectFailureText)   // 未就绪不静默
+            return
+        }
+        Task {
+            let result = await bridge.interruptAll()
+            await MainActor.run {
+                self.showInterruptAllFeedback(result)
+                self.statusItemController?.updateState(self.currentState)
+            }
+        }
+    }
+
+    /// v10：全部停止反馈组装（两侧独立结果 → 准确文案）。
+    /// fix-live-ux-details：以逗号连接各侧结果——单句播报（分号会拆成多句高优串播，过于打断）。
+    private func showInterruptAllFeedback(_ r: (main: HermesBridge.MainInterruptResult, task: HermesBridge.TaskInterruptResult)) {
+        var parts: [String] = []
+        switch r.main {
+        case .stopped: parts.append("主回答已停止")
+        case .inactive: parts.append("主 Agent 当前没有在回答")
+        case .failed: parts.append("主回答停止失败")
+        }
+        switch r.task {
+        case .stopped: parts.append("任务已停止")
+        case .inactive: parts.append("当前没有运行中的任务")
+        case .failed: parts.append("任务停止失败")
+        case .stoppedUnconfirmed: parts.append("任务已本地停止（远端未确认）")
+        }
+        let text = "🛑 " + parts.joined(separator: "，")
+        showBubble(text)
+        SpeechOutputManager.shared.speak(text.replacingOccurrences(of: "🛑 ", with: ""))
     }
 
     /// #22 开始新对话（语音命令/右键菜单共用——复用「新开对话」逻辑）。
@@ -1663,7 +2213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 当前主：直接查
             if let main = bridge.mainSession, main.sessionID == id {
                 Task { @MainActor in
-                    await self.showHistoryPanel(sessionID: main.sessionID, label: "主对话", bridge: bridge)
+                    await self.showHistoryPanel(sessionID: main.sessionID, label: "主对话", bridge: bridge,
+                                                profile: bridge.sessionIndex.mainProfile)
                 }
                 return
             }
@@ -1675,8 +2226,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             Task { @MainActor in
                 do {
-                    let info = try await bridge.client.resume(sessionID: rec.storedSessionID)
-                    await self.showHistoryPanel(sessionID: info.sessionID, label: "主对话（历史）", bridge: bridge)
+                    // v5：按记录 profile 恢复（legacy=nil 走默认 profile；deskpet-app 走隔离目录）
+                    let info = try await bridge.client.resume(sessionID: rec.storedSessionID, profile: rec.profile)
+                    await self.showHistoryPanel(sessionID: info.sessionID, label: "主对话（历史）", bridge: bridge, profile: rec.profile)
                     try? await bridge.client.close(sessionID: info.sessionID)
                 } catch {
                     self.presentHistory(title: "🗂 主对话（历史）", lines: ["⚠️ 查询失败（会话可能已失效）"])
@@ -1691,18 +2243,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let label = rec.title
         Task { @MainActor in
-            await self.showHistoryPanel(sessionID: rec.sessionID, label: label, bridge: bridge)
+            await self.showHistoryPanel(sessionID: rec.sessionID, label: label, bridge: bridge, profile: rec.profile)
         }
     }
 
     /// 历史面板统一入口：拉取 → 失败/空区分 → 展示（最近 20 条，内容不截断）。
+    /// v6：按记录 profile 路由（legacy=nil 走默认）。
     /// 线程安全（#36-1 崩溃修复）：@MainActor 编译期强制主线程 + 运行时收口双保险——
     /// HistoryPanelController/NSPanel 非主线程 init 会 EXC_CRASH。
     @MainActor
-    private func showHistoryPanel(sessionID: String, label: String, bridge: HermesBridge) async {
+    private func showHistoryPanel(sessionID: String, label: String, bridge: HermesBridge, profile: String? = nil) async {
         let messages: [[String: Any]]
         do {
-            messages = try await bridge.client.history(sessionID: sessionID)
+            messages = try await bridge.client.history(sessionID: sessionID, profile: profile)
         } catch {
             // P1-2：查询失败 ≠ 空历史（会话可能已失效/服务端错误）
             LogManager.shared.warn("历史查询失败：\(label)（\(error.localizedDescription)）")
@@ -1764,17 +2317,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let confirm = alert("移除任务记录", "从列表移除该任务记录「\(title)」？（常驻任务会话内容保留，不影响其它任务记录）", buttons: ["移除", "取消"])
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
         Task {
-            do {
-                // B-1：删除运行中的任务需先 interrupt（协议拒删活动会话）
-                if let active = bridge.activeTask, active.info.sessionID == rec.sessionID {
-                    try await bridge.interruptTask()
-                }
-                // #39：只删列表记录（常驻会话内容保留——共享语义）
-                bridge.removeTaskRecord(id: rec.id)
-                feedback("✅ 已移除记录：\(title)（会话内容保留）")
-            } catch {
-                feedback("⚠️ 删除失败：\(error.localizedDescription)")
+            // B-1：删除运行中的任务需先 interrupt（协议拒删活动会话）
+            if let active = bridge.activeTask, active.info.sessionID == rec.sessionID {
+                _ = await bridge.interruptTask()   // fix-ghost-task-queue：本地收口不抛错
             }
+            // #39：只删列表记录（常驻会话内容保留——共享语义）
+            bridge.removeTaskRecord(id: rec.id)
+            feedback("✅ 已移除记录：\(title)（会话内容保留）")
         }
     }
 
@@ -1906,7 +2455,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         执行任务：执行任务：<内容>、任务：<内容>、帮我执行：<内容>
         常见任务用语：帮我查… / 查一下… / 帮我搜索… / 搜索一下… / 帮我找… / 帮我打开… / 帮我下载…
         跟任务说：<内容>（转向运行中任务）
-        打断任务 / 停止任务
+        打断任务 / 停止任务（只停后台任务，聊天照常）
+        停止回答（只停当前回复，任务照常）
+        全部停止（主回复 + 任务一起停）
         新开对话 / 聊天记录
         设置：右键 → 设置（语音/交互/外观/系统分组）
         其他直接说，就是普通对话。触发词表可改：config/commands.json
@@ -2002,16 +2553,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - PetViewDelegate
 
 extension AppDelegate: PetViewDelegate {
-    func petViewRequestedInterrupt(_ view: PetView) { interruptCurrentTask() }
+    func petViewRequestedInterrupt(_ view: PetView) { interruptAllFromMenu() }
     func petViewRequestedNewChat(_ view: PetView) { startNewConversation() }
     func petViewRequestedClearHistory(_ view: PetView) { clearChatHistory() }
     func petViewRequestedRetry(_ view: PetView) { retryConnection() }
+    func petViewRequestedChooseHermesExecutable(_ view: PetView) { chooseHermesExecutable() }
     func petViewRequestedMuteState(_ view: PetView) -> Bool { SpeechOutputManager.shared.isMuted }
     func petViewRequestedWakeState(_ view: PetView) -> Bool { wakeController?.isEnabled ?? false }
     /// F9：右键菜单唤醒状态文案（与菜单栏一致的三态）
     func petViewRequestedWakeStatusText(_ view: PetView) -> String { wakeWordStatusText() }
-    /// F3：右键菜单「中断任务」可用态
-    func petViewRequestedIsTaskRunning(_ view: PetView) -> Bool { isTaskRunning() }
+    /// F3：右键菜单「中断任务」可用态——主 Agent 或任务 Agent 任一忙即可中断。
+    func petViewRequestedIsTaskRunning(_ view: PetView) -> Bool { isAnyAgentBusy() }
     func petViewRequestedWakeThresholds(_ view: PetView) -> [(value: Double, name: String, isCurrent: Bool)] {
         wakeThresholdMenuList()
     }
@@ -2027,15 +2579,25 @@ extension AppDelegate: PetViewDelegate {
     }
     func petViewRequestedSetPet(_ view: PetView, petID: String) { setPet(petID) }
     func petViewRequestedSetPersona(_ view: PetView, petID: String) { setPersona(petID) }
+    func petViewRequestedAddPersona(_ view: PetView) {
+        Task { @MainActor in self.showPersonaEditor(mode: .add) }
+    }
+    func petViewRequestedEditPersona(_ view: PetView) {
+        Task { @MainActor in self.showPersonaEditor(mode: .edit) }
+    }
+    func petViewRequestedDeletePersona(_ view: PetView, id: String) {
+        Task { @MainActor in self.deletePersonaWithConfirm(id: id) }
+    }
     func petViewRequestedEditPersonasFile(_ view: PetView) { editPersonasFile() }
     func petViewRequestedEditVoicePromptsFile(_ view: PetView) { editVoicePromptsFile() }
     func petViewRequestedSetExitPhrases(_ view: PetView) { setExitPhrases() }
 
-    // MARK: - 听写识别来源（豆包流式 ASR）
+    // MARK: - 听写识别来源（豆包流式 / MiMo 整段云端 ASR）
 
-    /// 当前识别来源（设置菜单勾选用）。
+    /// 当前识别来源（设置菜单勾选用）：local/duoyun/mimo 直读，其余未知值按 local。
     func asrProviderCurrent() -> String {
-        DeskPetConfig.load().asrProvider == "duoyun" ? "duoyun" : "local"
+        let p = DeskPetConfig.load().asrProvider
+        return (p == "duoyun" || p == "mimo") ? p : "local"
     }
 
     func petViewRequestedASRProvider(_ view: PetView) -> String {
@@ -2050,13 +2612,17 @@ extension AppDelegate: PetViewDelegate {
         selectASRProvider(sender.representedObject as? String ?? "local")
     }
 
-    /// 切换识别来源：保存 + 提示（豆包：消耗时长额度提示；无 key 不切换）
+    /// 切换识别来源：保存 + 提示（云端：消耗额度/整段延迟提示；无 key 不切换）
     private func selectASRProvider(_ id: String) {
-        guard id == "local" || id == "duoyun" else { return }
+        guard id == "local" || id == "duoyun" || id == "mimo" else { return }
         var cfg = DeskPetConfig.load()
         guard cfg.asrProvider != id else { return }
         if id == "duoyun", cfg.duoyunApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             feedback("⚠️ 需先配置豆包 API Key（设置 ▸ 语音 ▸ 豆包语音设置…）")
+            return
+        }
+        if id == "mimo", cfg.mimoApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            feedback("⚠️ 需先配置 MiMo API Key（见 指南：DeskPet/MiMo音色指南.md）")
             return
         }
         cfg.asrProvider = id
@@ -2064,9 +2630,13 @@ extension AppDelegate: PetViewDelegate {
             feedback("⚠️ 保存失败：配置目录不可写（项目内 history/config/）")
             return
         }
-        if id == "duoyun" {
+        switch id {
+        case "duoyun":
             feedback("✅ 听写识别已切换：豆包（流式）——持续聆听会消耗时长额度")
-        } else {
+        case "mimo":
+            // MiMo 整段语义：说完停 2 秒才上传，结果比豆包多等 1-3 秒
+            feedback("✅ 听写识别已切换：MiMo（云端整段）")
+        default:
             feedback("✅ 听写识别已切换：本地")
         }
     }
@@ -2081,6 +2651,7 @@ extension AppDelegate: PetViewDelegate {
         selectSystemVoice(identifier)
     }
     func petViewRequestedDuoyunSettings(_ view: PetView) { duoyunSettings() }
+    func petViewRequestedMiMoSettings(_ view: PetView) { mimoSettings() }
     func petViewRequestedEdgeVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)] {
         edgeVoiceMenuList()
     }
@@ -2106,6 +2677,18 @@ extension AppDelegate: PetViewDelegate {
     }
     func petViewRequestedSetDuoyunVoice(_ view: PetView, voiceType: String) { selectDuoyunVoice(voiceType) }
     func petViewRequestedCustomDuoyunVoice(_ view: PetView) { menuCustomDuoyunVoice() }
+    func petViewRequestedMiMoKeyConfigured(_ view: PetView) -> Bool { mimoKeyConfigured() }
+    func petViewRequestedMiMoVoices(_ view: PetView) -> [(id: String, name: String, isCurrent: Bool)] {
+        mimoVoiceMenuList()
+    }
+    func petViewRequestedSetMiMoVoice(_ view: PetView, voice: String) { selectMiMoVoice(voice) }
+    // MiMo 声线三模式热切换（preset/design/clone）：只读数据源 + 动作转发
+    func petViewRequestedMiMoMode(_ view: PetView) -> String { mimoModeCurrent() }
+    func petViewRequestedMiMoDesignPromptText(_ view: PetView) -> String { mimoDesignPromptText() }
+    func petViewRequestedMiMoClonePathText(_ view: PetView) -> String { mimoClonePathText() }
+    func petViewRequestedSetMiMoMode(_ view: PetView, modeID: String) { selectMiMoMode(modeID) }
+    func petViewRequestedEditMiMoDesignPrompt(_ view: PetView) { menuEditMiMoDesignPrompt() }
+    func petViewRequestedEditMiMoClonePath(_ view: PetView) { menuEditMiMoClonePath() }
     func petViewRequestedInput(_ view: PetView) { requestInput() }
     func petViewRequestedVoice(_ view: PetView) { toggleVoiceInput() }
     func petViewRequestedMute(_ view: PetView) { toggleMute() }
@@ -2120,5 +2703,394 @@ extension AppDelegate: PetViewDelegate {
     func petViewRequestedQuit(_ view: PetView) { quit() }
     func petView(_ view: PetView, didRequestState state: PetState) {
         setState(state, source: "右键菜单")
+    }
+}
+
+// MARK: - 人设编辑面板（task-panel）
+
+/// 「性格▸ 新增/编辑人设…」独立编辑面板：左侧人设列表（当前项加粗 +「（当前）」标记）、
+/// 名称输入框（id）、人设文本编辑区、保存/删除/关闭。
+/// 继承 DeskPet 面板语言（borderless NSPanel + RoundedPanelView、边距 16、标题 13 semibold、
+/// 分组标题 11 semibold、Esc 关闭、锚定桌宠旁、标准 AppKit 控件 NSTableView/NSTextField/NSTextView/NSButton）。
+/// 保存调 task-config 写 API：新增 → addPersona（重名就近提示不覆盖）；编辑 → 改名走 renamePersona
+/// （同步 petID）+ savePersonas 更新文本；删除 → 确认弹窗（破坏性按钮视觉、删除按钮红色靠右分离）+
+/// removePersona（删除当前 → 形象回退默认）。错误红色就近提示（不静默）；关闭/切换条目有未保存 → 提示放弃。
+@MainActor
+final class PersonaEditorPanelController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    enum Mode {
+        case add    // 空表单
+        case edit   // 预填当前人设（无当前 → 第一项）
+    }
+
+    static let panelSize = NSSize(width: 580, height: 450)
+
+    /// 保存/删除成功后回调（AppDelegate：刷新两侧菜单）。
+    var onRefreshMenus: (() -> Void)?
+    /// 结果反馈气泡回调（AppDelegate.feedback）。
+    var onFeedback: ((String) -> Void)?
+    /// 删除的恰是当前人设（petID 已回退默认）回调（AppDelegate：当前会话按默认人设继续）。
+    var onCurrentPersonaDeleted: (() -> Void)?
+
+    private let panel: InputPanel
+    private let background = RoundedPanelView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let closeButton = NSButton(title: "关闭", target: nil, action: nil)
+    private let listTitle = NSTextField(labelWithString: "人设列表")
+    private let tableScroll = NSScrollView()
+    private let tableView = NSTableView()
+    private let nameTitle = NSTextField(labelWithString: "名称（人设 id）")
+    private let nameField = NSTextField()
+    private let nameHint = NSTextField(labelWithString: "改当前人设名称会同步形象 id；形象素材缺失时自动回退默认")
+    private let textTitle = NSTextField(labelWithString: "人设文本（提示词）")
+    private let textScroll = NSScrollView()
+    private let textView = NSTextView()
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let saveButton = NSButton(title: "保存", target: nil, action: nil)
+    private let deleteButton = NSButton(title: "删除…", target: nil, action: nil)
+
+    private var entries: [(id: String, displayName: String, isCurrent: Bool)] = []
+    private var prompts: [String: String] = [:]
+    private var mode: Mode = .add
+    private var editingID = ""
+    private var snapshotID = ""
+    private var snapshotPrompt = ""
+
+    override init() {
+        panel = InputPanel(contentRect: NSRect(origin: .zero, size: Self.panelSize),
+                           styleMask: [.borderless, .nonactivatingPanel],
+                           backing: .buffered, defer: false)
+        super.init()
+        configurePanel()
+        configureControls()
+        configureTable()
+    }
+
+    private func configurePanel() {
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        panel.contentView = background
+        background.frame = panel.contentView?.bounds ?? .zero
+        background.autoresizingMask = [.width, .height]
+    }
+
+    private func configureControls() {
+        background.addSubview(titleLabel)
+        background.addSubview(closeButton)
+        background.addSubview(listTitle)
+        background.addSubview(tableScroll)
+        background.addSubview(nameTitle)
+        background.addSubview(nameField)
+        background.addSubview(nameHint)
+        background.addSubview(textTitle)
+        background.addSubview(textScroll)
+        background.addSubview(errorLabel)
+        background.addSubview(saveButton)
+        background.addSubview(deleteButton)
+
+        titleLabel.frame = NSRect(x: 16, y: Self.panelSize.height - 28, width: 380, height: 18)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        closeButton.frame = NSRect(x: Self.panelSize.width - 88, y: Self.panelSize.height - 38, width: 72, height: 28)
+        closeButton.bezelStyle = .rounded
+        closeButton.keyEquivalent = "\u{1b}"   // Esc 关闭
+        closeButton.target = self
+        closeButton.action = #selector(close)
+
+        listTitle.frame = NSRect(x: 16, y: Self.panelSize.height - 66, width: 150, height: 16)
+        listTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        listTitle.textColor = .secondaryLabelColor
+
+        tableScroll.frame = NSRect(x: 16, y: 48, width: 150, height: Self.panelSize.height - 120)
+
+        nameTitle.frame = NSRect(x: 182, y: Self.panelSize.height - 66, width: 382, height: 16)
+        nameTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        nameTitle.textColor = .secondaryLabelColor
+
+        nameField.frame = NSRect(x: 182, y: 352, width: 382, height: 24)
+        nameField.font = .systemFont(ofSize: 13)
+        nameField.placeholderString = "输入名称（id），例如 worker"
+        nameField.setAccessibilityLabel("人设名称")
+
+        nameHint.frame = NSRect(x: 182, y: 330, width: 382, height: 14)
+        nameHint.font = .systemFont(ofSize: 10)
+        nameHint.textColor = .tertiaryLabelColor
+        nameHint.lineBreakMode = .byTruncatingTail
+
+        textTitle.frame = NSRect(x: 182, y: 298, width: 382, height: 16)
+        textTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        textTitle.textColor = .secondaryLabelColor
+
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 12)
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainerInset = NSSize(width: 3, height: 5)
+        textView.setAccessibilityLabel("人设文本")
+        textScroll.documentView = textView
+        textScroll.hasVerticalScroller = true
+        textScroll.autohidesScrollers = true
+        textScroll.borderType = .bezelBorder
+        textScroll.frame = NSRect(x: 182, y: 52, width: 382, height: 240)
+
+        errorLabel.frame = NSRect(x: 182, y: 40, width: 382, height: 12)
+        errorLabel.font = .systemFont(ofSize: 11)
+        errorLabel.textColor = .systemRed
+        errorLabel.lineBreakMode = .byTruncatingTail
+        errorLabel.setAccessibilityLabel("错误提示")
+
+        saveButton.frame = NSRect(x: 380, y: 10, width: 88, height: 28)
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"   // 回车保存（面板默认按钮）
+        saveButton.target = self
+        saveButton.action = #selector(save)
+        saveButton.setAccessibilityLabel("保存人设")
+
+        // 破坏性操作可视化分离：删除按钮红色 + 靠右独立，与主操作（保存）拉开距离
+        deleteButton.frame = NSRect(x: 476, y: 10, width: 88, height: 28)
+        deleteButton.bezelStyle = .rounded
+        deleteButton.contentTintColor = .systemRed
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteClicked)
+        deleteButton.setAccessibilityLabel("删除当前人设")
+    }
+
+    private func configureTable() {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("persona"))
+        column.width = 140
+        column.minWidth = 120
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.rowHeight = 22
+        tableView.allowsEmptySelection = true
+        tableView.allowsMultipleSelection = false
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableScroll.documentView = tableView
+        tableScroll.hasVerticalScroller = true
+        tableScroll.autohidesScrollers = true
+        tableScroll.borderType = .bezelBorder
+    }
+
+    // MARK: - 展示 / 数据源
+
+    func show(mode: Mode, anchoredTo anchor: NSRect, screen: NSScreen?) {
+        self.mode = mode
+        titleLabel.stringValue = mode == .add ? "新增人设" : "编辑人设"
+        errorLabel.stringValue = ""
+        reloadEntries()
+        if mode == .add {
+            selectEntry(nil)
+        } else {
+            let target = entries.first(where: { $0.isCurrent }) ?? entries.first
+            selectEntry(target)
+            if let target, let idx = entries.firstIndex(where: { $0.id == target.id }) {
+                tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+            }
+        }
+        updateDeleteAvailability()
+
+        var f = NSRect(x: anchor.midX - Self.panelSize.width / 2,
+                       y: anchor.maxY + 12,
+                       width: Self.panelSize.width, height: Self.panelSize.height)
+        if let vf = screen?.visibleFrame {
+            if f.minX < vf.minX { f.origin.x = vf.minX + 8 }
+            if f.maxX > vf.maxX { f.origin.x = vf.maxX - f.width - 8 }
+            if f.maxY > vf.maxY { f.origin.y = anchor.minY - f.height - 12 }
+            if f.minY < vf.minY { f.origin.y = vf.minY + 8 }
+        }
+        panel.setFrame(f, display: true)
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(mode == .add ? nameField : textView)
+    }
+
+    func dismiss() {
+        panel.orderOut(nil)
+    }
+
+    private func reloadEntries() {
+        prompts = DeskPetConfig.loadPersonas()
+        let current = DeskPetConfig.load().petID
+        entries = prompts.keys.sorted().map { ($0, DeskPetConfig.personaDisplayName(for: $0), $0 == current) }
+        tableView.reloadData()
+    }
+
+    /// 载入条目到表单（nil = 空表单——新增初始态）。
+    private func selectEntry(_ entry: (id: String, displayName: String, isCurrent: Bool)?) {
+        guard let entry else {
+            editingID = ""
+            snapshotID = ""
+            snapshotPrompt = ""
+            nameField.stringValue = ""
+            textView.string = ""
+            tableView.deselectAll(nil)
+            updateDeleteAvailability()
+            return
+        }
+        editingID = entry.id
+        snapshotID = entry.id
+        snapshotPrompt = prompts[entry.id] ?? ""
+        nameField.stringValue = entry.id
+        textView.string = snapshotPrompt
+        updateDeleteAvailability()
+    }
+
+    private func isDirty() -> Bool {
+        nameField.stringValue != snapshotID || textView.string != snapshotPrompt
+    }
+
+    private func updateDeleteAvailability() {
+        deleteButton.isEnabled = !editingID.isEmpty
+    }
+
+    /// 未保存放弃确认（关闭/切换条目共用）——返回 true 表示确认放弃。
+    private func confirmDiscard() -> Bool {
+        let confirm = NSAlert()
+        confirm.messageText = snapshotID.isEmpty ? "放弃新增人设？" : "放弃对「\(snapshotID)」的未保存更改？"
+        confirm.informativeText = "当前更改尚未保存，放弃后将丢失。"
+        confirm.addButton(withTitle: "放弃更改")
+        confirm.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return confirm.runModal() == .alertFirstButtonReturn
+    }
+
+    // MARK: - 动作
+
+    @objc private func close() {
+        if isDirty(), !confirmDiscard() { return }
+        dismiss()
+    }
+
+    /// 保存：新增 → addPersona；编辑 → 改名走 renamePersona（同步 petID）+ savePersonas 更新文本。
+    /// 错误（空 id/空文本/重名/写盘失败）红色就近提示，不静默、不覆盖。
+    @objc private func save() {
+        let newName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newText = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        errorLabel.stringValue = ""
+        guard !newName.isEmpty else { errorLabel.stringValue = "名称不能为空"; return }
+        guard !newText.isEmpty else { errorLabel.stringValue = "人设文本不能为空"; return }
+
+        if mode == .add {
+            let table = DeskPetConfig.loadPersonas()
+            guard table[newName] == nil else { errorLabel.stringValue = "名称「\(newName)」已存在（重名）"; return }
+            guard DeskPetConfig.addPersona(id: newName, prompt: newText) else {
+                errorLabel.stringValue = "保存失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            onSaved("✅ 已新增人设：\(newName)")
+            return
+        }
+
+        guard !editingID.isEmpty else {
+            errorLabel.stringValue = "请先在左侧列表选择要编辑的人设"
+            return
+        }
+        let table = DeskPetConfig.loadPersonas()
+        guard table[editingID] != nil else {
+            errorLabel.stringValue = "原人设已被删除（可能在别处编辑），已刷新列表"
+            reloadEntries()
+            selectEntry(nil)
+            return
+        }
+        if newName != editingID {
+            guard table[newName] == nil else { errorLabel.stringValue = "名称「\(newName)」已存在（重名）"; return }
+            guard DeskPetConfig.renamePersona(from: editingID, to: newName) else {
+                errorLabel.stringValue = "改名失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            var t = DeskPetConfig.loadPersonas()
+            t[newName] = newText
+            guard DeskPetConfig.savePersonas(t) else {
+                errorLabel.stringValue = "名称已改为「\(newName)」，但文本保存失败：配置目录不可写"
+                reloadEntries()
+                selectEntry(entries.first(where: { $0.id == newName }))
+                return
+            }
+            onSaved("✅ 已保存人设：\(newName)")
+        } else {
+            var t = table
+            t[editingID] = newText
+            guard DeskPetConfig.savePersonas(t) else {
+                errorLabel.stringValue = "保存失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            onSaved("✅ 已保存人设：\(editingID)")
+        }
+    }
+
+    /// 删除当前编辑条目：确认弹窗（破坏性按钮）→ removePersona（当前 → 形象回退默认）→ 刷新菜单。
+    @objc private func deleteClicked() {
+        guard !editingID.isEmpty else { return }
+        let entry = entries.first(where: { $0.id == editingID })
+        let isCurrent = entry?.isCurrent ?? false
+        let name = DeskPetConfig.personaDisplayName(for: editingID)
+        let confirm = NSAlert()
+        confirm.messageText = "删除人设「\(name)」？"
+        confirm.informativeText = "将从 personas.json 永久移除，不可恢复。"
+            + (isCurrent ? "\n当前人设删除后，形象将回退默认「月薪猫」。\n" : "")
+        confirm.addButton(withTitle: "删除")
+        confirm.addButton(withTitle: "取消")
+        confirm.buttons.first?.hasDestructiveAction = true   // 破坏性可视化（macOS 11+）
+        NSApp.activate(ignoringOtherApps: true)
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        guard DeskPetConfig.removePersona(editingID) else {
+            errorLabel.stringValue = "删除失败：配置目录不可写（项目内 history/config/）"
+            return
+        }
+        if isCurrent { onCurrentPersonaDeleted?() }
+        onRefreshMenus?()
+        onFeedback?("🗑 已删除人设：\(name)")
+        dismiss()
+    }
+
+    private func onSaved(_ message: String) {
+        onRefreshMenus?()
+        onFeedback?(message)
+        dismiss()
+    }
+
+    // MARK: - NSTableViewDataSource / NSTableViewDelegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+        guard row >= 0, row < entries.count else { return nil }
+        let e = entries[row]
+        return e.isCurrent ? "\(e.displayName)（当前）" : e.displayName
+    }
+
+    func tableView(_ tableView: NSTableView, willDisplayCell cell: Any, for tableColumn: NSTableColumn?, row: Int) {
+        guard row >= 0, row < entries.count, let cell = cell as? NSTextFieldCell else { return }
+        cell.font = entries[row].isCurrent ? .boldSystemFont(ofSize: 12) : .systemFont(ofSize: 12)
+    }
+
+    /// 切换条目：有未保存更改先确认放弃；新增模式下点列表项 = 转为编辑该条目。
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        guard row >= 0, row < entries.count else { return }
+        let target = entries[row]
+        guard target.id != editingID else { return }
+        if isDirty(), !confirmDiscard() {
+            if let idx = entries.firstIndex(where: { $0.id == editingID }) {
+                tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+            }
+            return
+        }
+        errorLabel.stringValue = ""
+        if mode == .add {
+            mode = .edit
+            titleLabel.stringValue = "编辑人设"
+        }
+        selectEntry(target)
     }
 }

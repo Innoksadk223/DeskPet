@@ -11,10 +11,18 @@ enum SettingsMenuFactory {
         var duoyunSettings: Selector
         var duoyunVoice: Selector          // NSMenuItem 动作（representedObject = 声线 id）
         var duoyunCustomVoice: Selector
+        var mimoVoice: Selector             // MiMo 声线（预置音色列表项——preset 模式展示）
+        var mimoMode: Selector              // MiMo 声线模式单选（representedObject = 模式 id：preset/design/clone）
+        var mimoDesignPrompt: Selector      // 设计音色描述编辑（design 模式入口）
+        var mimoClonePath: Selector         // 克隆样本路径编辑（clone 模式入口）
+        var mimoSettings: Selector          // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声）
         var edgeVoice: Selector            // NSMenuItem 动作（representedObject = Edge 声线 id）
         var voiceServices: Selector        // 语音服务管理（清单展示）
-        var asrProvider: Selector        // 听写识别来源（local/duoyun 单选——representedObject = id）
+        var asrProvider: Selector        // 听写识别来源（local/duoyun/mimo 单选——representedObject = id）
         var persona: Selector              // NSMenuItem 动作（representedObject = 人设 id）
+        var addPersona: Selector          // 新增人设…（打开人设编辑面板——空表单）
+        var editPersona: Selector         // 编辑人设…（打开人设编辑面板——预填当前人设）
+        var deletePersona: Selector       // 删除人设（NSMenuItem 动作，representedObject = 人设 id——点击后确认弹窗）
         var editPersonas: Selector
         var editVoicePrompts: Selector      // executor8：高级——直接编辑语音提示词文件
         var channel: Selector              // NSMenuItem 动作（representedObject = 渠道 id）
@@ -24,6 +32,7 @@ enum SettingsMenuFactory {
         var autoLaunch: Selector          // 开机自启开关（菜单勾选态）
         var listenToggle: Selector        // 持续聆听开关（菜单勾选态）
         var retry: Selector
+        var hermesExecutable: Selector    // 本机 Hermes 可执行文件选择
         var resetDefaults: Selector        // P3-1：恢复默认设置
         var about: Selector               // 关于 DeskPet
     }
@@ -36,9 +45,14 @@ enum SettingsMenuFactory {
         var voices: [(identifier: String, name: String, isCurrent: Bool)]
         var duoyunVoices: [(id: String, name: String, isCurrent: Bool)]
         var duoyunKeyOK: Bool
+        var mimoVoices: [(id: String, name: String, isCurrent: Bool)]
+        var mimoKeyOK: Bool
+        var mimoMode: String                // 当前 MiMo 声线模式（preset/design/clone——顶部单选勾选）
+        var mimoDesignPrompt: String        // 设计音色描述当前值（design 分支 tooltip 用；空=未填写）
+        var mimoClonePath: String           // 克隆样本路径当前值（clone 分支 tooltip 用；空=未配置）
         var edgeVoices: [(id: String, name: String, isCurrent: Bool)]
         var edgeAvailable: Bool
-        var asrProvider: String          // 当前识别来源（local/duoyun）
+        var asrProvider: String          // 当前识别来源（local/duoyun/mimo）
         var wakeThresholds: [(value: Double, name: String, isCurrent: Bool)]
         var petScales: [(value: Double, name: String, isCurrent: Bool)]
         var autoLaunchOn: Bool           // 开机自启当前状态
@@ -209,12 +223,71 @@ enum SettingsMenuFactory {
             menu.addItem(duoyunVoicesItem)
         }
 
-        // 识别（听写识别来源：本地 / 豆包——单选勾选）
+        // MiMo 声线（2026-08-16：preset/design/clone 三模式热切换面板——顶部三模式单选，
+        // 分隔线后按 data.mimoMode 动态分支；仅清单含 mimo 时显示；无 key 置灰）
+        if manifestIDs.contains("mimo") {
+            let keyOK = data.mimoKeyOK
+            let mimoVoicesItem = NSMenuItem(title: "MiMo 声线", action: nil, keyEquivalent: "")
+            mimoVoicesItem.isEnabled = keyOK
+            mimoVoicesItem.toolTip = keyOK
+                ? "MiMo 声线：预置/设计/克隆三模式热切换——design=文字描述生成音色，clone=样本克隆音色（见 MiMo音色指南.md）"
+                : "先配置 MiMo API Key（MiMo 语音设置…）"
+            let mvMenu = NSMenu()
+
+            // ① 顶部三模式单选（当前模式勾选——data.mimoMode；点击 action=mimoMode 立即热切换）
+            let modes: [(id: String, name: String, tip: String)] = [
+                ("preset", "预置音色", "MiMo 官方预置音色清单"),
+                ("design", "设计音色", "用文字描述生成专属音色（来源见 MiMo音色指南.md）"),
+                ("clone", "克隆音色", "用 10-20s 干净人声样本克隆音色（来源见 MiMo音色指南.md）"),
+            ]
+            for m in modes {
+                let item = NSMenuItem(title: m.name, action: actions.mimoMode, keyEquivalent: "")
+                item.target = target
+                item.representedObject = m.id
+                item.state = (data.mimoMode == m.id) ? .on : .off
+                item.toolTip = m.tip
+                mvMenu.addItem(item)
+            }
+
+            // ② 分隔线后按当前模式动态分支（preset→预置列表；design→描述编辑；clone→路径编辑）
+            mvMenu.addItem(.separator())
+            if data.mimoMode == "design" {
+                let prompt = data.mimoDesignPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let designItem = NSMenuItem(title: "设计音色描述…", action: actions.mimoDesignPrompt, keyEquivalent: "")
+                designItem.target = target
+                designItem.toolTip = prompt.isEmpty
+                    ? "未填写——design 模式需先填写描述才能发声"
+                    : "当前描述：\(prompt)"
+                mvMenu.addItem(designItem)
+            } else if data.mimoMode == "clone" {
+                let path = data.mimoClonePath.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cloneItem = NSMenuItem(title: "克隆样本文件夹…", action: actions.mimoClonePath, keyEquivalent: "")
+                cloneItem.target = target
+                cloneItem.toolTip = path.isEmpty
+                    ? "未配置——点击打开样本文件夹，把 10-20s 干净人声 mp3 复制进去即可"
+                    : "当前样本：\(path)"
+                mvMenu.addItem(cloneItem)
+            } else {
+                // preset：官方预置音色列表（现有行为）
+                for mv in data.mimoVoices {
+                    let item = NSMenuItem(title: mv.name, action: actions.mimoVoice, keyEquivalent: "")
+                    item.target = target
+                    item.representedObject = mv.id
+                    item.state = mv.isCurrent ? .on : .off
+                    mvMenu.addItem(item)
+                }
+            }
+            mimoVoicesItem.submenu = mvMenu
+            menu.addItem(mimoVoicesItem)
+        }
+
+        // 识别（听写识别来源：本地 / 豆包流式 / MiMo 整段——单选勾选）
         let asrItem = NSMenuItem(title: "识别", action: nil, keyEquivalent: "")
         let asrMenu = NSMenu()
         let asrOptions: [(id: String, name: String, note: String)] = [
             ("local", "本地识别", "Apple 系统听写，离线可用，无消耗"),
             ("duoyun", "豆包识别", "云端流式，识别更准；持续聆听会消耗时长额度"),
+            ("mimo", "MiMo 识别", "云端整段识别（小米 MiMo），需 MiMo API Key"),
         ]
         for opt in asrOptions {
             let item = NSMenuItem(title: opt.name, action: actions.asrProvider, keyEquivalent: "")
@@ -232,6 +305,14 @@ enum SettingsMenuFactory {
             let duoyunItem = NSMenuItem(title: "豆包语音设置…", action: actions.duoyunSettings, keyEquivalent: "")
             duoyunItem.target = target
             menu.addItem(duoyunItem)
+        }
+
+        // MiMo 语音设置（2026-08-16：Key/预置音色/测试发声；已删服务不显示）
+        if manifestIDs.contains("mimo") {
+            let mimoItem = NSMenuItem(title: "MiMo 语音设置…", action: actions.mimoSettings, keyEquivalent: "")
+            mimoItem.target = target
+            mimoItem.toolTip = "MiMo API Key + 预置音色（设计/克隆音色见 MiMo音色指南.md）"
+            menu.addItem(mimoItem)
         }
 
         // 语音服务管理（清单展示）
@@ -332,10 +413,44 @@ enum SettingsMenuFactory {
             }
         }
         personaMenu.addItem(.separator())
-        let editPersonaItem = NSMenuItem(title: "直接编辑人设文件…（高级）", action: actions.editPersonas, keyEquivalent: "")
-        editPersonaItem.target = target
-        editPersonaItem.toolTip = "不推荐普通用户使用（人设随形象联动，换形象即换性格）"
-        personaMenu.addItem(editPersonaItem)
+        // GUI 编辑入口（task-panel）：新增/编辑打开编辑面板；删除为悬停子菜单（红色破坏性视觉），
+        // 点击后二次确认；删除当前人设 → 形象回退默认（DeskPetConfig.removePersona 内置联动）
+        let addPersonaCmd = NSMenuItem(title: "新增人设…", action: actions.addPersona, keyEquivalent: "")
+        addPersonaCmd.target = target
+        addPersonaCmd.toolTip = "打开人设编辑面板，创建新性格（名称即人设 id）"
+        personaMenu.addItem(addPersonaCmd)
+
+        let editPersonaCmd = NSMenuItem(title: "编辑人设…", action: actions.editPersona, keyEquivalent: "")
+        editPersonaCmd.target = target
+        editPersonaCmd.toolTip = "打开人设编辑面板（预填当前人设；左侧列表可切换任一形象的人设）"
+        personaMenu.addItem(editPersonaCmd)
+
+        let deletePersonaCmd = NSMenuItem(title: "删除人设…", action: nil, keyEquivalent: "")
+        let delMenu = NSMenu()
+        if data.personas.isEmpty {
+            let empty = NSMenuItem(title: "（无人设可删除）", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            delMenu.addItem(empty)
+        } else {
+            for p in data.personas {
+                let item = NSMenuItem(title: "删除「\(p.displayName)」", action: actions.deletePersona, keyEquivalent: "")
+                item.target = target
+                item.representedObject = p.id
+                // 破坏性操作可视化：红色标题 + tooltip 明示后果
+                item.attributedTitle = NSAttributedString(string: item.title, attributes: [.foregroundColor: NSColor.systemRed])
+                item.toolTip = "确认后不可恢复\(p.isCurrent ? "；删除当前人设后形象回退默认「月薪猫」" : "")"
+                delMenu.addItem(item)
+            }
+        }
+        deletePersonaCmd.submenu = delMenu
+        deletePersonaCmd.toolTip = "删除人设（选定后弹确认；删除当前人设 → 形象回退默认）"
+        personaMenu.addItem(deletePersonaCmd)
+
+        personaMenu.addItem(.separator())
+        let editPersonasFileItem = NSMenuItem(title: "直接编辑人设文件…（高级）", action: actions.editPersonas, keyEquivalent: "")
+        editPersonasFileItem.target = target
+        editPersonasFileItem.toolTip = "不推荐普通用户使用（人设随形象联动，换形象即换性格）"
+        personaMenu.addItem(editPersonasFileItem)
         personaItem.submenu = personaMenu
         personaItem.toolTip = "切换桌宠性格（人设提示词）——下一条对话生效"
         menu.addItem(personaItem)
@@ -359,6 +474,59 @@ enum SettingsMenuFactory {
 
     private static func makeSystemMenu(target: AnyObject?, actions: Actions, data: Data) -> NSMenu {
         let menu = NSMenu()
+
+        // P1：当前 Hermes 来源只读诊断 + 适配状态（已找到+版本 / 未找到+可行动原因+候选数 /
+        // 多安装提示）——不把 token/profile 内容放进菜单或日志。
+        let hermesManager = ServeManager.shared
+        let discovered = hermesManager.hermesCandidates.isEmpty
+            ? HermesDiscovery.discover()
+            : hermesManager.hermesCandidates
+        let selectedPath = hermesManager.selectedHermesPath ?? discovered.first?.path
+        let selectedCandidate = discovered.first(where: { $0.path == selectedPath })
+        let statuses = HermesDiscovery.statuses(from: discovered)
+        let decision = HermesDiscovery.adaptationDecision(statuses)
+        let hermesEntryPath = "设置▸系统▸选择 Hermes 可执行文件…"   // 真实菜单条目（U5）
+        let hermesTitle: String
+        var hermesTip: String
+        if let selectedPath {
+            let version = hermesManager.selectedHermesVersion ?? "版本未探测"
+            hermesTitle = "Hermes：已找到（\(version)）"
+            hermesTip = "来源：\(selectedCandidate?.sourceName ?? "本机探测")\n路径：\(selectedPath)\n候选数：\(discovered.count)"
+            if discovered.count > 1 {
+                hermesTip += "\n⚠️ 检测到 \(discovered.count) 个 Hermes 安装，可在（\(hermesEntryPath)）中另选"
+            }
+        } else {
+            hermesTitle = "Hermes：未找到（候选数：\(discovered.count)）"
+            hermesTip = "\(decision.message)\n修复入口：\(decision.repairEntry ?? hermesEntryPath)"
+        }
+        let hermesStatus = NSMenuItem(title: hermesTitle, action: nil, keyEquivalent: "")
+        hermesStatus.isEnabled = false
+        hermesStatus.toolTip = hermesTip
+        menu.addItem(hermesStatus)
+        // 多安装提示（可视化，不需悬停）——不打扰、保留「选择 Hermes 可执行文件…」入口
+        if discovered.count > 1 {
+            let multiHint = NSMenuItem(
+                title: "⚠️ 检测到 \(discovered.count) 个 Hermes 安装（当前用首个，可在（\(hermesEntryPath)）另选）",
+                action: nil,
+                keyEquivalent: ""
+            )
+            multiHint.isEnabled = false
+            menu.addItem(multiHint)
+        }
+
+        let chooseHermes = NSMenuItem(title: "选择 Hermes 可执行文件…", action: actions.hermesExecutable, keyEquivalent: "")
+        chooseHermes.target = target
+        chooseHermes.toolTip = "多个 Hermes 安装时选择并记住本机可执行文件路径"
+        menu.addItem(chooseHermes)
+
+        let profileStatus = NSMenuItem(
+            title: "DeskPet profile：\(DeskPetHermesProfile.diagnosticSummary())",
+            action: nil,
+            keyEquivalent: ""
+        )
+        profileStatus.isEnabled = false
+        profileStatus.toolTip = "profile：\(DeskPetHermesProfile.realHome.path)\nworkspace：\(DeskPetHermesProfile.workspace.path)"
+        menu.addItem(profileStatus)
 
         // 开机自启（勾选态）
         let autoLaunchItem = NSMenuItem(title: "开机自启", action: actions.autoLaunch, keyEquivalent: "")

@@ -404,12 +404,22 @@ extension DuoyunSpeechProvider {
 }
 
 extension DuoyunSpeechProvider: NSSoundDelegate {
+    /// 2026-08-16 竞态收口：NSSound delegate 回调无主线程保证——原实现直接在回调线程改
+    /// isPlaying/调 playNext，与主线程 stop()/enqueue() 裸并发（double removeFirst/双 play）。
+    /// 三重守卫：①统一派发主线程（与 stop/enqueue 串行化）；②flag=false（被 stop() 打断）
+    /// 不推进队列——打断收口由 stop() 自己完成；③身份校验 activeSound === sound——
+    /// 迟到回调（新播放已接管/已被清空）不得清状态或推进。
     func sound(_ sound: NSSound, didFinishPlaying flag: Bool) {
-        // 串行队列推进：一首播完播下一首
-        if activeSound === sound {
-            activeSound = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard flag else {
+                LogManager.shared.log(.debug, "豆包播放被中断（flag=false），跳过队列推进")
+                return
+            }
+            guard self.activeSound === sound else { return }
+            self.activeSound = nil
+            self.isPlaying = false
+            self.playNext()   // 串行队列推进：一首播完播下一首
         }
-        isPlaying = false
-        playNext()
     }
 }

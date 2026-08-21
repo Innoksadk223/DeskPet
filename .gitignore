@@ -12,3 +12,6 @@ state/
 
 # macOS
 .DS_Store
+
+# 本地发布备份与过程文件（勿上传）
+backups/

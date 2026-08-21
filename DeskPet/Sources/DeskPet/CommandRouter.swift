@@ -5,7 +5,10 @@ import Foundation
 final class CommandRouter {
     enum Action: String {
         case dispatch = "dispatch"      // 派发任务（剩余文本即任务内容）
-        case interrupt = "interrupt"    // 打断任务
+        case interrupt = "interrupt"    // 打断任务（task-only，菜单同义）
+        case interruptMain = "interrupt_main"   // v10：停止回答（main-only，不碰任务）
+        case interruptAll = "interrupt_all"     // v10：全部停止（主+任务同时收口）
+        case taskStatus = "task_status" // v3：任务状态本地直答（不再绕主 Agent）
         case newChat = "new_chat"       // 新开对话
         case history = "history"        // 查询记录
         case steerTask = "steer_task"   // 跟任务说（剩余文本转向任务会话）
@@ -29,7 +32,10 @@ final class CommandRouter {
     enum RouteResult {
         case chat(String)                     // 原文走主会话
         case dispatch(String, String)         // 任务内容 + 标题（原文完整短语——U9 动词不吞：标题保留触发词）
-        case interrupt
+        case interrupt                        // 打断任务（task-only）
+        case interruptMain                    // v10：停止回答（main-only）
+        case interruptAll                     // v10：全部停止（主+任务）
+        case taskStatus                       // v3：任务状态本地直答
         case newChat
         case history
         case steerTask(String)                // 转向内容
@@ -47,27 +53,47 @@ final class CommandRouter {
     }
 
     /// 从 history/config/commands.json 加载（首次自动迁移；ProjectPaths bundle/项目树 fallback）。
+    /// v4 配置刷新（command-config-refresh）：旧 history 副本缺新版默认规则时无破坏合并——
+    /// 用户规则与顺序完全保留，仅将内置默认中用户缺失的规则（按 type+pattern 判重）按默认顺序
+    /// 追加尾部；不写回用户文件（零覆盖风险），不要求手工删除旧副本。
+    /// 规则真源仍是 config/commands.json（不在此硬编码规则，无双真源）。
     func load() {
         // P1-4（pm2）：读写一致——指令表迁移 history/config/ 优先（与 personas 同模式）
         DeskPetConfig.ensureResourceMigrated("commands.json")
         let historyFile = DeskPetConfig.configDir().appendingPathComponent("commands.json")
-        if let data = try? Data(contentsOf: historyFile),
-           let config = try? JSONDecoder().decode(Config.self, from: data) {
-            rules = config.rules
-            LogManager.shared.info("指令表已加载：\(rules.count) 条规则（\(historyFile.path)）")
+        let userRules = loadRules(from: historyFile)
+        let defaultRules = loadRules(from: ProjectPaths.find(relative: "config/commands.json"))
+        if let user = userRules {
+            if let def = defaultRules {
+                // 判重键：type+pattern——同触发词已被用户自定义（改 action/边界/排除表）则视为用户已覆盖，不补回
+                var known = Set<String>()
+                for r in user { known.insert("\(r.type)|\(r.pattern)") }
+                let missing = def.filter { !known.contains("\($0.type)|\($0.pattern)") }
+                rules = user + missing
+                if !missing.isEmpty {
+                    LogManager.shared.info("指令表合并：用户 \(user.count) 条 + 补缺默认 \(missing.count) 条（旧副本缺新版规则；用户文件未覆盖）")
+                } else {
+                    LogManager.shared.info("指令表已加载：\(rules.count) 条规则（\(historyFile.path)）")
+                }
+                return
+            }
+            rules = user
+            LogManager.shared.info("指令表已加载：\(rules.count) 条规则（用户副本，内置默认不可用）")
             return
         }
-        guard let candidate = ProjectPaths.find(relative: "config/commands.json") else {
-            LogManager.shared.warn("未找到 config/commands.json，指令表为空（仅默认闲聊路由）")
+        if let def = defaultRules {
+            rules = def
+            LogManager.shared.info("指令表已加载：\(rules.count) 条规则（内置默认）")
             return
         }
-        if let data = try? Data(contentsOf: candidate),
-           let config = try? JSONDecoder().decode(Config.self, from: data) {
-            rules = config.rules
-            LogManager.shared.info("指令表已加载：\(rules.count) 条规则（\(candidate.path)）")
-        } else {
-            LogManager.shared.warn("指令表解析失败：\(candidate.path)")
-        }
+        LogManager.shared.warn("未找到 config/commands.json，指令表为空（仅默认闲聊路由）")
+    }
+
+    /// 从指定文件解析规则；文件不存在或解析失败返回 nil（调用方决定降级）。
+    private func loadRules(from url: URL?) -> [Rule]? {
+        guard let url, let data = try? Data(contentsOf: url),
+              let config = try? JSONDecoder().decode(Config.self, from: data) else { return nil }
+        return config.rules
     }
 
     /// 路由用户输入。
@@ -132,6 +158,9 @@ final class CommandRouter {
         case .deleteTask: return rest.isEmpty ? .chat(original) : .deleteTask(rest)
         case .deleteHistory: return .deleteHistory
         case .interrupt: return .interrupt
+        case .interruptMain: return .interruptMain
+        case .interruptAll: return .interruptAll
+        case .taskStatus: return .taskStatus
         case .newChat: return .newChat
         case .history: return .history
         case .help: return .help

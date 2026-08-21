@@ -27,6 +27,15 @@ final class StatusItemController: NSObject {
 
     func updateMute(_ muted: Bool) {
         isMuted = muted
+        rebuildMenu()
+    }
+
+    /// 人设编辑等外部变更后重建菜单（保持性格▸数据新鲜——保存/删除后由 AppDelegate 调用）。
+    func refreshMenu() {
+        rebuildMenu()
+    }
+
+    private func rebuildMenu() {
         // C1：先解析当前状态再重建（修复死逻辑 .idle:.idle 恒 idle + 先覆盖后解析丢状态）
         var state = PetState.idle
         if let title = statusItem.menu?.items.first?.title, title.hasPrefix("状态：") {
@@ -56,10 +65,10 @@ final class StatusItemController: NSObject {
 
         // U11：会话区（与右键菜单同步——中断任务/开始新对话/唤醒词开关，菜单栏此前缺失）
         menu.addItem(.separator())
-        let interrupt = NSMenuItem(title: "中断任务", action: #selector(AppDelegate.interruptCurrentTask), keyEquivalent: "")
+        let interrupt = NSMenuItem(title: "中断任务", action: #selector(AppDelegate.interruptAllFromMenu), keyEquivalent: "")
         interrupt.target = app
-        // F3：无运行中任务时置灰（不做假成功；语音命令路径仍有明确提示）
-        interrupt.isEnabled = app?.isTaskRunning() ?? false
+        // F3：主 Agent 或任务 Agent 任一忙时可用；GUI 菜单语义是两侧同时停止。
+        interrupt.isEnabled = app?.isAnyAgentBusy() ?? false
         menu.addItem(interrupt)
 
         let newChat = NSMenuItem(title: "开始新对话", action: #selector(AppDelegate.startNewConversation), keyEquivalent: "")
@@ -108,10 +117,18 @@ final class StatusItemController: NSObject {
             duoyunSettings: #selector(AppDelegate.menuDuoyunSettings),
             duoyunVoice: #selector(AppDelegate.menuSelectDuoyunVoice(_:)),
             duoyunCustomVoice: #selector(AppDelegate.menuCustomDuoyunVoice),
+            mimoVoice: #selector(AppDelegate.menuSelectMiMoVoice(_:)),
+            mimoMode: #selector(AppDelegate.menuSelectMiMoMode(_:)),
+            mimoDesignPrompt: #selector(AppDelegate.menuEditMiMoDesignPrompt),
+            mimoClonePath: #selector(AppDelegate.menuEditMiMoClonePath),
+            mimoSettings: #selector(AppDelegate.menuMiMoSettings),
             edgeVoice: #selector(AppDelegate.menuSelectEdgeVoice(_:)),
             voiceServices: #selector(AppDelegate.menuVoiceServices),
             asrProvider: #selector(AppDelegate.menuSelectASRProvider),
             persona: #selector(AppDelegate.menuSelectPersona(_:)),
+            addPersona: #selector(AppDelegate.menuAddPersona),
+            editPersona: #selector(AppDelegate.menuEditPersona),
+            deletePersona: #selector(AppDelegate.menuDeletePersona(_:)),
             editPersonas: #selector(AppDelegate.menuEditPersonas),
             editVoicePrompts: #selector(AppDelegate.menuEditVoicePrompts),
             channel: #selector(AppDelegate.menuSelectChannel(_:)),
@@ -121,6 +138,7 @@ final class StatusItemController: NSObject {
             autoLaunch: #selector(AppDelegate.toggleAutoLaunch),
             listenToggle: #selector(AppDelegate.menuToggleListenMode),
             retry: #selector(AppDelegate.retryConnection),
+            hermesExecutable: #selector(AppDelegate.chooseHermesExecutable),
             resetDefaults: #selector(AppDelegate.resetDefaults),
             about: #selector(AppDelegate.showAbout)
         )
@@ -131,6 +149,11 @@ final class StatusItemController: NSObject {
             voices: app?.voiceMenuList() ?? [],
             duoyunVoices: app?.duoyunVoiceMenuList() ?? [],
             duoyunKeyOK: app?.duoyunKeyConfigured() ?? false,
+            mimoVoices: app?.mimoVoiceMenuList() ?? [],
+            mimoKeyOK: app?.mimoKeyConfigured() ?? false,
+            mimoMode: app?.mimoModeCurrent() ?? "preset",
+            mimoDesignPrompt: app?.mimoDesignPromptText() ?? "",
+            mimoClonePath: app?.mimoClonePathText() ?? "",
             edgeVoices: app?.edgeVoiceMenuList() ?? [],
             edgeAvailable: app?.edgeAvailable() ?? false,
             asrProvider: app?.asrProviderCurrent() ?? "local",

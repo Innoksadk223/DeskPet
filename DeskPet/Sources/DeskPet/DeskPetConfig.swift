@@ -27,11 +27,31 @@ struct DeskPetConfig: Codable {
     var duoyunResourceId: String = "seed-tts-2.0"
     /// 豆包 TTS 音色（speaker；默认 Vivi 2.0——uranus 双通音色，researcher2 实测 seed-tts-2.0 可用 8 个）
     var duoyunVoiceType: String = "zh_female_vv_uranus_bigtts"
+    /// MiMo（小米）语音 API Key（2026-08-16：Authorization Bearer；platform.xiaomimimo.com 创建；
+    /// TTS 与 ASR 共用同一 Key；空 = 播报链/识别链跳过 MiMo）
+    var mimoApiKey: String = ""
+    /// MiMo 自定义 Base URL（2026-08-16：空 = 默认 https://api.xiaomimimo.com；
+    /// TTS/ASR 同端点 /v1/chat/completions——OpenAI 兼容；自定义时填完整 origin，不含路径）
+    var mimoBaseURL: String = ""
+    /// MiMo TTS 音色模式（2026-08-16：preset=预置音色 / design=设计音色 / clone=克隆音色）
+    var mimoTTSMode: String = "preset"
+    /// MiMo 预置音色名（preset 模式用：mimo_default/冰糖/茉莉/苏打/白桦（中文）、
+    /// Mia/Chloe/Milo/Dean（英文）；默认茉莉）
+    var mimoVoice: String = "茉莉"
+    /// MiMo 设计音色描述（design 模式必填——空 = design 模式不可用；如「沉稳的男声，语速适中，像纪录片旁白」）
+    var mimoVoiceDesignPrompt: String = ""
+    /// MiMo 克隆音色样本路径（clone 模式：mp3 文件绝对路径，10-20s 干净人声；空/文件不存在 = clone 不可用）
+    var mimoVoiceClonePath: String = ""
+    /// MiMo 朗读风格指令（可选：preset/clone 模式的 user 消息——如「语气轻快一些」；空 = 不带）
+    var mimoStyleInstruction: String = ""
+    /// MiMo ASR 识别语言（2026-08-16：auto/zh/en，默认 auto）
+    var mimoASRLanguage: String = "auto"
     /// 开机自启
     var launchAtLogin: Bool = false
-    /// 播报链顺序（edge | system | duoyun | thirdparty | hermes）——
-    /// edge 为默认读轨（用户决策）：链首首选，isAvailable=false 时跳过（D3 降级 system）
-    var speechChain: [String] = ["edge", "system", "duoyun", "thirdparty", "hermes"]
+    /// 播报链顺序（edge | system | duoyun | mimo | thirdparty | hermes）——
+    /// edge 为默认读轨（用户决策）：链首首选，isAvailable=false 时跳过（D3 降级 system）；
+    /// mimo 2026-08-16 追加在 duoyun 之后（只改默认数组——既有配置文件保持原链，渠道切换时按需插入）
+    var speechChain: [String] = ["edge", "system", "duoyun", "mimo", "thirdparty", "hermes"]
     /// 宠物大小档位（1.0 小 / 1.5 中 / 2.25 大——每档 1.5 倍，菜单三档不手填）
     var petScale: Double = 1.0
     /// 转录存档保留天数（transcripts/*.jsonl 定期清理，默认 7 天）
@@ -51,7 +71,8 @@ struct DeskPetConfig: Codable {
     /// P1：聆听退出词（用户决策 2026-08-12：退出词=「晚安」；「退下/再见」回归对话，
     /// 不再 contains 误伤拦截；UI 文案已对齐实际——只提「晚安」）
     var listenExitPhrases: [String] = ["晚安"]   // 用户决策（2026-08-12）：退出词=晚安
-    /// P1：聆听分段静默时长（秒，说完停顿多久提交并续听）
+    /// v8（asr-segmentation-fix）：语音分段提交阈值——静音满该时长提交当前累积文本
+    /// （分句阈值固定 1s 标记不提交；默认 2.0s，可编辑 deskpet-config.json 调整，clamp 1.0...5.0）
     var listenSilenceTimeout: Double = 2.0
     /// 唤醒词灵敏度（sherpa KWS 阈值，默认 0.25；范围 0.1-0.5：
     /// 越低越灵敏越易误触发，越高越迟钝越易漏；非法值回退默认）
@@ -76,9 +97,17 @@ struct DeskPetConfig: Codable {
         duoyunBaseURL = try c.decodeIfPresent(String.self, forKey: .duoyunBaseURL) ?? ""
         duoyunResourceId = try c.decodeIfPresent(String.self, forKey: .duoyunResourceId) ?? "seed-tts-2.0"
         duoyunVoiceType = try c.decodeIfPresent(String.self, forKey: .duoyunVoiceType) ?? "zh_female_vv_uranus_bigtts"
+        mimoApiKey = try c.decodeIfPresent(String.self, forKey: .mimoApiKey) ?? ""
+        mimoBaseURL = try c.decodeIfPresent(String.self, forKey: .mimoBaseURL) ?? ""
+        mimoTTSMode = try c.decodeIfPresent(String.self, forKey: .mimoTTSMode) ?? "preset"
+        mimoVoice = try c.decodeIfPresent(String.self, forKey: .mimoVoice) ?? "茉莉"
+        mimoVoiceDesignPrompt = try c.decodeIfPresent(String.self, forKey: .mimoVoiceDesignPrompt) ?? ""
+        mimoVoiceClonePath = try c.decodeIfPresent(String.self, forKey: .mimoVoiceClonePath) ?? ""
+        mimoStyleInstruction = try c.decodeIfPresent(String.self, forKey: .mimoStyleInstruction) ?? ""
+        mimoASRLanguage = try c.decodeIfPresent(String.self, forKey: .mimoASRLanguage) ?? "auto"
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         speechChain = try c.decodeIfPresent([String].self, forKey: .speechChain)
-            ?? ["edge", "system", "duoyun", "thirdparty", "hermes"]
+            ?? ["edge", "system", "duoyun", "mimo", "thirdparty", "hermes"]
         petScale = try c.decodeIfPresent(Double.self, forKey: .petScale) ?? 1.0
         transcriptRetentionDays = try c.decodeIfPresent(Int.self, forKey: .transcriptRetentionDays) ?? 7
         edgeVoice = try c.decodeIfPresent(String.self, forKey: .edgeVoice) ?? "zh-CN-XiaoxiaoNeural"
@@ -288,6 +317,162 @@ struct DeskPetConfig: Codable {
         return [:]
     }
 
+    // MARK: - 人设写 API（GUI 编辑面板地基：新增/改名/删除/保存）
+
+    /// 人设表原子保存：内容校验（id/文本 trim 后均非空）与 JSON 编码都通过才落盘；
+    /// 写入前把现有运行副本备份为 personas.json.bak-<时间戳>（旧版本/损坏内容都留底，可人工回退）；
+    /// 临时文件 + 原子替换——任何失败返回 false，旧文件完整保留（绝不写半）。
+    /// 目标固定为 history/config/personas.json 运行副本（默认；首启未迁移先迁移），
+    /// 绝不写源 config/ 或 bundle（保持用户编辑不回退原则）。
+    /// - Parameter dir: 目标目录注入（自测临时目录用）；nil = 配置文件目录。
+    @discardableResult
+    static func savePersonas(_ personas: [String: String], to dir: URL? = nil) -> Bool {
+        let targetDir: URL
+        if let dir {
+            targetDir = dir
+        } else {
+            ensurePersonasMigrated()   // 确保运行副本存在（源 config/ → history/ 首启迁移）
+            targetDir = configDir()
+        }
+        // 内容校验（trim 后）：id 非空、文本非空——非法内容不落盘（不写半、也不产生备份副作用）
+        for (id, prompt) in personas {
+            if id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                LogManager.shared.warn("人设保存拒绝：空 id 或空文本（未写入）")
+                return false
+            }
+        }
+        // JSON 编码校验：编码失败不写
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(personas) else {
+            LogManager.shared.error("人设保存失败：JSON 编码失败（未写入）")
+            return false
+        }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        let target = targetDir.appendingPathComponent("personas.json")
+        // 写入前备份现有运行副本（旧版/损坏内容留底）——秒级时间戳 + UUID 后缀避免同一秒多次写入撞名
+        if fm.fileExists(atPath: target.path) {
+            let backup = targetDir.appendingPathComponent(
+                "personas.json.bak-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8))")
+            if (try? fm.copyItem(at: target, to: backup)) == nil {
+                LogManager.shared.warn("人设写入前备份失败（继续保存）：\(backup.path)")
+            }
+        }
+        // 临时文件 + 原子替换：失败不留半文件、旧文件不动
+        let tmp = targetDir.appendingPathComponent("personas.json.tmp-\(UUID().uuidString)")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            if fm.fileExists(atPath: target.path) {
+                _ = try fm.replaceItemAt(target, withItemAt: tmp)   // 同目录 rename，原子替换
+            } else {
+                try fm.moveItem(at: tmp, to: target)
+            }
+            return true
+        } catch {
+            try? fm.removeItem(at: tmp)
+            LogManager.shared.error("人设保存失败：\(error.localizedDescription)（旧文件保留）")
+            return false
+        }
+    }
+
+    /// 指定目录读取人设表（写 API 内部用；nil = 现有 loadPersonas() 语义——
+    /// 运行副本优先/损坏备份/旧 deskpet-config 兼容 fallback）。
+    private static func loadPersonas(at dir: URL?) -> [String: String] {
+        guard let dir else { return loadPersonas() }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("personas.json")),
+           let p = try? JSONDecoder().decode([String: String].self, from: data) {
+            return p
+        }
+        return [:]
+    }
+
+    /// 指定目录读取 deskpet-config.json（写 API 内部用；nil = load() 缓存语义）。
+    private static func personaConfig(at dir: URL?) -> DeskPetConfig {
+        guard let dir else { return load() }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("deskpet-config.json")),
+           let cfg = try? JSONDecoder().decode(DeskPetConfig.self, from: data) {
+            return cfg
+        }
+        return DeskPetConfig()
+    }
+
+    /// 指定目录写入 deskpet-config.json（写 API 内部用；nil = save() 并刷新缓存）。
+    @discardableResult
+    private static func persistPersonaConfig(_ cfg: DeskPetConfig, at dir: URL?) -> Bool {
+        guard let dir else { return cfg.save() }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(cfg) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent("deskpet-config.json"), options: .atomic)
+            return true
+        } catch {
+            LogManager.shared.error("人设 petID 联动保存失败：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 新增人设：id 非空（trim）且表中唯一、提示词 trim 后非空才落盘。
+    /// 校验/写盘失败返回 false（不落盘、旧文件保留）；成功返回 true。
+    @discardableResult
+    static func addPersona(id: String, prompt: String, in dir: URL? = nil) -> Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, !prompt.isEmpty else { return false }
+        var table = loadPersonas(at: dir)
+        guard table[id] == nil else { return false }   // id 冲突拒绝
+        table[id] = prompt
+        return savePersonas(table, to: dir)
+    }
+
+    /// 改名：只替换 key、value 文本原样保留；新 id 非空且不与现有 id 冲突。
+    /// 若旧 id == 当前 cfg.petID → 同步 cfg.petID 为新 id（写 deskpet-config.json，保持当前连续）；
+    /// 联动保存失败 → 回滚人设表并返回 false（两文件保持一致）。
+    @discardableResult
+    static func renamePersona(from oldID: String, to newID: String, in dir: URL? = nil) -> Bool {
+        let old = oldID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = newID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !old.isEmpty, !new.isEmpty, old != new else { return false }
+        var table = loadPersonas(at: dir)
+        guard table[old] != nil else { return false }   // 旧 id 必须存在
+        guard table[new] == nil else { return false }   // 新 id 唯一（冲突拒绝）
+        let prompt = table.removeValue(forKey: old)!
+        table[new] = prompt                             // value 原样
+        guard savePersonas(table, to: dir) else { return false }
+        var cfg = personaConfig(at: dir)
+        guard cfg.petID == old else { return true }     // 非当前 id：无需联动
+        cfg.petID = new
+        guard persistPersonaConfig(cfg, at: dir) else {
+            if let prompt = table.removeValue(forKey: new) { table[old] = prompt }   // 回滚人设表
+            _ = savePersonas(table, to: dir)
+            return false
+        }
+        return true
+    }
+
+    /// 删除人设：只删指定 key（不误删他人）；若删的是当前 cfg.petID
+    /// → petID 回退默认 monthly-salary-cat（写 deskpet-config.json，保持连续）；
+    /// 联动保存失败 → 回滚人设表并返回 false。
+    @discardableResult
+    static func removePersona(_ id: String, in dir: URL? = nil) -> Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return false }
+        var table = loadPersonas(at: dir)
+        guard let removed = table.removeValue(forKey: id) else { return false }   // 不存在不误删/无操作
+        guard savePersonas(table, to: dir) else { return false }
+        var cfg = personaConfig(at: dir)
+        guard cfg.petID == id else { return true }
+        cfg.petID = "monthly-salary-cat"
+        guard persistPersonaConfig(cfg, at: dir) else {
+            table[id] = removed                                                // 回滚人设表
+            _ = savePersonas(table, to: dir)
+            return false
+        }
+        return true
+    }
+
     /// P1-4（pm2）：资源迁移——项目树 config/<relative> → history/config/<relative>
     /// （首次复制，已存在不覆盖——与 personas 同模式；读写一致，消除双目录歧义）。
     /// commands.json / prompts/voice.json 等读取入口在 load 前调用。
@@ -348,6 +533,7 @@ struct DeskPetConfig: Codable {
         case "cache-capy": return "卡皮巴拉"
         case "xiaolemi": return "小蕾米"
         case "momonga": return "卖萌小可爱（Momonga）"
+        case "whale-girl": return "鲸鱼娘"
         default: return id
         }
     }
