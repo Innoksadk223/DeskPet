@@ -1774,6 +1774,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setPersona(id)
     }
     @objc func menuEditPersonas() { editPersonasFile() }
+
+    // MARK: - 人设 GUI 管理（task-panel：新增/编辑面板 + 删除确认 + 菜单刷新）
+
+    @objc func menuAddPersona() {
+        Task { @MainActor in self.showPersonaEditor(mode: .add) }
+    }
+    @objc func menuEditPersona() {
+        Task { @MainActor in self.showPersonaEditor(mode: .edit) }
+    }
+    @objc func menuDeletePersona(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Task { @MainActor in self.deletePersonaWithConfirm(id: id) }
+    }
+
+    private var personaEditorPanel: PersonaEditorPanelController?
+
+    /// 打开人设编辑面板（新增=空表单；编辑=预填当前人设），锚定桌宠旁；
+    /// 面板内保存/删除都刷新两侧菜单（右键菜单每次弹出重建，菜单栏强制重建）。
+    @MainActor
+    private func showPersonaEditor(mode: PersonaEditorPanelController.Mode) {
+        guard let petPanel else { return }
+        let panel = personaEditorPanel ?? PersonaEditorPanelController()
+        personaEditorPanel = panel
+        panel.onRefreshMenus = { [weak self] in self?.refreshPersonaMenus() }
+        panel.onFeedback = { [weak self] text in self?.feedback(text) }
+        panel.onCurrentPersonaDeleted = { [weak self] in
+            // petID 已由写 API 回退默认；让当前会话按默认人设继续（同 setPersona 的应用语义）
+            Task { [weak self] in await self?.bridge?.applyPersonaChange("monthly-salary-cat") }
+        }
+        panel.show(mode: mode, anchoredTo: petPanel.frame, screen: petPanel.screen)
+    }
+
+    /// 删除人设（菜单入口）：确认弹窗（破坏性按钮视觉）→ 写 API（删除当前 → petID 回退默认）→ 刷新菜单。
+    @MainActor
+    private func deletePersonaWithConfirm(id: String) {
+        let name = DeskPetConfig.personaDisplayName(for: id)
+        let isCurrent = DeskPetConfig.load().petID == id
+        let confirm = alert("删除人设「\(name)」？",
+                            "将从 personas.json 永久移除，不可恢复。"
+                                + (isCurrent ? "\n当前人设删除后，形象将回退默认「月薪猫」。\n" : ""),
+                            buttons: ["删除", "取消"])
+        confirm.buttons.first?.hasDestructiveAction = true   // 破坏性可视化（macOS 11+）
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        guard DeskPetConfig.removePersona(id) else {
+            feedback("⚠️ 删除失败：配置目录不可写（项目内 history/config/）")
+            return
+        }
+        if isCurrent {
+            Task { [weak self] in await self?.bridge?.applyPersonaChange("monthly-salary-cat") }
+        }
+        refreshPersonaMenus()
+        LogManager.shared.info("人设已删除（GUI）：\(id)")
+        feedback("🗑 已删除人设：\(name)")
+    }
+
+    /// 保存/删除人设后刷新菜单栏菜单（右键菜单每次弹出重建，无需处理）。
+    @MainActor
+    private func refreshPersonaMenus() {
+        statusItemController?.refreshMenu()
+    }
+
     @objc func menuEditVoicePrompts() { editVoicePromptsFile() }
     @objc func menuSetExitPhrases() { setExitPhrases() }
     @objc func menuSelectChannel(_ sender: NSMenuItem) {
@@ -2518,6 +2579,15 @@ extension AppDelegate: PetViewDelegate {
     }
     func petViewRequestedSetPet(_ view: PetView, petID: String) { setPet(petID) }
     func petViewRequestedSetPersona(_ view: PetView, petID: String) { setPersona(petID) }
+    func petViewRequestedAddPersona(_ view: PetView) {
+        Task { @MainActor in self.showPersonaEditor(mode: .add) }
+    }
+    func petViewRequestedEditPersona(_ view: PetView) {
+        Task { @MainActor in self.showPersonaEditor(mode: .edit) }
+    }
+    func petViewRequestedDeletePersona(_ view: PetView, id: String) {
+        Task { @MainActor in self.deletePersonaWithConfirm(id: id) }
+    }
     func petViewRequestedEditPersonasFile(_ view: PetView) { editPersonasFile() }
     func petViewRequestedEditVoicePromptsFile(_ view: PetView) { editVoicePromptsFile() }
     func petViewRequestedSetExitPhrases(_ view: PetView) { setExitPhrases() }
@@ -2633,5 +2703,394 @@ extension AppDelegate: PetViewDelegate {
     func petViewRequestedQuit(_ view: PetView) { quit() }
     func petView(_ view: PetView, didRequestState state: PetState) {
         setState(state, source: "右键菜单")
+    }
+}
+
+// MARK: - 人设编辑面板（task-panel）
+
+/// 「性格▸ 新增/编辑人设…」独立编辑面板：左侧人设列表（当前项加粗 +「（当前）」标记）、
+/// 名称输入框（id）、人设文本编辑区、保存/删除/关闭。
+/// 继承 DeskPet 面板语言（borderless NSPanel + RoundedPanelView、边距 16、标题 13 semibold、
+/// 分组标题 11 semibold、Esc 关闭、锚定桌宠旁、标准 AppKit 控件 NSTableView/NSTextField/NSTextView/NSButton）。
+/// 保存调 task-config 写 API：新增 → addPersona（重名就近提示不覆盖）；编辑 → 改名走 renamePersona
+/// （同步 petID）+ savePersonas 更新文本；删除 → 确认弹窗（破坏性按钮视觉、删除按钮红色靠右分离）+
+/// removePersona（删除当前 → 形象回退默认）。错误红色就近提示（不静默）；关闭/切换条目有未保存 → 提示放弃。
+@MainActor
+final class PersonaEditorPanelController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    enum Mode {
+        case add    // 空表单
+        case edit   // 预填当前人设（无当前 → 第一项）
+    }
+
+    static let panelSize = NSSize(width: 580, height: 450)
+
+    /// 保存/删除成功后回调（AppDelegate：刷新两侧菜单）。
+    var onRefreshMenus: (() -> Void)?
+    /// 结果反馈气泡回调（AppDelegate.feedback）。
+    var onFeedback: ((String) -> Void)?
+    /// 删除的恰是当前人设（petID 已回退默认）回调（AppDelegate：当前会话按默认人设继续）。
+    var onCurrentPersonaDeleted: (() -> Void)?
+
+    private let panel: InputPanel
+    private let background = RoundedPanelView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let closeButton = NSButton(title: "关闭", target: nil, action: nil)
+    private let listTitle = NSTextField(labelWithString: "人设列表")
+    private let tableScroll = NSScrollView()
+    private let tableView = NSTableView()
+    private let nameTitle = NSTextField(labelWithString: "名称（人设 id）")
+    private let nameField = NSTextField()
+    private let nameHint = NSTextField(labelWithString: "改当前人设名称会同步形象 id；形象素材缺失时自动回退默认")
+    private let textTitle = NSTextField(labelWithString: "人设文本（提示词）")
+    private let textScroll = NSScrollView()
+    private let textView = NSTextView()
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let saveButton = NSButton(title: "保存", target: nil, action: nil)
+    private let deleteButton = NSButton(title: "删除…", target: nil, action: nil)
+
+    private var entries: [(id: String, displayName: String, isCurrent: Bool)] = []
+    private var prompts: [String: String] = [:]
+    private var mode: Mode = .add
+    private var editingID = ""
+    private var snapshotID = ""
+    private var snapshotPrompt = ""
+
+    override init() {
+        panel = InputPanel(contentRect: NSRect(origin: .zero, size: Self.panelSize),
+                           styleMask: [.borderless, .nonactivatingPanel],
+                           backing: .buffered, defer: false)
+        super.init()
+        configurePanel()
+        configureControls()
+        configureTable()
+    }
+
+    private func configurePanel() {
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        panel.contentView = background
+        background.frame = panel.contentView?.bounds ?? .zero
+        background.autoresizingMask = [.width, .height]
+    }
+
+    private func configureControls() {
+        background.addSubview(titleLabel)
+        background.addSubview(closeButton)
+        background.addSubview(listTitle)
+        background.addSubview(tableScroll)
+        background.addSubview(nameTitle)
+        background.addSubview(nameField)
+        background.addSubview(nameHint)
+        background.addSubview(textTitle)
+        background.addSubview(textScroll)
+        background.addSubview(errorLabel)
+        background.addSubview(saveButton)
+        background.addSubview(deleteButton)
+
+        titleLabel.frame = NSRect(x: 16, y: Self.panelSize.height - 28, width: 380, height: 18)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        closeButton.frame = NSRect(x: Self.panelSize.width - 88, y: Self.panelSize.height - 38, width: 72, height: 28)
+        closeButton.bezelStyle = .rounded
+        closeButton.keyEquivalent = "\u{1b}"   // Esc 关闭
+        closeButton.target = self
+        closeButton.action = #selector(close)
+
+        listTitle.frame = NSRect(x: 16, y: Self.panelSize.height - 66, width: 150, height: 16)
+        listTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        listTitle.textColor = .secondaryLabelColor
+
+        tableScroll.frame = NSRect(x: 16, y: 48, width: 150, height: Self.panelSize.height - 120)
+
+        nameTitle.frame = NSRect(x: 182, y: Self.panelSize.height - 66, width: 382, height: 16)
+        nameTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        nameTitle.textColor = .secondaryLabelColor
+
+        nameField.frame = NSRect(x: 182, y: 352, width: 382, height: 24)
+        nameField.font = .systemFont(ofSize: 13)
+        nameField.placeholderString = "输入名称（id），例如 worker"
+        nameField.setAccessibilityLabel("人设名称")
+
+        nameHint.frame = NSRect(x: 182, y: 330, width: 382, height: 14)
+        nameHint.font = .systemFont(ofSize: 10)
+        nameHint.textColor = .tertiaryLabelColor
+        nameHint.lineBreakMode = .byTruncatingTail
+
+        textTitle.frame = NSRect(x: 182, y: 298, width: 382, height: 16)
+        textTitle.font = .systemFont(ofSize: 11, weight: .semibold)
+        textTitle.textColor = .secondaryLabelColor
+
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 12)
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainerInset = NSSize(width: 3, height: 5)
+        textView.setAccessibilityLabel("人设文本")
+        textScroll.documentView = textView
+        textScroll.hasVerticalScroller = true
+        textScroll.autohidesScrollers = true
+        textScroll.borderType = .bezelBorder
+        textScroll.frame = NSRect(x: 182, y: 52, width: 382, height: 240)
+
+        errorLabel.frame = NSRect(x: 182, y: 40, width: 382, height: 12)
+        errorLabel.font = .systemFont(ofSize: 11)
+        errorLabel.textColor = .systemRed
+        errorLabel.lineBreakMode = .byTruncatingTail
+        errorLabel.setAccessibilityLabel("错误提示")
+
+        saveButton.frame = NSRect(x: 380, y: 10, width: 88, height: 28)
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"   // 回车保存（面板默认按钮）
+        saveButton.target = self
+        saveButton.action = #selector(save)
+        saveButton.setAccessibilityLabel("保存人设")
+
+        // 破坏性操作可视化分离：删除按钮红色 + 靠右独立，与主操作（保存）拉开距离
+        deleteButton.frame = NSRect(x: 476, y: 10, width: 88, height: 28)
+        deleteButton.bezelStyle = .rounded
+        deleteButton.contentTintColor = .systemRed
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteClicked)
+        deleteButton.setAccessibilityLabel("删除当前人设")
+    }
+
+    private func configureTable() {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("persona"))
+        column.width = 140
+        column.minWidth = 120
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.rowHeight = 22
+        tableView.allowsEmptySelection = true
+        tableView.allowsMultipleSelection = false
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableScroll.documentView = tableView
+        tableScroll.hasVerticalScroller = true
+        tableScroll.autohidesScrollers = true
+        tableScroll.borderType = .bezelBorder
+    }
+
+    // MARK: - 展示 / 数据源
+
+    func show(mode: Mode, anchoredTo anchor: NSRect, screen: NSScreen?) {
+        self.mode = mode
+        titleLabel.stringValue = mode == .add ? "新增人设" : "编辑人设"
+        errorLabel.stringValue = ""
+        reloadEntries()
+        if mode == .add {
+            selectEntry(nil)
+        } else {
+            let target = entries.first(where: { $0.isCurrent }) ?? entries.first
+            selectEntry(target)
+            if let target, let idx = entries.firstIndex(where: { $0.id == target.id }) {
+                tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+            }
+        }
+        updateDeleteAvailability()
+
+        var f = NSRect(x: anchor.midX - Self.panelSize.width / 2,
+                       y: anchor.maxY + 12,
+                       width: Self.panelSize.width, height: Self.panelSize.height)
+        if let vf = screen?.visibleFrame {
+            if f.minX < vf.minX { f.origin.x = vf.minX + 8 }
+            if f.maxX > vf.maxX { f.origin.x = vf.maxX - f.width - 8 }
+            if f.maxY > vf.maxY { f.origin.y = anchor.minY - f.height - 12 }
+            if f.minY < vf.minY { f.origin.y = vf.minY + 8 }
+        }
+        panel.setFrame(f, display: true)
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(mode == .add ? nameField : textView)
+    }
+
+    func dismiss() {
+        panel.orderOut(nil)
+    }
+
+    private func reloadEntries() {
+        prompts = DeskPetConfig.loadPersonas()
+        let current = DeskPetConfig.load().petID
+        entries = prompts.keys.sorted().map { ($0, DeskPetConfig.personaDisplayName(for: $0), $0 == current) }
+        tableView.reloadData()
+    }
+
+    /// 载入条目到表单（nil = 空表单——新增初始态）。
+    private func selectEntry(_ entry: (id: String, displayName: String, isCurrent: Bool)?) {
+        guard let entry else {
+            editingID = ""
+            snapshotID = ""
+            snapshotPrompt = ""
+            nameField.stringValue = ""
+            textView.string = ""
+            tableView.deselectAll(nil)
+            updateDeleteAvailability()
+            return
+        }
+        editingID = entry.id
+        snapshotID = entry.id
+        snapshotPrompt = prompts[entry.id] ?? ""
+        nameField.stringValue = entry.id
+        textView.string = snapshotPrompt
+        updateDeleteAvailability()
+    }
+
+    private func isDirty() -> Bool {
+        nameField.stringValue != snapshotID || textView.string != snapshotPrompt
+    }
+
+    private func updateDeleteAvailability() {
+        deleteButton.isEnabled = !editingID.isEmpty
+    }
+
+    /// 未保存放弃确认（关闭/切换条目共用）——返回 true 表示确认放弃。
+    private func confirmDiscard() -> Bool {
+        let confirm = NSAlert()
+        confirm.messageText = snapshotID.isEmpty ? "放弃新增人设？" : "放弃对「\(snapshotID)」的未保存更改？"
+        confirm.informativeText = "当前更改尚未保存，放弃后将丢失。"
+        confirm.addButton(withTitle: "放弃更改")
+        confirm.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return confirm.runModal() == .alertFirstButtonReturn
+    }
+
+    // MARK: - 动作
+
+    @objc private func close() {
+        if isDirty(), !confirmDiscard() { return }
+        dismiss()
+    }
+
+    /// 保存：新增 → addPersona；编辑 → 改名走 renamePersona（同步 petID）+ savePersonas 更新文本。
+    /// 错误（空 id/空文本/重名/写盘失败）红色就近提示，不静默、不覆盖。
+    @objc private func save() {
+        let newName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newText = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        errorLabel.stringValue = ""
+        guard !newName.isEmpty else { errorLabel.stringValue = "名称不能为空"; return }
+        guard !newText.isEmpty else { errorLabel.stringValue = "人设文本不能为空"; return }
+
+        if mode == .add {
+            let table = DeskPetConfig.loadPersonas()
+            guard table[newName] == nil else { errorLabel.stringValue = "名称「\(newName)」已存在（重名）"; return }
+            guard DeskPetConfig.addPersona(id: newName, prompt: newText) else {
+                errorLabel.stringValue = "保存失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            onSaved("✅ 已新增人设：\(newName)")
+            return
+        }
+
+        guard !editingID.isEmpty else {
+            errorLabel.stringValue = "请先在左侧列表选择要编辑的人设"
+            return
+        }
+        let table = DeskPetConfig.loadPersonas()
+        guard table[editingID] != nil else {
+            errorLabel.stringValue = "原人设已被删除（可能在别处编辑），已刷新列表"
+            reloadEntries()
+            selectEntry(nil)
+            return
+        }
+        if newName != editingID {
+            guard table[newName] == nil else { errorLabel.stringValue = "名称「\(newName)」已存在（重名）"; return }
+            guard DeskPetConfig.renamePersona(from: editingID, to: newName) else {
+                errorLabel.stringValue = "改名失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            var t = DeskPetConfig.loadPersonas()
+            t[newName] = newText
+            guard DeskPetConfig.savePersonas(t) else {
+                errorLabel.stringValue = "名称已改为「\(newName)」，但文本保存失败：配置目录不可写"
+                reloadEntries()
+                selectEntry(entries.first(where: { $0.id == newName }))
+                return
+            }
+            onSaved("✅ 已保存人设：\(newName)")
+        } else {
+            var t = table
+            t[editingID] = newText
+            guard DeskPetConfig.savePersonas(t) else {
+                errorLabel.stringValue = "保存失败：配置目录不可写（项目内 history/config/）"
+                return
+            }
+            onSaved("✅ 已保存人设：\(editingID)")
+        }
+    }
+
+    /// 删除当前编辑条目：确认弹窗（破坏性按钮）→ removePersona（当前 → 形象回退默认）→ 刷新菜单。
+    @objc private func deleteClicked() {
+        guard !editingID.isEmpty else { return }
+        let entry = entries.first(where: { $0.id == editingID })
+        let isCurrent = entry?.isCurrent ?? false
+        let name = DeskPetConfig.personaDisplayName(for: editingID)
+        let confirm = NSAlert()
+        confirm.messageText = "删除人设「\(name)」？"
+        confirm.informativeText = "将从 personas.json 永久移除，不可恢复。"
+            + (isCurrent ? "\n当前人设删除后，形象将回退默认「月薪猫」。\n" : "")
+        confirm.addButton(withTitle: "删除")
+        confirm.addButton(withTitle: "取消")
+        confirm.buttons.first?.hasDestructiveAction = true   // 破坏性可视化（macOS 11+）
+        NSApp.activate(ignoringOtherApps: true)
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        guard DeskPetConfig.removePersona(editingID) else {
+            errorLabel.stringValue = "删除失败：配置目录不可写（项目内 history/config/）"
+            return
+        }
+        if isCurrent { onCurrentPersonaDeleted?() }
+        onRefreshMenus?()
+        onFeedback?("🗑 已删除人设：\(name)")
+        dismiss()
+    }
+
+    private func onSaved(_ message: String) {
+        onRefreshMenus?()
+        onFeedback?(message)
+        dismiss()
+    }
+
+    // MARK: - NSTableViewDataSource / NSTableViewDelegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+        guard row >= 0, row < entries.count else { return nil }
+        let e = entries[row]
+        return e.isCurrent ? "\(e.displayName)（当前）" : e.displayName
+    }
+
+    func tableView(_ tableView: NSTableView, willDisplayCell cell: Any, for tableColumn: NSTableColumn?, row: Int) {
+        guard row >= 0, row < entries.count, let cell = cell as? NSTextFieldCell else { return }
+        cell.font = entries[row].isCurrent ? .boldSystemFont(ofSize: 12) : .systemFont(ofSize: 12)
+    }
+
+    /// 切换条目：有未保存更改先确认放弃；新增模式下点列表项 = 转为编辑该条目。
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        guard row >= 0, row < entries.count else { return }
+        let target = entries[row]
+        guard target.id != editingID else { return }
+        if isDirty(), !confirmDiscard() {
+            if let idx = entries.firstIndex(where: { $0.id == editingID }) {
+                tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+            }
+            return
+        }
+        errorLabel.stringValue = ""
+        if mode == .add {
+            mode = .edit
+            titleLabel.stringValue = "编辑人设"
+        }
+        selectEntry(target)
     }
 }

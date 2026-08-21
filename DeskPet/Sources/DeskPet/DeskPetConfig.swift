@@ -317,6 +317,162 @@ struct DeskPetConfig: Codable {
         return [:]
     }
 
+    // MARK: - 人设写 API（GUI 编辑面板地基：新增/改名/删除/保存）
+
+    /// 人设表原子保存：内容校验（id/文本 trim 后均非空）与 JSON 编码都通过才落盘；
+    /// 写入前把现有运行副本备份为 personas.json.bak-<时间戳>（旧版本/损坏内容都留底，可人工回退）；
+    /// 临时文件 + 原子替换——任何失败返回 false，旧文件完整保留（绝不写半）。
+    /// 目标固定为 history/config/personas.json 运行副本（默认；首启未迁移先迁移），
+    /// 绝不写源 config/ 或 bundle（保持用户编辑不回退原则）。
+    /// - Parameter dir: 目标目录注入（自测临时目录用）；nil = 配置文件目录。
+    @discardableResult
+    static func savePersonas(_ personas: [String: String], to dir: URL? = nil) -> Bool {
+        let targetDir: URL
+        if let dir {
+            targetDir = dir
+        } else {
+            ensurePersonasMigrated()   // 确保运行副本存在（源 config/ → history/ 首启迁移）
+            targetDir = configDir()
+        }
+        // 内容校验（trim 后）：id 非空、文本非空——非法内容不落盘（不写半、也不产生备份副作用）
+        for (id, prompt) in personas {
+            if id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                LogManager.shared.warn("人设保存拒绝：空 id 或空文本（未写入）")
+                return false
+            }
+        }
+        // JSON 编码校验：编码失败不写
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(personas) else {
+            LogManager.shared.error("人设保存失败：JSON 编码失败（未写入）")
+            return false
+        }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        let target = targetDir.appendingPathComponent("personas.json")
+        // 写入前备份现有运行副本（旧版/损坏内容留底）——秒级时间戳 + UUID 后缀避免同一秒多次写入撞名
+        if fm.fileExists(atPath: target.path) {
+            let backup = targetDir.appendingPathComponent(
+                "personas.json.bak-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8))")
+            if (try? fm.copyItem(at: target, to: backup)) == nil {
+                LogManager.shared.warn("人设写入前备份失败（继续保存）：\(backup.path)")
+            }
+        }
+        // 临时文件 + 原子替换：失败不留半文件、旧文件不动
+        let tmp = targetDir.appendingPathComponent("personas.json.tmp-\(UUID().uuidString)")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            if fm.fileExists(atPath: target.path) {
+                _ = try fm.replaceItemAt(target, withItemAt: tmp)   // 同目录 rename，原子替换
+            } else {
+                try fm.moveItem(at: tmp, to: target)
+            }
+            return true
+        } catch {
+            try? fm.removeItem(at: tmp)
+            LogManager.shared.error("人设保存失败：\(error.localizedDescription)（旧文件保留）")
+            return false
+        }
+    }
+
+    /// 指定目录读取人设表（写 API 内部用；nil = 现有 loadPersonas() 语义——
+    /// 运行副本优先/损坏备份/旧 deskpet-config 兼容 fallback）。
+    private static func loadPersonas(at dir: URL?) -> [String: String] {
+        guard let dir else { return loadPersonas() }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("personas.json")),
+           let p = try? JSONDecoder().decode([String: String].self, from: data) {
+            return p
+        }
+        return [:]
+    }
+
+    /// 指定目录读取 deskpet-config.json（写 API 内部用；nil = load() 缓存语义）。
+    private static func personaConfig(at dir: URL?) -> DeskPetConfig {
+        guard let dir else { return load() }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("deskpet-config.json")),
+           let cfg = try? JSONDecoder().decode(DeskPetConfig.self, from: data) {
+            return cfg
+        }
+        return DeskPetConfig()
+    }
+
+    /// 指定目录写入 deskpet-config.json（写 API 内部用；nil = save() 并刷新缓存）。
+    @discardableResult
+    private static func persistPersonaConfig(_ cfg: DeskPetConfig, at dir: URL?) -> Bool {
+        guard let dir else { return cfg.save() }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(cfg) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent("deskpet-config.json"), options: .atomic)
+            return true
+        } catch {
+            LogManager.shared.error("人设 petID 联动保存失败：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 新增人设：id 非空（trim）且表中唯一、提示词 trim 后非空才落盘。
+    /// 校验/写盘失败返回 false（不落盘、旧文件保留）；成功返回 true。
+    @discardableResult
+    static func addPersona(id: String, prompt: String, in dir: URL? = nil) -> Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, !prompt.isEmpty else { return false }
+        var table = loadPersonas(at: dir)
+        guard table[id] == nil else { return false }   // id 冲突拒绝
+        table[id] = prompt
+        return savePersonas(table, to: dir)
+    }
+
+    /// 改名：只替换 key、value 文本原样保留；新 id 非空且不与现有 id 冲突。
+    /// 若旧 id == 当前 cfg.petID → 同步 cfg.petID 为新 id（写 deskpet-config.json，保持当前连续）；
+    /// 联动保存失败 → 回滚人设表并返回 false（两文件保持一致）。
+    @discardableResult
+    static func renamePersona(from oldID: String, to newID: String, in dir: URL? = nil) -> Bool {
+        let old = oldID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = newID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !old.isEmpty, !new.isEmpty, old != new else { return false }
+        var table = loadPersonas(at: dir)
+        guard table[old] != nil else { return false }   // 旧 id 必须存在
+        guard table[new] == nil else { return false }   // 新 id 唯一（冲突拒绝）
+        let prompt = table.removeValue(forKey: old)!
+        table[new] = prompt                             // value 原样
+        guard savePersonas(table, to: dir) else { return false }
+        var cfg = personaConfig(at: dir)
+        guard cfg.petID == old else { return true }     // 非当前 id：无需联动
+        cfg.petID = new
+        guard persistPersonaConfig(cfg, at: dir) else {
+            if let prompt = table.removeValue(forKey: new) { table[old] = prompt }   // 回滚人设表
+            _ = savePersonas(table, to: dir)
+            return false
+        }
+        return true
+    }
+
+    /// 删除人设：只删指定 key（不误删他人）；若删的是当前 cfg.petID
+    /// → petID 回退默认 monthly-salary-cat（写 deskpet-config.json，保持连续）；
+    /// 联动保存失败 → 回滚人设表并返回 false。
+    @discardableResult
+    static func removePersona(_ id: String, in dir: URL? = nil) -> Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return false }
+        var table = loadPersonas(at: dir)
+        guard let removed = table.removeValue(forKey: id) else { return false }   // 不存在不误删/无操作
+        guard savePersonas(table, to: dir) else { return false }
+        var cfg = personaConfig(at: dir)
+        guard cfg.petID == id else { return true }
+        cfg.petID = "monthly-salary-cat"
+        guard persistPersonaConfig(cfg, at: dir) else {
+            table[id] = removed                                                // 回滚人设表
+            _ = savePersonas(table, to: dir)
+            return false
+        }
+        return true
+    }
+
     /// P1-4（pm2）：资源迁移——项目树 config/<relative> → history/config/<relative>
     /// （首次复制，已存在不覆盖——与 personas 同模式；读写一致，消除双目录歧义）。
     /// commands.json / prompts/voice.json 等读取入口在 load 前调用。

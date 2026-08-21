@@ -46,6 +46,10 @@ if args.contains("--self-test-hermes-discovery") {
     // P1：本机 Hermes 候选排序/过滤/空结果诊断——不启动 Hermes、不触碰用户安装。
     exit(HermesSelfTest.runDiscoverySelfTest())
 }
+if args.contains("--self-test-persona") {
+    // task-config：人设配置写 API 纯离线自测（临时目录注入）——不触碰真实配置。
+    exit(HermesSelfTest.runPersonaConfigSelfTest())
+}
 if args.contains("--self-test-hermes") || args.contains("--self-test-bridge") || args.contains("--self-test-router") || args.contains("--self-test-tts") || args.contains("--self-test-speech") || args.contains("--self-test-duoyun") || args.contains("--self-test-transcript") || args.contains("--self-test-edge") {
     if args.contains("--self-test-duoyun") {
         exit(DuoyunSpeechProvider.runSelfTest())

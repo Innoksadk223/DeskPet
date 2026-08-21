@@ -240,6 +240,105 @@ enum HermesSelfTest {
         return failed == 0 ? 0 : 1
     }
 
+    /// 人设配置写 API 纯离线自测（--self-test-persona-config）：
+    /// 临时目录注入（savePersonas/addPersona/renamePersona/removePersona 的 dir 参数），
+    /// 不触碰真实 history/config/、源 config/ 与 bundle。
+    /// 覆盖：add 持久化 / rename 同步 petID / remove 回退默认 / 损坏备份 /
+    /// 校验拒绝空 id、空文本、id 冲突 / 失败不落盘（旧文件保留）。
+    static func runPersonaConfigSelfTest() -> Int32 {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("deskpet-persona-config-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            print("[self-test] Persona 配置自测失败：无法创建临时目录（\(error.localizedDescription)）")
+            return 1
+        }
+        defer { try? fm.removeItem(at: root) }
+
+        var passed = 0
+        var failed = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            if ok { passed += 1 } else { failed += 1 }
+            print("[persona-config] \(ok ? "✓" : "✗") \(name)\(detail.isEmpty ? "" : "：\(detail)")")
+        }
+        func readTable() -> [String: String] {
+            guard let data = try? Data(contentsOf: root.appendingPathComponent("personas.json")),
+                  let p = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+            return p
+        }
+        func readPetID() -> String {
+            guard let data = try? Data(contentsOf: root.appendingPathComponent("deskpet-config.json")),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return "<无>" }
+            return (obj["petID"] as? String) ?? "<无>"
+        }
+        func writePetID(_ id: String) {
+            if let data = try? JSONSerialization.data(withJSONObject: ["petID": id]) {
+                try? data.write(to: root.appendingPathComponent("deskpet-config.json"), options: .atomic)
+            }
+        }
+        func backups() -> [URL] {
+            ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("personas.json.bak-") }
+        }
+
+        // 1) 校验拒绝：空 id / 空文本——不落盘（文件不应产生）
+        check("add 拒绝空 id", !DeskPetConfig.addPersona(id: "   ", prompt: "你好", in: root))
+        check("add 拒绝空文本", !DeskPetConfig.addPersona(id: "worker", prompt: " \n ", in: root))
+        check("拒绝后文件未产生", !fm.fileExists(atPath: root.appendingPathComponent("personas.json").path))
+
+        // 2) add 持久化：文本 trim 落盘；id 唯一（冲突拒绝且不覆盖原文）
+        check("add 成功", DeskPetConfig.addPersona(id: "worker", prompt: "  你是打工人。 ", in: root))
+        check("add 持久化且 trim 落盘", readTable() == ["worker": "你是打工人。"], "table=\(readTable())")
+        check("add 拒绝 id 冲突", !DeskPetConfig.addPersona(id: "worker", prompt: "重复", in: root))
+        check("冲突不覆盖原文", readTable()["worker"] == "你是打工人。")
+        check("add 第二人设", DeskPetConfig.addPersona(id: "cat", prompt: "喵", in: root))
+
+        // 3) rename：只改 key、value 原样；当前 petID 同步（注入 cfg.petID=worker）
+        writePetID("worker")
+        check("rename 成功且 value 原样",
+              DeskPetConfig.renamePersona(from: "worker", to: "worker2", in: root)
+                  && readTable()["worker2"] == "你是打工人。" && readTable()["worker"] == nil)
+        check("rename 当前 id → petID 同步", readPetID() == "worker2", "petID=\(readPetID())")
+        check("rename 拒绝 id 冲突", !DeskPetConfig.renamePersona(from: "worker2", to: "cat", in: root))
+        check("rename 拒绝不存在 id", !DeskPetConfig.renamePersona(from: "ghost", to: "x", in: root))
+        check("rename 拒绝空/相同 id",
+              !DeskPetConfig.renamePersona(from: " ", to: "x", in: root)
+                  && !DeskPetConfig.renamePersona(from: "worker2", to: "  ", in: root)
+                  && !DeskPetConfig.renamePersona(from: "worker2", to: "worker2", in: root))
+
+        // 4) remove 当前人设：petID 回退默认；只删目标 key
+        check("remove 当前人设成功", DeskPetConfig.removePersona("worker2", in: root))
+        check("remove 只删目标 key", readTable()["worker2"] == nil && readTable()["cat"] == "喵")
+        check("remove 当前 → petID 回退默认", readPetID() == "monthly-salary-cat", "petID=\(readPetID())")
+        check("remove 拒绝不存在 id", !DeskPetConfig.removePersona("ghost", in: root))
+
+        // 5) remove 非当前人设：petID 不动（注入 petID=cat，删其他 key）
+        writePetID("cat")
+        check("add 第三人设", DeskPetConfig.addPersona(id: "dog", prompt: "汪", in: root))
+        check("remove 非当前人不碰 petID",
+              DeskPetConfig.removePersona("dog", in: root) && readPetID() == "cat", "petID=\(readPetID())")
+
+        // 6) 损坏备份：现存文件为非法 JSON → save 仍成功、先备份 .bak（含旧损坏内容）、落盘合法 JSON
+        let corrupt = Data("not-valid-json{{{".utf8)
+        try? corrupt.write(to: root.appendingPathComponent("personas.json"))
+        let before = backups().count
+        check("损坏文件上保存成功", DeskPetConfig.savePersonas(["fresh": "新的"], to: root))
+        let baks = backups()
+        check("写入前生成 .bak 备份", baks.count > before, "before=\(before) after=\(baks.count)")
+        check("备份保留旧（损坏）内容", baks.contains { (try? Data(contentsOf: $0)) == corrupt })
+        check("落盘为合法 JSON", readTable() == ["fresh": "新的"])
+
+        // 7) savePersonas 自身校验与失败保留：空 id / 空文本拒绝，旧文件原样
+        let snapshot = readTable()
+        check("save 拒绝空 id", !DeskPetConfig.savePersonas(["": "x"], to: root))
+        check("save 拒绝空文本", !DeskPetConfig.savePersonas(["a": "  "], to: root))
+        check("拒绝后旧文件保留", readTable() == snapshot && readTable() == ["fresh": "新的"])
+
+        print("[persona-config] 通过 \(passed)/\(passed + failed)")
+        return failed == 0 ? 0 : 1
+    }
+
     static func run(token: String, port: Int) async -> Int32 {
         let client = HermesClient(port: port, token: token)
         var sawMessageDelta = false

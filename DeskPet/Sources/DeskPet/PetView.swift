@@ -33,6 +33,10 @@ protocol PetViewDelegate: AnyObject {
     func petViewRequestedSetPet(_ view: PetView, petID: String)
     func petViewRequestedPersonas(_ view: PetView) -> [(id: String, displayName: String, isCurrent: Bool)]
     func petViewRequestedSetPersona(_ view: PetView, petID: String)
+    // task-panel：人设 GUI 管理（新增/编辑打开面板；删除带确认）
+    func petViewRequestedAddPersona(_ view: PetView)
+    func petViewRequestedEditPersona(_ view: PetView)
+    func petViewRequestedDeletePersona(_ view: PetView, id: String)
     func petViewRequestedEditPersonasFile(_ view: PetView)
     func petViewRequestedASRProvider(_ view: PetView) -> String
     func petViewRequestedSelectASRProvider(_ view: PetView, providerID: String)
@@ -335,6 +339,9 @@ final class PetView: NSView {
             voiceServices: #selector(voiceServices),
             asrProvider: #selector(selectASRProvider),
             persona: #selector(selectPersona(_:)),
+            addPersona: #selector(addPersonaCmd),
+            editPersona: #selector(editPersonaCmd),
+            deletePersona: #selector(deletePersonaCmd(_:)),
             editPersonas: #selector(editPersonasFile),
             editVoicePrompts: #selector(editVoicePromptsFile),
             channel: #selector(selectChannel(_:)),
@@ -452,6 +459,15 @@ final class PetView: NSView {
     @objc private func selectPersona(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         delegate?.petViewRequestedSetPersona(self, petID: id)
+    }
+
+    @objc private func addPersonaCmd() { delegate?.petViewRequestedAddPersona(self) }
+
+    @objc private func editPersonaCmd() { delegate?.petViewRequestedEditPersona(self) }
+
+    @objc private func deletePersonaCmd(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        delegate?.petViewRequestedDeletePersona(self, id: id)
     }
 
     @objc private func selectPet(_ sender: NSMenuItem) {

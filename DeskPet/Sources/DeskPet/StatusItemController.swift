@@ -27,6 +27,15 @@ final class StatusItemController: NSObject {
 
     func updateMute(_ muted: Bool) {
         isMuted = muted
+        rebuildMenu()
+    }
+
+    /// 人设编辑等外部变更后重建菜单（保持性格▸数据新鲜——保存/删除后由 AppDelegate 调用）。
+    func refreshMenu() {
+        rebuildMenu()
+    }
+
+    private func rebuildMenu() {
         // C1：先解析当前状态再重建（修复死逻辑 .idle:.idle 恒 idle + 先覆盖后解析丢状态）
         var state = PetState.idle
         if let title = statusItem.menu?.items.first?.title, title.hasPrefix("状态：") {
@@ -117,6 +126,9 @@ final class StatusItemController: NSObject {
             voiceServices: #selector(AppDelegate.menuVoiceServices),
             asrProvider: #selector(AppDelegate.menuSelectASRProvider),
             persona: #selector(AppDelegate.menuSelectPersona(_:)),
+            addPersona: #selector(AppDelegate.menuAddPersona),
+            editPersona: #selector(AppDelegate.menuEditPersona),
+            deletePersona: #selector(AppDelegate.menuDeletePersona(_:)),
             editPersonas: #selector(AppDelegate.menuEditPersonas),
             editVoicePrompts: #selector(AppDelegate.menuEditVoicePrompts),
             channel: #selector(AppDelegate.menuSelectChannel(_:)),

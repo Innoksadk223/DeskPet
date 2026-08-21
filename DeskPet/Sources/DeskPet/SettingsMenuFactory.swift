@@ -20,6 +20,9 @@ enum SettingsMenuFactory {
         var voiceServices: Selector        // 语音服务管理（清单展示）
         var asrProvider: Selector        // 听写识别来源（local/duoyun/mimo 单选——representedObject = id）
         var persona: Selector              // NSMenuItem 动作（representedObject = 人设 id）
+        var addPersona: Selector          // 新增人设…（打开人设编辑面板——空表单）
+        var editPersona: Selector         // 编辑人设…（打开人设编辑面板——预填当前人设）
+        var deletePersona: Selector       // 删除人设（NSMenuItem 动作，representedObject = 人设 id——点击后确认弹窗）
         var editPersonas: Selector
         var editVoicePrompts: Selector      // executor8：高级——直接编辑语音提示词文件
         var channel: Selector              // NSMenuItem 动作（representedObject = 渠道 id）
@@ -410,10 +413,44 @@ enum SettingsMenuFactory {
             }
         }
         personaMenu.addItem(.separator())
-        let editPersonaItem = NSMenuItem(title: "直接编辑人设文件…（高级）", action: actions.editPersonas, keyEquivalent: "")
-        editPersonaItem.target = target
-        editPersonaItem.toolTip = "不推荐普通用户使用（人设随形象联动，换形象即换性格）"
-        personaMenu.addItem(editPersonaItem)
+        // GUI 编辑入口（task-panel）：新增/编辑打开编辑面板；删除为悬停子菜单（红色破坏性视觉），
+        // 点击后二次确认；删除当前人设 → 形象回退默认（DeskPetConfig.removePersona 内置联动）
+        let addPersonaCmd = NSMenuItem(title: "新增人设…", action: actions.addPersona, keyEquivalent: "")
+        addPersonaCmd.target = target
+        addPersonaCmd.toolTip = "打开人设编辑面板，创建新性格（名称即人设 id）"
+        personaMenu.addItem(addPersonaCmd)
+
+        let editPersonaCmd = NSMenuItem(title: "编辑人设…", action: actions.editPersona, keyEquivalent: "")
+        editPersonaCmd.target = target
+        editPersonaCmd.toolTip = "打开人设编辑面板（预填当前人设；左侧列表可切换任一形象的人设）"
+        personaMenu.addItem(editPersonaCmd)
+
+        let deletePersonaCmd = NSMenuItem(title: "删除人设…", action: nil, keyEquivalent: "")
+        let delMenu = NSMenu()
+        if data.personas.isEmpty {
+            let empty = NSMenuItem(title: "（无人设可删除）", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            delMenu.addItem(empty)
+        } else {
+            for p in data.personas {
+                let item = NSMenuItem(title: "删除「\(p.displayName)」", action: actions.deletePersona, keyEquivalent: "")
+                item.target = target
+                item.representedObject = p.id
+                // 破坏性操作可视化：红色标题 + tooltip 明示后果
+                item.attributedTitle = NSAttributedString(string: item.title, attributes: [.foregroundColor: NSColor.systemRed])
+                item.toolTip = "确认后不可恢复\(p.isCurrent ? "；删除当前人设后形象回退默认「月薪猫」" : "")"
+                delMenu.addItem(item)
+            }
+        }
+        deletePersonaCmd.submenu = delMenu
+        deletePersonaCmd.toolTip = "删除人设（选定后弹确认；删除当前人设 → 形象回退默认）"
+        personaMenu.addItem(deletePersonaCmd)
+
+        personaMenu.addItem(.separator())
+        let editPersonasFileItem = NSMenuItem(title: "直接编辑人设文件…（高级）", action: actions.editPersonas, keyEquivalent: "")
+        editPersonasFileItem.target = target
+        editPersonasFileItem.toolTip = "不推荐普通用户使用（人设随形象联动，换形象即换性格）"
+        personaMenu.addItem(editPersonasFileItem)
         personaItem.submenu = personaMenu
         personaItem.toolTip = "切换桌宠性格（人设提示词）——下一条对话生效"
         menu.addItem(personaItem)
